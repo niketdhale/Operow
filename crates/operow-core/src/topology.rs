@@ -24,12 +24,26 @@ pub struct EcuConfig {
     pub pos: (f32, f32),
 }
 
+fn default_data_bitrate() -> u32 {
+    2_000_000
+}
+
 /// Static configuration of a CAN bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanBusConfig {
     pub id: BusId,
     pub name: String,
+    /// Arbitration/nominal bitrate (bit/s). Also the only bitrate used when
+    /// `fd_enabled` is `false`.
     pub bitrate: u32,
+    /// Whether this bus carries CAN FD frames. When `false`, any FD frame
+    /// sent onto it is dropped and counted as an error.
+    #[serde(default)]
+    pub fd_enabled: bool,
+    /// Data-phase bitrate (bit/s) used by FD frames with BRS set. Ignored
+    /// when `fd_enabled` is `false`.
+    #[serde(default = "default_data_bitrate")]
+    pub data_bitrate: u32,
 }
 
 /// Attaches a node to a bus.
@@ -59,6 +73,8 @@ pub enum TopologyError {
     UnknownBus(BusId),
     #[error("bus {0:?} has a non-positive bitrate")]
     InvalidBitrate(BusId),
+    #[error("bus {0:?} has FD enabled but a non-positive data bitrate")]
+    InvalidDataBitrate(BusId),
 }
 
 /// Errors returned by [`Topology::from_json`].
@@ -85,6 +101,9 @@ impl Topology {
         for bus in &self.buses {
             if bus.bitrate == 0 {
                 return Err(TopologyError::InvalidBitrate(bus.id));
+            }
+            if bus.fd_enabled && bus.data_bitrate == 0 {
+                return Err(TopologyError::InvalidDataBitrate(bus.id));
             }
         }
         for link in &self.links {

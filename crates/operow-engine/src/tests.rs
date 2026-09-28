@@ -41,6 +41,8 @@ fn topo_with_two_senders() -> Topology {
             id: BusId(1),
             name: "CAN0".into(),
             bitrate: 500_000,
+            fd_enabled: false,
+            data_bitrate: 2_000_000,
         }],
         links: vec![
             Link {
@@ -96,6 +98,8 @@ fn periodic_message_produces_expected_frame_count() {
             id: BusId(1),
             name: "CAN0".into(),
             bitrate: 500_000,
+            fd_enabled: false,
+            data_bitrate: 2_000_000,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -154,6 +158,8 @@ fn sender_does_not_receive_its_own_frame() {
             id: BusId(1),
             name: "CAN0".into(),
             bitrate: 500_000,
+            fd_enabled: false,
+            data_bitrate: 2_000_000,
         }],
         links: vec![
             Link {
@@ -228,4 +234,61 @@ fn runner_smoke_test() {
 
     handle.cmd.send(Command::Shutdown).unwrap();
     handle.join();
+}
+
+fn topo_single_node(fd_enabled: bool) -> Topology {
+    Topology {
+        nodes: vec![EcuConfig {
+            id: NodeId(1),
+            name: "A".into(),
+            tx: vec![],
+            pos: (0.0, 0.0),
+        }],
+        buses: vec![CanBusConfig {
+            id: BusId(1),
+            name: "CAN0".into(),
+            bitrate: 500_000,
+            fd_enabled,
+            data_bitrate: 2_000_000,
+        }],
+        links: vec![Link {
+            node: NodeId(1),
+            bus: BusId(1),
+        }],
+    }
+}
+
+#[test]
+fn fd_frame_rejected_on_non_fd_bus_increments_error_frames() {
+    let topo = topo_single_node(false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+
+    let fd_frame = CanFrame::new_fd(0x123, false, true, &[0u8; 64]).unwrap();
+    sim.send_once(NodeId(1), fd_frame);
+    sim.run_until(Timestamp::from_ms(10), &mut out);
+
+    assert!(out.is_empty(), "FD frame must not be transmitted");
+    let stats = sim.stats().get(&BusId(1)).unwrap();
+    assert_eq!(stats.error_frames, 1);
+    assert_eq!(stats.frames, 0);
+}
+
+#[test]
+fn fd_frame_transmitted_on_fd_enabled_bus() {
+    let topo = topo_single_node(true);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+
+    let fd_frame = CanFrame::new_fd(0x123, false, true, &[0u8; 64]).unwrap();
+    sim.send_once(NodeId(1), fd_frame);
+    sim.run_until(Timestamp::from_ms(10), &mut out);
+
+    assert_eq!(out.len(), 1);
+    assert!(out[0].frame.fd);
+    let stats = sim.stats().get(&BusId(1)).unwrap();
+    assert_eq!(stats.error_frames, 0);
+    assert_eq!(stats.frames, 1);
+    // 34 nominal bits @500k + 678 data bits @2M = 407_000 ns.
+    assert_eq!(stats.busy_ns, 407_000);
 }

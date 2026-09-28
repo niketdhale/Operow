@@ -13,9 +13,21 @@ pub struct TraceRow {
     pub sender_name: String,
     pub id: u32,
     pub extended: bool,
+    pub fd: bool,
+    pub brs: bool,
     pub dlc: u8,
-    pub data: [u8; 8],
+    pub data: [u8; 64],
     pub msg_name: String,
+}
+
+impl TraceRow {
+    pub fn frame_type(&self) -> &'static str {
+        match (self.fd, self.brs) {
+            (false, _) => "CAN",
+            (true, false) => "CAN FD",
+            (true, true) => "CAN FD BRS",
+        }
+    }
 }
 
 pub struct Trace {
@@ -60,6 +72,8 @@ impl Trace {
             sender_name: sender_name.to_string(),
             id: ev.frame.id,
             extended: ev.frame.extended,
+            fd: ev.frame.fd,
+            brs: ev.frame.brs,
             dlc: ev.frame.dlc,
             data: ev.frame.data,
             msg_name: msg_name.to_string(),
@@ -121,8 +135,10 @@ impl Trace {
             .column(Column::exact(70.0)) // id
             .column(Column::remainder().at_least(100.0)) // name
             .column(Column::exact(40.0)) // dir
+            .column(Column::exact(80.0)) // type
             .column(Column::exact(40.0)) // dlc
-            .column(Column::exact(180.0)) // data
+            .column(Column::exact(36.0)) // len
+            .column(Column::exact(220.0)) // data
             .column(Column::exact(120.0)); // sender
 
         if self.autoscroll {
@@ -132,7 +148,7 @@ impl Trace {
         table
             .header(20.0, |mut header| {
                 for label in [
-                    "Time (s)", "Chn", "ID", "Name", "Dir", "DLC", "Data", "Sender",
+                    "Time (s)", "Chn", "ID", "Name", "Dir", "Type", "DLC", "Len", "Data", "Sender",
                 ] {
                     header.col(|ui| {
                         ui.strong(label);
@@ -158,17 +174,42 @@ impl Trace {
                         ui.label("Tx");
                     });
                     row.col(|ui| {
+                        ui.label(r.frame_type());
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            operow_core::len_to_dlc(r.dlc as usize)
+                                .unwrap_or(0)
+                                .to_string(),
+                        );
+                    });
+                    row.col(|ui| {
                         ui.label(r.dlc.to_string());
                     });
                     row.col(|ui| {
-                        let mut s = String::with_capacity(24);
-                        for (i, b) in r.data[..r.dlc as usize].iter().enumerate() {
-                            if i > 0 {
-                                s.push(' ');
-                            }
-                            s.push_str(&format!("{b:02X}"));
-                        }
-                        ui.monospace(s);
+                        let full: String = r.data[..r.dlc as usize]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| {
+                                if i > 0 {
+                                    format!(" {b:02X}")
+                                } else {
+                                    format!("{b:02X}")
+                                }
+                            })
+                            .collect();
+                        const TRUNCATE_AT: usize = 8;
+                        let shown = if r.dlc as usize > TRUNCATE_AT {
+                            let mut s: String = r.data[..TRUNCATE_AT]
+                                .iter()
+                                .map(|b| format!("{b:02X} "))
+                                .collect();
+                            s.push('…');
+                            s
+                        } else {
+                            full.clone()
+                        };
+                        ui.monospace(shown).on_hover_text(full);
                     });
                     row.col(|ui| {
                         ui.label(&r.sender_name);

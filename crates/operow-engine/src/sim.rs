@@ -1,16 +1,21 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
-use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology, TopologyError};
+use operow_core::{
+    BusEvent, BusId, CanBusConfig, CanFrame, NodeId, Timestamp, Topology, TopologyError,
+};
 
 use crate::ecu::{Ecu, EcuCtx, PeriodicEcu};
-use crate::timing::frame_duration_ns;
+use crate::timing::frame_duration_ns_any;
 
 /// Per-bus utilization counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BusStats {
     pub frames: u64,
     pub busy_ns: u64,
+    /// Frames that could not be transmitted (currently: CAN FD frames sent
+    /// onto a bus that does not have `fd_enabled` set).
+    pub error_frames: u64,
 }
 
 impl BusStats {
@@ -79,7 +84,7 @@ fn arbitration_key(frame: &CanFrame) -> (u32, bool) {
 pub struct Simulation {
     node_buses: HashMap<NodeId, Vec<BusId>>,
     bus_nodes: HashMap<BusId, Vec<NodeId>>,
-    bitrates: HashMap<BusId, u32>,
+    bus_configs: HashMap<BusId, CanBusConfig>,
     ecus: HashMap<NodeId, Box<dyn Ecu>>,
     now: u64,
     heap: BinaryHeap<Reverse<Scheduled>>,
@@ -104,12 +109,12 @@ impl Simulation {
             bus_nodes.entry(link.bus).or_default().push(link.node);
         }
 
-        let mut bitrates = HashMap::new();
+        let mut bus_configs = HashMap::new();
         let mut bus_busy = HashMap::new();
         let mut bus_pending = HashMap::new();
         let mut stats = HashMap::new();
         for bus in &topology.buses {
-            bitrates.insert(bus.id, bus.bitrate);
+            bus_configs.insert(bus.id, bus.clone());
             bus_busy.insert(bus.id, false);
             bus_pending.insert(bus.id, Vec::new());
             stats.insert(bus.id, BusStats::default());
@@ -124,7 +129,7 @@ impl Simulation {
         Ok(Simulation {
             node_buses,
             bus_nodes,
-            bitrates,
+            bus_configs,
             ecus,
             now: 0,
             heap: BinaryHeap::new(),
@@ -231,32 +236,50 @@ impl Simulation {
         if *self.bus_busy.get(&bus).unwrap_or(&false) {
             return;
         }
-        let Some(pending) = self.bus_pending.get_mut(&bus) else {
-            return;
-        };
-        if pending.is_empty() {
+        loop {
+            let Some(pending) = self.bus_pending.get_mut(&bus) else {
+                return;
+            };
+            if pending.is_empty() {
+                return;
+            }
+            let winner_idx = pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (frame, _))| arbitration_key(frame))
+                .map(|(i, _)| i)
+                .expect("pending is non-empty");
+            let (frame, sender) = pending.remove(winner_idx);
+
+            let fd_enabled = self
+                .bus_configs
+                .get(&bus)
+                .map(|c| c.fd_enabled)
+                .unwrap_or(false);
+            if frame.fd && !fd_enabled {
+                // Dropped: this bus does not carry CAN FD frames.
+                self.stats.entry(bus).or_default().error_frames += 1;
+                continue;
+            }
+
+            let (nominal, data_rate) = self
+                .bus_configs
+                .get(&bus)
+                .map(|c| (c.bitrate, c.data_bitrate))
+                .unwrap_or((500_000, 500_000));
+            let duration_ns = frame_duration_ns_any(&frame, nominal, data_rate);
+            self.bus_busy.insert(bus, true);
+            self.schedule(
+                self.now + duration_ns,
+                EventKind::TxComplete {
+                    bus,
+                    sender,
+                    frame,
+                    duration_ns,
+                },
+            );
             return;
         }
-        let winner_idx = pending
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (frame, _))| arbitration_key(frame))
-            .map(|(i, _)| i)
-            .expect("pending is non-empty");
-        let (frame, sender) = pending.remove(winner_idx);
-
-        let bitrate = *self.bitrates.get(&bus).unwrap_or(&500_000);
-        let duration_ns = frame_duration_ns(&frame, bitrate);
-        self.bus_busy.insert(bus, true);
-        self.schedule(
-            self.now + duration_ns,
-            EventKind::TxComplete {
-                bus,
-                sender,
-                frame,
-                duration_ns,
-            },
-        );
     }
 
     fn handle_event(&mut self, kind: EventKind, out: &mut Vec<BusEvent>) {

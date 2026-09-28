@@ -78,6 +78,30 @@ impl Inspector {
                         ui.label("Bitrate (bit/s):");
                         ui.add(egui::DragValue::new(&mut bus.bitrate).range(1..=10_000_000));
                     });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut bus.fd_enabled, "CAN FD");
+                    });
+                    ui.add_enabled_ui(bus.fd_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Data bitrate (bit/s):");
+                            egui::ComboBox::from_id_salt(("bus_data_bitrate", sel))
+                                .selected_text(crate::graph::format_bitrate(bus.data_bitrate))
+                                .show_ui(ui, |ui| {
+                                    for rate in
+                                        [1_000_000u32, 2_000_000, 4_000_000, 5_000_000, 8_000_000]
+                                    {
+                                        ui.selectable_value(
+                                            &mut bus.data_bitrate,
+                                            rate,
+                                            crate::graph::format_bitrate(rate),
+                                        );
+                                    }
+                                });
+                            ui.add(
+                                egui::DragValue::new(&mut bus.data_bitrate).range(1..=10_000_000),
+                            );
+                        });
+                    });
                 });
             }
             GraphNode::Ecu(ecu) => {
@@ -91,16 +115,20 @@ impl Inspector {
 
                     let mut remove: Option<usize> = None;
                     egui::Grid::new(("tx_grid", sel))
-                        .num_columns(7)
+                        .num_columns(12)
                         .striped(true)
                         .show(ui, |ui| {
                             ui.strong("Name");
                             ui.strong("ID (hex)");
                             ui.strong("Ext");
+                            ui.strong("FD");
+                            ui.strong("BRS");
                             ui.strong("DLC");
-                            ui.strong("Data (hex)");
+                            ui.strong("Len");
+                            ui.strong("Data (hex, up to 64 bytes)");
                             ui.strong("Period (ms)");
                             ui.strong("En");
+                            ui.strong("");
                             ui.end_row();
 
                             for (i, msg) in ecu.tx.iter_mut().enumerate() {
@@ -114,13 +142,22 @@ impl Inspector {
                                     .or_insert_with(|| format!("{:X}", msg.frame.id));
                                 let id_resp =
                                     ui.add(egui::TextEdit::singleline(id_buf).desired_width(60.0));
-                                if id_resp.lost_focus() || id_resp.changed() {
-                                    // Re-synced below after grid.
-                                }
 
                                 let mut ext = msg.frame.extended;
                                 ui.checkbox(&mut ext, "");
 
+                                let mut fd = msg.frame.fd;
+                                ui.checkbox(&mut fd, "");
+
+                                let mut brs = msg.frame.brs;
+                                ui.add_enabled_ui(fd, |ui| {
+                                    ui.checkbox(&mut brs, "");
+                                });
+                                if !fd {
+                                    brs = false;
+                                }
+
+                                ui.label(msg.frame.dlc_code().to_string());
                                 ui.label(msg.frame.dlc.to_string());
 
                                 let data_buf = self
@@ -128,10 +165,13 @@ impl Inspector {
                                     .entry(i)
                                     .or_insert_with(|| hex_bytes(msg.frame.payload()));
                                 let data_resp = ui
-                                    .add(egui::TextEdit::singleline(data_buf).desired_width(140.0));
+                                    .add(egui::TextEdit::singleline(data_buf).desired_width(220.0));
 
                                 ui.add(egui::DragValue::new(&mut msg.period_ms).range(1..=60_000));
                                 ui.checkbox(&mut msg.enabled, "");
+                                if ui.small_button("🗑").clicked() {
+                                    remove = Some(i);
+                                }
                                 ui.end_row();
 
                                 // Apply edits after drawing the row so widget IDs stay stable.
@@ -140,7 +180,12 @@ impl Inspector {
                                         .ok();
                                 let data_val = parse_hex_bytes(data_buf);
                                 if let (Some(id), Some(data)) = (id_val, data_val.as_ref()) {
-                                    match CanFrame::new(id, ext, data) {
+                                    let result = if fd {
+                                        CanFrame::new_fd(id, ext, brs, data)
+                                    } else {
+                                        CanFrame::new(id, ext, data)
+                                    };
+                                    match result {
                                         Ok(frame) => {
                                             msg.frame = frame;
                                             self.error = None;
@@ -148,13 +193,12 @@ impl Inspector {
                                         Err(e) => self.error = Some(e.to_string()),
                                     }
                                 } else if id_resp.changed() || data_resp.changed() {
-                                    self.error = Some("invalid ID or data hex".to_string());
+                                    self.error = Some(
+                                        "invalid ID or data hex (FD lengths allowed: 0-8, 12, \
+                                         16, 20, 24, 32, 48, 64 bytes; classic: 0-8 bytes)"
+                                            .to_string(),
+                                    );
                                 }
-
-                                if ui.small_button("🗑").clicked() {
-                                    remove = Some(i);
-                                }
-                                ui.end_row();
                             }
                         });
 

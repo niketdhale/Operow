@@ -45,29 +45,46 @@ impl Graph {
         }
     }
 
-    /// Build the default preloaded topology: one 500k bus with three ECUs.
+    /// Build the default preloaded topology: one CAN FD bus (500k/2M) with
+    /// three ECUs.
     pub fn default_demo() -> Self {
         let mut g = Graph::new();
         let bus = g.add_bus(Pos2::new(80.0, 260.0));
-        let bus_id = match &g.snarl[bus] {
-            GraphNode::Bus(b) => b.id,
+        let bus_id = match &mut g.snarl[bus] {
+            GraphNode::Bus(b) => {
+                b.fd_enabled = true;
+                b.data_bitrate = 2_000_000;
+                b.id
+            }
             GraphNode::Ecu(_) => unreachable!(),
         };
 
         let engine = g.add_ecu(Pos2::new(60.0, 60.0), "Engine");
         if let GraphNode::Ecu(e) = &mut g.snarl[engine] {
-            e.tx.push(tx("EngineRPM", 0x100, 10));
-            e.tx.push(tx("EngineTemp", 0x101, 100));
+            e.tx.push(tx(
+                "EngineRPM",
+                0x100,
+                10,
+                &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+            ));
+            e.tx.push(tx("EngineTemp", 0x101, 100, &[0x5A, 0x01]));
         }
 
         let brake = g.add_ecu(Pos2::new(280.0, 60.0), "Brake");
         if let GraphNode::Ecu(e) = &mut g.snarl[brake] {
-            e.tx.push(tx("BrakeStatus", 0x200, 20));
+            e.tx.push(tx("BrakeStatus", 0x200, 20, &[0x01, 0x02, 0x03, 0x04]));
         }
 
         let gateway = g.add_ecu(Pos2::new(500.0, 60.0), "Gateway");
         if let GraphNode::Ecu(e) = &mut g.snarl[gateway] {
-            e.tx.push(tx("GatewayHeartbeat", 0x300, 50));
+            e.tx.push(tx("GatewayHeartbeat", 0x300, 50, &[0xAA]));
+            let fd_data: Vec<u8> = (0..64).collect();
+            e.tx.push(operow_core::TxMessage {
+                name: "GwDiagFD".to_string(),
+                frame: operow_core::CanFrame::new_fd(0x400, false, true, &fd_data).unwrap(),
+                period_ms: 100,
+                enabled: true,
+            });
         }
 
         for ecu in [engine, brake, gateway] {
@@ -110,6 +127,8 @@ impl Graph {
                 id,
                 name,
                 bitrate: 500_000,
+                fd_enabled: false,
+                data_bitrate: 2_000_000,
             }),
         )
     }
@@ -189,10 +208,10 @@ impl Graph {
     }
 }
 
-fn tx(name: &str, id: u32, period_ms: u32) -> TxMessage {
+fn tx(name: &str, id: u32, period_ms: u32, data: &[u8]) -> TxMessage {
     TxMessage {
         name: name.to_string(),
-        frame: operow_core::CanFrame::new(id, false, &[0; 8]).unwrap(),
+        frame: operow_core::CanFrame::new(id, false, data).unwrap(),
         period_ms,
         enabled: true,
     }
@@ -218,7 +237,18 @@ impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
     fn title(&mut self, node: &GraphNode) -> String {
         match node {
             GraphNode::Ecu(_) => format!("🖳 {}", node.name()),
-            GraphNode::Bus(_) => format!("▬ {}", node.name()),
+            GraphNode::Bus(b) => {
+                if b.fd_enabled {
+                    format!(
+                        "▬ {} (CAN FD {}/{})",
+                        node.name(),
+                        format_bitrate(b.bitrate),
+                        format_bitrate(b.data_bitrate)
+                    )
+                } else {
+                    format!("▬ {} ({})", node.name(), format_bitrate(b.bitrate))
+                }
+            }
         }
     }
 
@@ -343,6 +373,17 @@ impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
         if let Some(bg) = background {
             bg.draw(viewport, snarl_style, style, painter);
         }
+    }
+}
+
+/// Formats a bit/s value compactly, e.g. `500k`, `2M`.
+pub fn format_bitrate(bps: u32) -> String {
+    if bps >= 1_000_000 && bps.is_multiple_of(1_000_000) {
+        format!("{}M", bps / 1_000_000)
+    } else if bps >= 1_000 && bps.is_multiple_of(1_000) {
+        format!("{}k", bps / 1_000)
+    } else {
+        format!("{bps}")
     }
 }
 

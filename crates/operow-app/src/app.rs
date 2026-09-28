@@ -17,6 +17,7 @@ struct LiveBusStats {
     load_pct: f64,
     frames_per_s: f64,
     total_frames: u64,
+    error_frames: u64,
 }
 
 pub struct OperowApp {
@@ -191,6 +192,7 @@ impl OperowApp {
                     entry.load_pct = d_busy as f64 / dt_ns as f64 * 100.0;
                     entry.frames_per_s = d_frames as f64 / (dt_ns as f64 / 1e9);
                     entry.total_frames = stats.frames;
+                    entry.error_frames = stats.error_frames;
                     entry.prev = stats;
                 }
                 self.prev_stats_time = time;
@@ -319,10 +321,20 @@ impl OperowApp {
             ui.horizontal(|ui| {
                 for (bus, stats) in &self.bus_stats {
                     let name = self.names.bus_name(*bus);
-                    ui.label(format!(
-                        "{name}: {:.1}% load, {:.0} fps, {} total",
-                        stats.load_pct, stats.frames_per_s, stats.total_frames
-                    ));
+                    if stats.error_frames > 0 {
+                        ui.label(format!(
+                            "{name}: {:.1}% load, {:.0} fps, {} total, {} errors",
+                            stats.load_pct,
+                            stats.frames_per_s,
+                            stats.total_frames,
+                            stats.error_frames
+                        ));
+                    } else {
+                        ui.label(format!(
+                            "{name}: {:.1}% load, {:.0} fps, {} total",
+                            stats.load_pct, stats.frames_per_s, stats.total_frames
+                        ));
+                    }
                     ui.separator();
                 }
             });

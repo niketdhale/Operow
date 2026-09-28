@@ -95,6 +95,9 @@ struct EngineState {
     run_state: RunState,
     speed: f64,
     virtual_ns: u64,
+    /// Buses we have already logged a "dropped FD frame(s)" warning for, so
+    /// we only warn once per bus.
+    warned_fd_buses: std::collections::HashSet<BusId>,
 }
 
 fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
@@ -104,6 +107,7 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         run_state: RunState::Stopped,
         speed: 1.0,
         virtual_ns: 0,
+        warned_fd_buses: std::collections::HashSet::new(),
     };
     let mut last_tick = Instant::now();
     let mut last_stats = Instant::now();
@@ -153,6 +157,14 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         if last_stats.elapsed() >= STATS_INTERVAL {
             last_stats = Instant::now();
             let buses: Vec<_> = sim.stats().iter().map(|(b, s)| (*b, *s)).collect();
+            for (bus, s) in &buses {
+                if s.error_frames > 0 && state.warned_fd_buses.insert(*bus) {
+                    let _ = ev_tx.try_send(EngineEvent::Log(format!(
+                        "bus {bus:?}: dropped {} CAN FD frame(s) sent on a non-FD bus",
+                        s.error_frames
+                    )));
+                }
+            }
             let _ = ev_tx.try_send(EngineEvent::Stats {
                 time: Timestamp(state.virtual_ns),
                 buses,
@@ -176,6 +188,7 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 state.topology = Some(topology);
                 state.virtual_ns = 0;
                 state.run_state = RunState::Stopped;
+                state.warned_fd_buses.clear();
                 let _ = ev_tx.try_send(EngineEvent::Log("topology loaded".into()));
                 let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
             }
@@ -197,6 +210,7 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
             }
             state.virtual_ns = 0;
             state.run_state = RunState::Stopped;
+            state.warned_fd_buses.clear();
             let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
         }
         Command::Pause => {
