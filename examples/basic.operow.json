@@ -1,0 +1,90 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "name": "Engine",
+      "tx": [
+        {
+          "name": "EngineData",
+          "frame": {
+            "id": 256,
+            "extended": false,
+            "dlc": 8,
+            "data": [0, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 10,
+          "enabled": true
+        },
+        {
+          "name": "EngineStatus",
+          "frame": {
+            "id": 257,
+            "extended": false,
+            "dlc": 2,
+            "data": [0, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 100,
+          "enabled": true
+        }
+      ],
+      "pos": [100.0, 200.0]
+    },
+    {
+      "id": 2,
+      "name": "Brake",
+      "tx": [
+        {
+          "name": "BrakeData",
+          "frame": {
+            "id": 512,
+            "extended": false,
+            "dlc": 4,
+            "data": [0, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 20,
+          "enabled": true
+        }
+      ],
+      "pos": [300.0, 200.0]
+    },
+    {
+      "id": 3,
+      "name": "Gateway",
+      "tx": [
+        {
+          "name": "GwStatus",
+          "frame": {
+            "id": 768,
+            "extended": false,
+            "dlc": 1,
+            "data": [0, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 50,
+          "enabled": true
+        }
+      ],
+      "pos": [500.0, 200.0]
+    }
+  ],
+  "buses": [
+    {
+      "id": 1,
+      "name": "CAN1",
+      "bitrate": 500000
+    }
+  ],
+  "links": [
+    {
+      "node": 1,
+      "bus": 1
+    },
+    {
+      "node": 2,
+      "bus": 1
+    },
+    {
+      "node": 3,
+      "bus": 1
+    }
+  ]
+}
