@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/operow-core",
     "crates/operow-engine",
+    "crates/operow-app",
 ]
 
 [workspace.package]
