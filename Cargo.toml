@@ -4,6 +4,7 @@ members = [
     "crates/operow-core",
     "crates/operow-engine",
     "crates/operow-app",
+    "crates/egui-flow",
 ]
 
 [workspace.package]
