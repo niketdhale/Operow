@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use operow_core::{BusId, Timestamp, Topology};
 use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunState};
 
-use crate::graph::{Graph, GraphActions, GraphNode, GraphViewer};
+use egui_flow::{Flow, FlowOptions};
+
+use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::inspector::Inspector;
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace};
@@ -36,6 +38,9 @@ pub struct OperowApp {
     theme: AppTheme,
     status_log: Vec<String>,
     last_error: Option<String>,
+    /// Flow-space position of the last right-click on the canvas, where
+    /// "Add ECU"/"Add CAN Bus" place the new node.
+    menu_pos: Option<egui::Pos2>,
 
     // Interactive generator scratch state, stored per selected ECU via the
     // inspector node id is out of scope here; kept minimal: a floating
@@ -68,6 +73,7 @@ impl OperowApp {
             theme: AppTheme::Light,
             status_log: Vec::new(),
             last_error: None,
+            menu_pos: None,
             screenshot_path,
             screenshot_start: None,
             screenshot_taken: false,
@@ -369,10 +375,10 @@ impl OperowApp {
     }
 
     fn send_once_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(sel) = self.graph.selected else {
+        let Some(sel) = self.graph.selected() else {
             return;
         };
-        let Some(GraphNode::Ecu(ecu)) = self.graph.snarl.get_node(sel) else {
+        let Some(GraphNode::Ecu(ecu)) = self.graph.node(sel) else {
             return;
         };
         if ecu.tx.is_empty() {
@@ -450,40 +456,59 @@ impl eframe::App for OperowApp {
                 self.send_once_ui(ui);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let running = self.run_state != RunState::Stopped;
-            let mut actions = GraphActions::default();
-            let mut pending_ecu = None;
-            let mut pending_bus = None;
-            {
-                let mut viewer = GraphViewer {
-                    theme: self.theme,
-                    running,
-                    actions: &mut actions,
-                    pending_add_ecu: &mut pending_ecu,
-                    pending_add_bus: &mut pending_bus,
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                let running = self.run_state != RunState::Stopped;
+                let opts = FlowOptions {
+                    nodes_connectable: !running,
+                    delete_key: !running,
+                    ..Default::default()
                 };
-                let style = crate::graph::snarl_style(self.theme);
-                self.graph.snarl.show(&mut viewer, &style, "snarl", ui);
-            }
-            if let Some(pos) = pending_ecu {
-                let id = self.graph.add_ecu(pos, "NewEcu");
-                self.graph.selected = Some(id);
-            }
-            if let Some(pos) = pending_bus {
-                let id = self.graph.add_bus(pos);
-                self.graph.selected = Some(id);
-            }
-            if let Some(sel) = actions.select {
-                self.graph.selected = Some(sel);
-            }
-            if let Some(del) = actions.delete {
-                self.graph.snarl.remove_node(del);
-                if self.graph.selected == Some(del) {
-                    self.graph.selected = None;
+                let mut viewer = GraphViewer { theme: self.theme };
+                let out =
+                    Flow::new("graph")
+                        .options(opts)
+                        .show(ui, &mut self.graph.state, &mut viewer);
+
+                if running {
+                    return;
                 }
-            }
-        });
+                if out.pane.secondary_clicked() {
+                    self.menu_pos = out.pane.interact_pointer_pos();
+                }
+                let pos = self.menu_pos.unwrap_or(egui::pos2(40.0, 40.0));
+                out.pane.context_menu(|ui| {
+                    ui.set_min_width(160.0);
+                    if ui.button("Add ECU").clicked() {
+                        let id = self.graph.add_ecu(pos, "NewEcu");
+                        self.graph.select(id);
+                        ui.close();
+                    }
+                    if ui.button("Add CAN Bus").clicked() {
+                        let id = self.graph.add_bus(pos);
+                        self.graph.select(id);
+                        ui.close();
+                    }
+                });
+                let mut delete = None;
+                for (id, resp) in &out.nodes {
+                    resp.context_menu(|ui| {
+                        ui.set_min_width(120.0);
+                        if ui.button("Properties").clicked() {
+                            self.graph.select(*id);
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            delete = Some(*id);
+                            ui.close();
+                        }
+                    });
+                }
+                if let Some(id) = delete {
+                    self.graph.remove(id);
+                }
+            });
 
         self.take_screenshot_if_needed(ctx);
 

@@ -13,12 +13,11 @@ A CANoe-inspired ECU network simulator for automotive CAN bus design and testing
 
 ## Architecture
 
-The workspace consists of four crates:
+The workspace consists of three crates:
 
 - **operow-core**: Data types and CAN frame definitions
 - **operow-engine**: Discrete-event simulation engine
-- **operow-app**: Native egui frontend
-- **egui-flow**: Reusable React Flow-style node-graph canvas widget for egui (see `crates/egui-flow`)
+- **operow-app**: Native egui frontend. The node-graph canvas comes from [`egui-flow`](https://github.com/niketdhale/egui-flow), a separate React Flow-style widget crate pulled in as a git dependency
 
 ## Build & Run
 

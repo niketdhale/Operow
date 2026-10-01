@@ -12,7 +12,7 @@ path = "src/main.rs"
 eframe = "0.33"
 egui = "0.33"
 egui_extras = "0.33"
-egui-snarl = "0.9"
+egui-flow = { git = "https://github.com/niketdhale/egui-flow", rev = "3daa9fe45a08c0447e377fde79e806e7c7264f0f" }
 rfd = "0.15"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
