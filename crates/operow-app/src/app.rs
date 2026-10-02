@@ -7,13 +7,15 @@ use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunSta
 use egui_flow::{Flow, FlowOptions, PulseStyle};
 
 use crate::dbcs;
-use crate::graph::{Graph, GraphNode, GraphViewer};
+use crate::graph::{Graph, GraphNode, GraphViewer, PulseDir, PulseSpec, pulses_for_events};
 use crate::icons;
 use crate::inspector::Inspector;
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceMode};
 
 const MAX_EVENTS_PER_FRAME: usize = 256;
+/// Minimum gap between pulses of one style on one wire.
+const PULSE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Per-bus live stats shown in the top bar.
 #[derive(Default, Clone, Copy)]
@@ -68,6 +70,10 @@ pub struct OperowApp {
     bus_stats: std::collections::HashMap<BusId, LiveBusStats>,
 
     theme: AppTheme,
+    /// Show pulses on the wires for live traffic.
+    animate_traffic: bool,
+    /// When each pulse kind last fired on a wire, for throttling.
+    pulse_last: std::collections::HashMap<PulseSpec, std::time::Instant>,
     status_log: Vec<String>,
     show_log: bool,
     last_error: Option<String>,
@@ -109,6 +115,8 @@ impl OperowApp {
             prev_stats_time: Timestamp::ZERO,
             bus_stats: Default::default(),
             theme: AppTheme::Light,
+            animate_traffic: true,
+            pulse_last: Default::default(),
             status_log: Vec::new(),
             show_log: false,
             last_error: None,
@@ -486,6 +494,45 @@ impl OperowApp {
         }
     }
 
+    /// Animate each frame along its real route: the sender's wire onto the
+    /// bus. Forwarded frames use the gateway accent. At most one pulse per
+    /// wire and style per `PULSE_MIN_INTERVAL`.
+    fn animate_frames(&mut self, frames: &[operow_core::BusEvent]) {
+        let links = self.graph.to_topology().links;
+        let now = std::time::Instant::now();
+        self.pulse_last
+            .retain(|_, t| now.duration_since(*t) < PULSE_MIN_INTERVAL * 20);
+        for spec in pulses_for_events(frames, &links) {
+            // egui-flow pulses only run source->target (ECU to bus), so the
+            // bus-to-receiver legs cannot be drawn.
+            if spec.dir != PulseDir::ToBus {
+                continue;
+            }
+            if self
+                .pulse_last
+                .get(&spec)
+                .is_some_and(|t| now.duration_since(*t) < PULSE_MIN_INTERVAL)
+            {
+                continue;
+            }
+            self.pulse_last.insert(spec, now);
+            let color = if spec.kind.forwarded {
+                self.theme.gateway_color()
+            } else {
+                self.theme.bus_color(if spec.kind.fd { 2 } else { 0 })
+            };
+            self.graph.pulse_link(
+                spec.node,
+                spec.bus,
+                PulseStyle {
+                    color: Some(color),
+                    radius: 4.0,
+                    duration: 0.6,
+                },
+            );
+        }
+    }
+
     fn handle_event(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::Frames(frames) => {
@@ -500,23 +547,8 @@ impl OperowApp {
                         .push(f, &bus_name, &sender_name, &origin_name, &msg_name);
                     self.sim_time = f.time;
                 }
-                // One particle per sending ECU per batch: shows live traffic on
-                // the wires without a dot for each of the hundreds of frames/s.
-                let mut senders: std::collections::HashMap<operow_core::NodeId, bool> =
-                    std::collections::HashMap::new();
-                for f in &frames {
-                    *senders.entry(f.sender).or_default() |= f.frame.fd;
-                }
-                for (sender, fd) in senders {
-                    let color = self.theme.bus_color(if fd { 2 } else { 0 });
-                    self.graph.pulse_sender(
-                        sender,
-                        PulseStyle {
-                            color: Some(color),
-                            radius: 4.0,
-                            duration: 0.6,
-                        },
-                    );
+                if self.animate_traffic {
+                    self.animate_frames(&frames);
                 }
             }
             EngineEvent::Stats { time, buses } => {
@@ -631,6 +663,7 @@ impl OperowApp {
             ui.label(format!("trace: {} rows", self.trace.len()));
 
             ui.separator();
+            ui.checkbox(&mut self.animate_traffic, "Animate traffic");
             let theme_label = match self.theme {
                 AppTheme::Light => "🌙 Dark",
                 AppTheme::Dark => "☀ Light",

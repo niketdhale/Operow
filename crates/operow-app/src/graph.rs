@@ -5,7 +5,7 @@ use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
 use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
 use operow_core::{
-    BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
+    BusEvent, BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
 };
 
 use crate::icons;
@@ -168,26 +168,14 @@ impl Graph {
         self.state.nodes.iter().find(|n| n.selected).map(|n| n.id)
     }
 
-    /// Send a particle down every wire leaving the ECU `sender`, to show it
-    /// transmitting a frame. No-op if the ECU isn't on the canvas.
-    pub fn pulse_sender(&mut self, sender: NodeId, style: PulseStyle) {
-        let Some(node) = self
-            .state
-            .nodes
-            .iter()
-            .find(|n| matches!(&n.data, GraphNode::Ecu(e) if e.id == sender))
-            .map(|n| n.id)
-        else {
-            return;
-        };
-        let edges: Vec<_> = self
-            .state
-            .edges
-            .iter()
-            .filter(|e| e.source == node)
-            .map(|e| e.id)
-            .collect();
-        for edge in edges {
+    /// Send a particle along the wire between ECU `node` and bus `bus`, in
+    /// the wire's own direction (ECU to bus). No-op if there is no such wire.
+    pub fn pulse_link(&mut self, node: NodeId, bus: BusId, style: PulseStyle) {
+        let edge = self.state.edges.iter().find(|e| {
+            matches!(self.node(e.source), Some(GraphNode::Ecu(n)) if n.id == node)
+                && matches!(self.node(e.target), Some(GraphNode::Bus(b)) if b.id == bus)
+        });
+        if let Some(edge) = edge.map(|e| e.id) {
             self.state.pulse_edge(edge, style);
         }
     }
@@ -428,5 +416,142 @@ mod tests {
         e.kind = NodeKind::Ecu;
         e.tx.clear();
         assert_eq!(subtitle(&e), None);
+    }
+}
+
+/// Which way a pulse travels along an ECU-bus wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PulseDir {
+    /// ECU drives the frame onto the bus.
+    ToBus,
+    /// Bus delivers the frame to a receiving ECU.
+    FromBus,
+}
+
+/// Visual class of a pulse: originated (`Tx`) vs. gateway-forwarded
+/// (`Forwarded`), each optionally CAN FD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PulseKind {
+    pub forwarded: bool,
+    pub fd: bool,
+}
+
+/// One animated hop of a frame along an ECU-bus wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PulseSpec {
+    pub node: NodeId,
+    pub bus: BusId,
+    pub dir: PulseDir,
+    pub kind: PulseKind,
+}
+
+/// Map a batch of bus events onto a deduplicated list of wire pulses: the
+/// sender's wire to the bus, then the bus's wire to every other linked node.
+/// Order is first-seen, so the sender leg precedes the receiver legs.
+pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> {
+    let mut out: Vec<PulseSpec> = Vec::new();
+    let mut push = |spec: PulseSpec| {
+        if !out.contains(&spec) {
+            out.push(spec);
+        }
+    };
+    for ev in events {
+        let kind = PulseKind {
+            forwarded: ev.hop > 0,
+            fd: ev.frame.fd,
+        };
+        push(PulseSpec {
+            node: ev.sender,
+            bus: ev.bus,
+            dir: PulseDir::ToBus,
+            kind,
+        });
+        for l in links
+            .iter()
+            .filter(|l| l.bus == ev.bus && l.node != ev.sender)
+        {
+            push(PulseSpec {
+                node: l.node,
+                bus: ev.bus,
+                dir: PulseDir::FromBus,
+                kind,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+    use operow_core::{CanFrame, Direction, Timestamp};
+
+    fn ev(bus: u32, sender: u32, hop: u8, fd: bool) -> BusEvent {
+        let frame = if fd {
+            CanFrame::new_fd(0x100, false, false, &[0; 12]).unwrap()
+        } else {
+            CanFrame::new(0x100, false, &[0; 8]).unwrap()
+        };
+        BusEvent {
+            time: Timestamp(0),
+            bus: BusId(bus),
+            sender: NodeId(sender),
+            origin: NodeId(1),
+            dir: if hop > 0 {
+                Direction::Rx
+            } else {
+                Direction::Tx
+            },
+            frame_uid: 1,
+            hop,
+            frame,
+        }
+    }
+
+    fn links() -> Vec<Link> {
+        [(1, 1), (9, 1), (9, 2), (2, 2), (3, 2)]
+            .iter()
+            .map(|&(n, b)| Link {
+                node: NodeId(n),
+                bus: BusId(b),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_event_pulses_gateway_to_bus2() {
+        let p = pulses_for_events(&[ev(2, 9, 1, false)], &links());
+        assert_eq!(
+            p[0],
+            PulseSpec {
+                node: NodeId(9),
+                bus: BusId(2),
+                dir: PulseDir::ToBus,
+                kind: PulseKind {
+                    forwarded: true,
+                    fd: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn receivers_included_sender_excluded() {
+        let p = pulses_for_events(&[ev(2, 9, 1, false)], &links());
+        let from: Vec<_> = p
+            .iter()
+            .filter(|s| s.dir == PulseDir::FromBus)
+            .map(|s| s.node)
+            .collect();
+        assert_eq!(from, vec![NodeId(2), NodeId(3)]);
+        assert_eq!(p.len(), 3);
+    }
+
+    #[test]
+    fn duplicates_are_merged_but_styles_kept() {
+        let evs = [ev(1, 1, 0, false), ev(1, 1, 0, false), ev(1, 1, 0, true)];
+        let p = pulses_for_events(&evs, &links());
+        // 1 ToBus + 1 FromBus (node 9) per style.
+        assert_eq!(p.len(), 4);
     }
 }
