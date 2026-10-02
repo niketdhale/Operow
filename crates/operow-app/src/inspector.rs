@@ -1,7 +1,7 @@
 //! Left side panel: node palette + properties inspector for the selected
 //! ECU or CAN bus.
 
-use egui_snarl::NodeId as SnarlId;
+use egui_flow::NodeId as FlowId;
 use operow_core::CanFrame;
 
 use crate::graph::{Graph, GraphNode};
@@ -13,7 +13,7 @@ pub struct Inspector {
     data_buf: std::collections::HashMap<usize, String>,
     id_buf: std::collections::HashMap<usize, String>,
     error: Option<String>,
-    last_sel: Option<SnarlId>,
+    last_sel: Option<FlowId>,
 }
 
 impl Inspector {
@@ -43,14 +43,10 @@ impl Inspector {
             );
         }
 
-        let Some(sel) = graph.selected else {
+        let Some(sel) = graph.selected() else {
             ui.label("Select a node to edit its properties.");
             return;
         };
-        if graph.snarl.get_node(sel).is_none() {
-            graph.selected = None;
-            return;
-        }
 
         if self.last_sel != Some(sel) {
             self.last_sel = Some(sel);
@@ -65,8 +61,8 @@ impl Inspector {
         });
     }
 
-    fn node_ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, sel: SnarlId, running: bool) {
-        let node = graph.snarl.get_node_mut(sel).expect("checked above");
+    fn node_ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, sel: FlowId, running: bool) {
+        let node = graph.node_mut(sel).expect("selected node exists");
         match node {
             GraphNode::Bus(bus) => {
                 ui.add_enabled_ui(!running, |ui| {

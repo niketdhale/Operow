@@ -1,9 +1,8 @@
 //! The node-graph editor: ECU and CAN-bus nodes wired together with
-//! `egui-snarl`, convertible to/from an `operow_core::Topology`.
+//! `egui-flow`, convertible to/from an `operow_core::Topology`.
 
-use egui::{Color32, Pos2, Stroke};
-use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer};
-use egui_snarl::{InPin, InPinId, NodeId as SnarlId, OutPin, OutPinId, Snarl};
+use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
+use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
 use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, Topology, TxMessage};
 
@@ -25,23 +24,21 @@ impl GraphNode {
     }
 }
 
-/// Owns the snarl graph plus the id counters needed to allocate fresh
-/// `NodeId`/`BusId` values for new nodes.
+/// Owns the flow graph plus the id counters needed to allocate fresh
+/// `NodeId`/`BusId` values for new nodes. The selection lives in the flow
+/// state, so the properties inspector reads it from there.
 pub struct Graph {
-    pub snarl: Snarl<GraphNode>,
+    pub state: FlowState<GraphNode, ()>,
     next_node_id: u32,
     next_bus_id: u32,
-    /// Selected node, kept for the properties inspector.
-    pub selected: Option<SnarlId>,
 }
 
 impl Graph {
     pub fn new() -> Self {
         Graph {
-            snarl: Snarl::new(),
+            state: FlowState::new(),
             next_node_id: 1,
             next_bus_id: 1,
-            selected: None,
         }
     }
 
@@ -49,18 +46,14 @@ impl Graph {
     /// three ECUs.
     pub fn default_demo() -> Self {
         let mut g = Graph::new();
-        let bus = g.add_bus(Pos2::new(80.0, 260.0));
-        let bus_id = match &mut g.snarl[bus] {
-            GraphNode::Bus(b) => {
-                b.fd_enabled = true;
-                b.data_bitrate = 2_000_000;
-                b.id
-            }
-            GraphNode::Ecu(_) => unreachable!(),
-        };
+        let bus = g.add_bus(Pos2::new(160.0, 260.0));
+        if let Some(GraphNode::Bus(b)) = g.node_mut(bus) {
+            b.fd_enabled = true;
+            b.data_bitrate = 2_000_000;
+        }
 
         let engine = g.add_ecu(Pos2::new(60.0, 60.0), "Engine");
-        if let GraphNode::Ecu(e) = &mut g.snarl[engine] {
+        if let Some(GraphNode::Ecu(e)) = g.node_mut(engine) {
             e.tx.push(tx(
                 "EngineRPM",
                 0x100,
@@ -71,12 +64,12 @@ impl Graph {
         }
 
         let brake = g.add_ecu(Pos2::new(280.0, 60.0), "Brake");
-        if let GraphNode::Ecu(e) = &mut g.snarl[brake] {
+        if let Some(GraphNode::Ecu(e)) = g.node_mut(brake) {
             e.tx.push(tx("BrakeStatus", 0x200, 20, &[0x01, 0x02, 0x03, 0x04]));
         }
 
         let gateway = g.add_ecu(Pos2::new(500.0, 60.0), "Gateway");
-        if let GraphNode::Ecu(e) = &mut g.snarl[gateway] {
+        if let Some(GraphNode::Ecu(e)) = g.node_mut(gateway) {
             e.tx.push(tx("GatewayHeartbeat", 0x300, 50, &[0xAA]));
             let fd_data: Vec<u8> = (0..64).collect();
             e.tx.push(operow_core::TxMessage {
@@ -88,25 +81,16 @@ impl Graph {
         }
 
         for ecu in [engine, brake, gateway] {
-            g.snarl.connect(
-                OutPinId {
-                    node: ecu,
-                    output: 0,
-                },
-                InPinId {
-                    node: bus,
-                    input: 0,
-                },
-            );
-            let _ = bus_id;
+            g.state.connect(ecu, bus, ());
         }
+        g.state.fit_view();
         g
     }
 
-    pub fn add_ecu(&mut self, pos: Pos2, name: &str) -> SnarlId {
+    pub fn add_ecu(&mut self, pos: Pos2, name: &str) -> FlowId {
         let id = NodeId(self.next_node_id);
         self.next_node_id += 1;
-        self.snarl.insert_node(
+        self.state.add_node(
             pos,
             GraphNode::Ecu(EcuConfig {
                 id,
@@ -117,11 +101,11 @@ impl Graph {
         )
     }
 
-    pub fn add_bus(&mut self, pos: Pos2) -> SnarlId {
+    pub fn add_bus(&mut self, pos: Pos2) -> FlowId {
         let id = BusId(self.next_bus_id);
         self.next_bus_id += 1;
         let name = format!("CAN{}", self.next_bus_id - 1);
-        self.snarl.insert_node(
+        self.state.add_node(
             pos,
             GraphNode::Bus(CanBusConfig {
                 id,
@@ -133,28 +117,76 @@ impl Graph {
         )
     }
 
+    pub fn node(&self, id: FlowId) -> Option<&GraphNode> {
+        self.state.node(id).map(|n| &n.data)
+    }
+
+    pub fn node_mut(&mut self, id: FlowId) -> Option<&mut GraphNode> {
+        self.state.node_mut(id).map(|n| &mut n.data)
+    }
+
+    /// Remove a node and the wires attached to it.
+    pub fn remove(&mut self, id: FlowId) {
+        self.state.remove_node(id);
+    }
+
+    /// Make `id` the only selected node.
+    pub fn select(&mut self, id: FlowId) {
+        self.state.clear_selection();
+        if let Some(n) = self.state.node_mut(id) {
+            n.selected = true;
+        }
+    }
+
+    /// The selected node shown in the properties inspector, if any.
+    pub fn selected(&self) -> Option<FlowId> {
+        self.state.nodes.iter().find(|n| n.selected).map(|n| n.id)
+    }
+
+    /// Send a particle down every wire leaving the ECU `sender`, to show it
+    /// transmitting a frame. No-op if the ECU isn't on the canvas.
+    pub fn pulse_sender(&mut self, sender: NodeId, style: PulseStyle) {
+        let Some(node) = self
+            .state
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.data, GraphNode::Ecu(e) if e.id == sender))
+            .map(|n| n.id)
+        else {
+            return;
+        };
+        let edges: Vec<_> = self
+            .state
+            .edges
+            .iter()
+            .filter(|e| e.source == node)
+            .map(|e| e.id)
+            .collect();
+        for edge in edges {
+            self.state.pulse_edge(edge, style);
+        }
+    }
+
     /// Convert the graph into a `Topology` for the simulation engine.
     pub fn to_topology(&self) -> Topology {
         let mut nodes = Vec::new();
         let mut buses = Vec::new();
         let mut links = Vec::new();
 
-        for (id, node) in self.snarl.nodes_ids_data() {
-            match &node.value {
+        for node in &self.state.nodes {
+            match &node.data {
                 GraphNode::Ecu(e) => {
                     let mut cfg = e.clone();
-                    cfg.pos = (node.pos.x, node.pos.y);
+                    cfg.pos = (node.position.x, node.position.y);
                     nodes.push(cfg);
                 }
                 GraphNode::Bus(b) => buses.push(b.clone()),
             }
-            let _ = id;
         }
 
-        for (out_pin, in_pin) in self.snarl.wires() {
-            let (ecu_side, bus_side) = (out_pin.node, in_pin.node);
+        for edge in &self.state.edges {
             if let (Some(GraphNode::Ecu(e)), Some(GraphNode::Bus(b))) =
-                (self.snarl.get_node(ecu_side), self.snarl.get_node(bus_side))
+                (self.node(edge.source), self.node(edge.target))
             {
                 links.push(Link {
                     node: e.id,
@@ -178,32 +210,22 @@ impl Graph {
 
         for ecu in &topo.nodes {
             let pos = Pos2::new(ecu.pos.0, ecu.pos.1);
-            let sid = g.snarl.insert_node(pos, GraphNode::Ecu(ecu.clone()));
+            let fid = g.state.add_node(pos, GraphNode::Ecu(ecu.clone()));
             g.next_node_id = g.next_node_id.max(ecu.id.0 + 1);
-            ecu_map.insert(ecu.id, sid);
+            ecu_map.insert(ecu.id, fid);
         }
         for (i, bus) in topo.buses.iter().enumerate() {
-            let pos = Pos2::new(80.0, 260.0 + 160.0 * i as f32);
-            let sid = g.snarl.insert_node(pos, GraphNode::Bus(bus.clone()));
+            let pos = Pos2::new(160.0, 260.0 + 160.0 * i as f32);
+            let fid = g.state.add_node(pos, GraphNode::Bus(bus.clone()));
             g.next_bus_id = g.next_bus_id.max(bus.id.0 + 1);
-            bus_map.insert(bus.id, sid);
+            bus_map.insert(bus.id, fid);
         }
         for link in &topo.links {
-            if let (Some(&ecu_sid), Some(&bus_sid)) =
-                (ecu_map.get(&link.node), bus_map.get(&link.bus))
-            {
-                g.snarl.connect(
-                    OutPinId {
-                        node: ecu_sid,
-                        output: 0,
-                    },
-                    InPinId {
-                        node: bus_sid,
-                        input: 0,
-                    },
-                );
+            if let (Some(&ecu), Some(&bus)) = (ecu_map.get(&link.node), bus_map.get(&link.bus)) {
+                g.state.connect(ecu, bus, ());
             }
         }
+        g.state.fit_view();
         g
     }
 }
@@ -217,92 +239,29 @@ fn tx(name: &str, id: u32, period_ms: u32, data: &[u8]) -> TxMessage {
     }
 }
 
-/// Actions requested from within the graph viewer that the app needs to
-/// apply outside of the immediate `show` borrow (e.g. opening menus).
-#[derive(Default)]
-pub struct GraphActions {
-    pub select: Option<SnarlId>,
-    pub delete: Option<SnarlId>,
-}
-
-pub struct GraphViewer<'a> {
+/// Renders ECU and bus nodes. ECUs have a single output on the bottom edge
+/// and buses a single input on the top edge, so the only wires that can be
+/// drawn are ECU -> bus.
+pub struct GraphViewer {
     pub theme: AppTheme,
-    pub running: bool,
-    pub actions: &'a mut GraphActions,
-    pub pending_add_ecu: &'a mut Option<Pos2>,
-    pub pending_add_bus: &'a mut Option<Pos2>,
 }
 
-impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
-    fn title(&mut self, node: &GraphNode) -> String {
-        match node {
-            GraphNode::Ecu(_) => format!("🖳 {}", node.name()),
-            GraphNode::Bus(b) => {
-                if b.fd_enabled {
-                    format!(
-                        "▬ {} (CAN FD {}/{})",
-                        node.name(),
-                        format_bitrate(b.bitrate),
-                        format_bitrate(b.data_bitrate)
-                    )
-                } else {
-                    format!("▬ {} ({})", node.name(), format_bitrate(b.bitrate))
-                }
-            }
-        }
-    }
-
-    fn inputs(&mut self, node: &GraphNode) -> usize {
-        match node {
-            GraphNode::Ecu(_) => 0,
-            GraphNode::Bus(_) => 1,
-        }
-    }
-
-    fn outputs(&mut self, node: &GraphNode) -> usize {
-        match node {
-            GraphNode::Ecu(_) => 1,
-            GraphNode::Bus(_) => 0,
-        }
-    }
-
-    fn show_input(
-        &mut self,
-        pin: &InPin,
-        ui: &mut egui::Ui,
-        snarl: &mut Snarl<GraphNode>,
-    ) -> impl SnarlPin + 'static {
-        let _ = (ui, snarl, pin);
-        PinInfo::circle()
-            .with_fill(self.theme.bus_color(0))
-            .with_stroke(Stroke::new(1.0, Color32::BLACK))
-    }
-
-    fn show_output(
-        &mut self,
-        pin: &OutPin,
-        ui: &mut egui::Ui,
-        snarl: &mut Snarl<GraphNode>,
-    ) -> impl SnarlPin + 'static {
-        let _ = (ui, snarl, pin);
-        PinInfo::circle()
-            .with_fill(self.theme.bus_color(1))
-            .with_stroke(Stroke::new(1.0, Color32::BLACK))
-    }
-
-    fn has_body(&mut self, node: &GraphNode) -> bool {
-        matches!(node, GraphNode::Ecu(e) if !e.tx.is_empty())
-    }
-
-    fn show_body(
-        &mut self,
-        node: SnarlId,
-        _inputs: &[InPin],
-        _outputs: &[OutPin],
-        ui: &mut egui::Ui,
-        snarl: &mut Snarl<GraphNode>,
-    ) {
-        if let Some(GraphNode::Ecu(e)) = snarl.get_node(node) {
+impl FlowViewer<GraphNode, ()> for GraphViewer {
+    fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
+        let title = match &node.data {
+            GraphNode::Ecu(_) => format!("🖳 {}", node.data.name()),
+            GraphNode::Bus(b) if b.fd_enabled => format!(
+                "▬ {} (CAN FD {}/{})",
+                node.data.name(),
+                format_bitrate(b.bitrate),
+                format_bitrate(b.data_bitrate)
+            ),
+            GraphNode::Bus(b) => format!("▬ {} ({})", node.data.name(), format_bitrate(b.bitrate)),
+        };
+        ui.label(egui::RichText::new(title).strong());
+        if let GraphNode::Ecu(e) = &node.data
+            && !e.tx.is_empty()
+        {
             ui.label(
                 egui::RichText::new(format!("{} msg(s)", e.tx.len()))
                     .small()
@@ -311,68 +270,30 @@ impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
         }
     }
 
-    fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<GraphNode>) {
-        if self.running {
-            return;
-        }
-        // Only allow ECU output -> Bus input connections (enforced by
-        // pin counts already, since only ECUs have outputs and only
-        // buses have inputs).
-        snarl.connect(from.id, to.id);
-    }
-
-    fn has_graph_menu(&mut self, _pos: Pos2, _snarl: &mut Snarl<GraphNode>) -> bool {
-        !self.running
-    }
-
-    fn show_graph_menu(&mut self, pos: Pos2, ui: &mut egui::Ui, _snarl: &mut Snarl<GraphNode>) {
-        ui.set_min_width(160.0);
-        if ui.button("Add ECU").clicked() {
-            *self.pending_add_ecu = Some(pos);
-            ui.close();
-        }
-        if ui.button("Add CAN Bus").clicked() {
-            *self.pending_add_bus = Some(pos);
-            ui.close();
+    fn handles(&self, node: &Node<GraphNode>) -> Vec<Handle> {
+        match node.data {
+            GraphNode::Ecu(_) => vec![Handle::source(Handle::DEFAULT_SOURCE, Side::Bottom)],
+            GraphNode::Bus(_) => vec![Handle::target(Handle::DEFAULT_TARGET, Side::Top)],
         }
     }
 
-    fn has_node_menu(&mut self, _node: &GraphNode) -> bool {
-        !self.running
+    fn node_frame(&self, ui: &egui::Ui, node: &Node<GraphNode>) -> Frame {
+        let accent = match node.data {
+            GraphNode::Ecu(_) => self.theme.bus_color(1),
+            GraphNode::Bus(_) => self.theme.bus_color(0),
+        };
+        Frame::new()
+            .fill(ui.visuals().window_fill)
+            .stroke(Stroke::new(1.5_f32, accent))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::same(8))
     }
 
-    fn show_node_menu(
-        &mut self,
-        node: SnarlId,
-        _inputs: &[InPin],
-        _outputs: &[OutPin],
-        ui: &mut egui::Ui,
-        _snarl: &mut Snarl<GraphNode>,
-    ) {
-        ui.set_min_width(120.0);
-        if ui.button("Properties").clicked() {
-            self.actions.select = Some(node);
-            ui.close();
-        }
-        if ui.button("Delete").clicked() {
-            self.actions.delete = Some(node);
-            ui.close();
-        }
-    }
-
-    fn draw_background(
-        &mut self,
-        background: Option<&egui_snarl::ui::BackgroundPattern>,
-        viewport: &egui::Rect,
-        snarl_style: &SnarlStyle,
-        style: &egui::Style,
-        painter: &egui::Painter,
-        snarl: &Snarl<GraphNode>,
-    ) {
-        let _ = snarl;
-        if let Some(bg) = background {
-            bg.draw(viewport, snarl_style, style, painter);
-        }
+    fn minimap_color(&self, node: &Node<GraphNode>) -> Option<egui::Color32> {
+        Some(match node.data {
+            GraphNode::Ecu(_) => self.theme.bus_color(1),
+            GraphNode::Bus(_) => self.theme.bus_color(0),
+        })
     }
 }
 
@@ -385,14 +306,4 @@ pub fn format_bitrate(bps: u32) -> String {
     } else {
         format!("{bps}")
     }
-}
-
-/// A dark/light-aware snarl style.
-pub fn snarl_style(theme: AppTheme) -> SnarlStyle {
-    let mut style = SnarlStyle::new();
-    style.bg_pattern_stroke = Some(match theme {
-        AppTheme::Light => Stroke::new(1.0, Color32::from_gray(210)),
-        AppTheme::Dark => Stroke::new(1.0, Color32::from_gray(60)),
-    });
-    style
 }
