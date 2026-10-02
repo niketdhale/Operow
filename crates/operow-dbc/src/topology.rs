@@ -16,20 +16,20 @@ fn fd_len(len: usize) -> usize {
 }
 
 /// Map a `GenMsgSendType` value (case-insensitive); unknown or missing falls
-/// back to cyclic when a cycle time is present, else spontaneous.
+/// back to cyclic when a cycle time is present, else event.
 fn map_send_type(send_type: Option<&str>, has_cycle: bool) -> SendType {
     match send_type.map(str::to_ascii_lowercase).as_deref() {
         Some("cyclic") => SendType::Cyclic,
-        Some("spontaneous" | "nomsgsendtype") => SendType::Spontaneous,
+        Some("spontaneous" | "nomsgsendtype") => SendType::Event,
         Some("ifactive" | "cyclicifactive") => SendType::CyclicIfActive,
         Some(
             "cyclicandspontanx"
             | "cyclicandspontaneous"
             | "cyclicifactiveandspontanwithdelay"
             | "cyclicandspontanwithdelay",
-        ) => SendType::CyclicAndSpontaneous,
+        ) => SendType::CyclicAndEvent,
         _ if has_cycle => SendType::Cyclic,
-        _ => SendType::Spontaneous,
+        _ => SendType::Event,
     }
 }
 
@@ -89,6 +89,7 @@ impl Database {
                     .collect(),
                 kind: NodeKind::Ecu,
                 pos: (80.0 + 180.0 * i as f32, 120.0),
+                script: None,
             })
             .collect::<Vec<_>>();
         let links = nodes.iter().map(|n| Link { node: n.id, bus }).collect();

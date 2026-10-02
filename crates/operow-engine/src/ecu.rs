@@ -110,7 +110,7 @@ impl EcuCtx {
 /// `msg` indexes the node's `tx` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EcuCommand {
-    /// Fire a spontaneous send of the message.
+    /// Fire an event send of the message.
     Trigger { msg: usize },
     /// Replace the payload bytes, keeping the frame id and flags.
     SetPayload { msg: usize, data: Vec<u8> },
@@ -128,6 +128,10 @@ pub trait Ecu: Send {
     fn on_frame(&mut self, _bus: BusId, _frame: &CanFrame, _ctx: &mut EcuCtx) {}
     /// Called when an [`EcuCommand`] is delivered to this node.
     fn on_command(&mut self, _cmd: &EcuCommand, _ctx: &mut EcuCtx) {}
+    /// Take any log lines produced since the last call.
+    fn drain_logs(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Timer ids at or above this value are deferred on-change sends
@@ -182,9 +186,9 @@ impl MsgState {
     fn cyclic_running(&self) -> bool {
         self.msg.enabled
             && match self.msg.send_type {
-                SendType::Cyclic | SendType::CyclicAndSpontaneous => true,
+                SendType::Cyclic | SendType::CyclicAndEvent => true,
                 SendType::CyclicIfActive => self.active,
-                SendType::Spontaneous | SendType::OnChange { .. } => false,
+                SendType::Event | SendType::OnChange { .. } => false,
             }
     }
 
@@ -253,7 +257,7 @@ impl Ecu for PeriodicEcu {
                     return;
                 };
                 match st.msg.send_type {
-                    SendType::Spontaneous | SendType::CyclicAndSpontaneous => st.send(ctx),
+                    SendType::Event | SendType::CyclicAndEvent => st.send(ctx),
                     SendType::OnChange { min_gap_ms } => st.send_on_change(*msg, min_gap_ms, ctx),
                     SendType::Cyclic | SendType::CyclicIfActive => {}
                 }
@@ -269,7 +273,7 @@ impl Ecu for PeriodicEcu {
                     return;
                 }
                 match st.msg.send_type {
-                    SendType::CyclicAndSpontaneous => st.send(ctx),
+                    SendType::CyclicAndEvent => st.send(ctx),
                     SendType::OnChange { min_gap_ms } if st.msg.frame != old => {
                         st.send_on_change(*msg, min_gap_ms, ctx)
                     }

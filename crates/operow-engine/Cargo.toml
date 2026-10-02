@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 operow-core = { workspace = true }
 crossbeam-channel = { workspace = true }
+rhai = { version = "1.26.1", features = ["sync"] }
+thiserror.workspace = true

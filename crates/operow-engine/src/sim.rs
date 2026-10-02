@@ -8,11 +8,21 @@ use operow_core::{
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 use crate::gateway::GatewayEcu;
+use crate::script::ScriptEcu;
 use crate::timing::frame_duration_ns_any;
 
 /// Maximum number of gateway hops a frame may take; forwards beyond it are
 /// dropped and counted in [`BusStats::routing_drops`].
 pub const MAX_HOPS: u8 = 8;
+
+/// Errors returned by [`Simulation::new`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SimError {
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+    #[error("script of node {node:?} failed to compile: {msg}")]
+    Script { node: NodeId, msg: String },
+}
 
 /// Per-bus utilization counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,7 +118,7 @@ impl Simulation {
     /// Build a simulation from a validated topology. Every node gets a
     /// default [`PeriodicEcu`] (or a [`GatewayEcu`] for gateways); use [`Simulation::set_ecu`] to override a
     /// node's behavior before the first call to `run_until`.
-    pub fn new(topology: &Topology) -> Result<Self, TopologyError> {
+    pub fn new(topology: &Topology) -> Result<Self, SimError> {
         topology.validate()?;
 
         let mut node_buses: HashMap<NodeId, Vec<BusId>> = HashMap::new();
@@ -131,10 +141,16 @@ impl Simulation {
 
         let mut ecus: HashMap<NodeId, Box<dyn Ecu>> = HashMap::new();
         for node in &topology.nodes {
-            let ecu: Box<dyn Ecu> = match node.kind {
+            let mut ecu: Box<dyn Ecu> = match node.kind {
                 NodeKind::Ecu => Box::new(PeriodicEcu::new(node)),
                 NodeKind::Gateway { .. } => Box::new(GatewayEcu::new(node)),
             };
+            if let Some(source) = &node.script {
+                ecu = Box::new(
+                    ScriptEcu::new(ecu, &node.name, source)
+                        .map_err(|msg| SimError::Script { node: node.id, msg })?,
+                );
+            }
             ecus.insert(node.id, ecu);
             node_buses.entry(node.id).or_default();
         }
@@ -159,6 +175,22 @@ impl Simulation {
     /// `run_until`/`send_once` call, i.e. before the simulation has started.
     pub fn set_ecu(&mut self, node: NodeId, ecu: Box<dyn Ecu>) {
         self.ecus.insert(node, ecu);
+    }
+
+    /// Take the log lines (e.g. script output) produced by all ECUs since
+    /// the last call, ordered by node id.
+    pub fn drain_logs(&mut self) -> Vec<String> {
+        let mut nodes: Vec<NodeId> = self.ecus.keys().copied().collect();
+        nodes.sort();
+        nodes
+            .into_iter()
+            .flat_map(|n| {
+                self.ecus
+                    .get_mut(&n)
+                    .map(|e| e.drain_logs())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Current virtual simulation time.

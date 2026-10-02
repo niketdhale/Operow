@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
-use crate::sim::{BusStats, Simulation};
+use crate::sim::{BusStats, SimError, Simulation};
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +150,9 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         state.virtual_ns = state.virtual_ns.saturating_add(advance_ns);
 
         sim.run_until(Timestamp(state.virtual_ns), &mut frames_buf);
+        for line in sim.drain_logs() {
+            let _ = ev_tx.try_send(EngineEvent::Log(line));
+        }
         if !frames_buf.is_empty() {
             let batch = std::mem::take(&mut frames_buf);
             if ev_tx.try_send(EngineEvent::Frames(batch)).is_err() {
@@ -196,7 +199,10 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
             }
             Err(e) => {
-                let _ = ev_tx.try_send(EngineEvent::Error(format!("invalid topology: {e}")));
+                let _ = ev_tx.try_send(EngineEvent::Error(match e {
+                    SimError::Topology(e) => format!("invalid topology: {e}"),
+                    e => e.to_string(),
+                }));
             }
         },
         Command::Start => {
@@ -232,11 +238,17 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
         Command::SendOnce(node, bus, frame) => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.send_once(node, bus, frame);
+                for line in sim.drain_logs() {
+                    let _ = ev_tx.try_send(EngineEvent::Log(line));
+                }
             }
         }
         Command::Ecu(node, cmd) => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.command(node, cmd);
+                for line in sim.drain_logs() {
+                    let _ = ev_tx.try_send(EngineEvent::Log(line));
+                }
             }
         }
         Command::Shutdown => return false,

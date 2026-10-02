@@ -28,6 +28,7 @@ fn topo_with_two_senders() -> Topology {
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
+                script: None,
             },
             EcuConfig {
                 id: NodeId(2),
@@ -42,6 +43,7 @@ fn topo_with_two_senders() -> Topology {
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
+                script: None,
             },
         ],
         buses: vec![CanBusConfig {
@@ -103,6 +105,7 @@ fn periodic_message_produces_expected_frame_count() {
             }],
             kind: Default::default(),
             pos: (0.0, 0.0),
+            script: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -159,6 +162,7 @@ fn sender_does_not_receive_its_own_frame() {
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
+                script: None,
             },
             EcuConfig {
                 id: NodeId(2),
@@ -166,6 +170,7 @@ fn sender_does_not_receive_its_own_frame() {
                 tx: vec![],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
+                script: None,
             },
         ],
         buses: vec![CanBusConfig {
@@ -258,6 +263,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             tx: vec![],
             kind: Default::default(),
             pos: (0.0, 0.0),
+            script: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -325,6 +331,7 @@ fn node(id: u32, tx: Vec<TxMessage>, kind: NodeKind) -> EcuConfig {
         tx,
         kind,
         pos: (0.0, 0.0),
+        script: None,
     }
 }
 
@@ -552,10 +559,10 @@ fn send_type_cyclic_counts() {
 fn send_type_disabled_suppresses_everything() {
     for st in [
         SendType::Cyclic,
-        SendType::Spontaneous,
+        SendType::Event,
         SendType::OnChange { min_gap_ms: 0 },
         SendType::CyclicIfActive,
-        SendType::CyclicAndSpontaneous,
+        SendType::CyclicAndEvent,
     ] {
         let mut sim = send_type_sim(st, false);
         sim.command(
@@ -572,8 +579,8 @@ fn send_type_disabled_suppresses_everything() {
 }
 
 #[test]
-fn send_type_spontaneous_only_on_trigger() {
-    let mut sim = send_type_sim(SendType::Spontaneous, true);
+fn send_type_event_only_on_trigger() {
+    let mut sim = send_type_sim(SendType::Event, true);
     assert_eq!(run_to(&mut sim, 100).len(), 0);
     // Setting the payload alone does not send.
     set(&mut sim, 5);
@@ -634,8 +641,8 @@ fn send_type_cyclic_if_active_toggle_no_duplicates() {
 }
 
 #[test]
-fn send_type_cyclic_and_spontaneous() {
-    let mut sim = send_type_sim(SendType::CyclicAndSpontaneous, true);
+fn send_type_cyclic_and_event() {
+    let mut sim = send_type_sim(SendType::CyclicAndEvent, true);
     // 0, 10, ..., 100.
     assert_eq!(run_to(&mut sim, 100).len(), 11);
     sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
@@ -652,7 +659,7 @@ fn send_type_cyclic_and_spontaneous() {
 #[test]
 fn set_payload_keeps_id_and_ignores_extra_bytes() {
     let mut msg = periodic(0x321, 10, Some(1));
-    msg.send_type = SendType::Spontaneous;
+    msg.send_type = SendType::Event;
     msg.frame = CanFrame::new(0x321, false, &[1, 2, 3]).unwrap();
     let topo = Topology {
         nodes: vec![node(1, vec![msg], NodeKind::Ecu)],
@@ -687,7 +694,7 @@ fn set_payload_keeps_id_and_ignores_extra_bytes() {
 #[test]
 fn gateway_delegates_commands_to_own_tx() {
     let mut msg = periodic(0x400, 10, None);
-    msg.send_type = SendType::Spontaneous;
+    msg.send_type = SendType::Event;
     let topo = Topology {
         nodes: vec![node(1, vec![msg], NodeKind::Gateway { routes: Vec::new() })],
         buses: vec![bus(1, "A")],
@@ -697,4 +704,153 @@ fn gateway_delegates_commands_to_own_tx() {
     assert_eq!(run_to(&mut sim, 50).len(), 0);
     sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
     assert_eq!(run_to(&mut sim, 51).len(), 1);
+}
+
+// ---- scripting ----
+
+fn script_topo(script: &str, tx: Vec<TxMessage>) -> Topology {
+    let mut s = node(1, tx, NodeKind::Ecu);
+    s.script = Some(script.into());
+    Topology {
+        // Node 2 sends 0x100 once at t=0 on bus 1.
+        nodes: vec![
+            s,
+            node(2, vec![periodic(0x100, 1000, Some(1))], NodeKind::Ecu),
+        ],
+        buses: vec![bus(1, "A"), bus(2, "B")],
+        links: vec![link(1, 1), link(1, 2), link(2, 1)],
+    }
+}
+
+fn ids(events: &[operow_core::BusEvent]) -> Vec<(u32, u32)> {
+    events.iter().map(|e| (e.bus.0, e.frame.id)).collect()
+}
+
+#[test]
+fn script_echoes_id_plus_one() {
+    let script = r#"
+        fn on_message(msg) {
+            if msg.id == 0x100 {
+                output(#{ id: msg.id + 1, data: msg.data, bus: msg.bus });
+            }
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out = run_to(&mut sim, 10);
+    assert_eq!(ids(&out), vec![(1, 0x100), (1, 0x101)]);
+    assert_eq!(out[1].frame.payload(), [1]);
+}
+
+#[test]
+fn script_timer_periodic_send() {
+    let script = r#"
+        fn on_start() { set_timer(1, 10); }
+        fn on_timer(id) {
+            output(#{ id: 0x300 + id, data: [now_ms()] , bus: 2});
+            set_timer(id, 10);
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out: Vec<_> = run_to(&mut sim, 35)
+        .into_iter()
+        .filter(|e| e.frame.id == 0x301)
+        .collect();
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[2].frame.payload(), [30]);
+}
+
+#[test]
+fn script_state_persists_across_calls() {
+    let script = r#"
+        fn on_start() { this.count = 0; set_timer(1, 10); }
+        fn on_timer(id) {
+            this.count += 1;
+            output(#{ id: 0x400, data: [this.count], bus: 2 });
+            set_timer(1, 10);
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out: Vec<_> = run_to(&mut sim, 35)
+        .into_iter()
+        .filter(|e| e.frame.id == 0x400)
+        .collect();
+    let counts: Vec<u8> = out.iter().map(|e| e.frame.payload()[0]).collect();
+    assert_eq!(counts, [1, 2, 3]);
+}
+
+#[test]
+fn script_output_bus_field_selects_bus() {
+    let script = r#"
+        fn on_start() {
+            output(#{ id: 0x500, bus: 2 });
+            output(#{ id: 0x501 });
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out = run_to(&mut sim, 10);
+    let mut got = ids(&out);
+    got.retain(|(_, id)| *id >= 0x500);
+    got.sort();
+    assert_eq!(got, vec![(1, 0x501), (2, 0x500), (2, 0x501)]);
+}
+
+#[test]
+fn script_trigger_sends_event_message() {
+    let mut msg = periodic(0x600, 10, Some(1));
+    msg.send_type = SendType::Event;
+    let script = r#"
+        fn on_message(msg) { trigger(0); }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![msg])).unwrap();
+    let out = run_to(&mut sim, 10);
+    assert_eq!(ids(&out), vec![(1, 0x100), (1, 0x600)]);
+}
+
+#[test]
+fn script_set_payload_applies() {
+    let mut msg = periodic(0x600, 10, Some(1));
+    msg.send_type = SendType::CyclicAndEvent;
+    let script = "fn on_message(msg) { set_payload(0, [9]); }";
+    let mut sim = Simulation::new(&script_topo(script, vec![msg])).unwrap();
+    let out = run_to(&mut sim, 5);
+    let last = out.iter().rfind(|e| e.frame.id == 0x600).unwrap();
+    assert_eq!(last.frame.payload(), [9]);
+}
+
+#[test]
+fn script_compile_error_surfaces() {
+    let err = Simulation::new(&script_topo("fn on_start( {", vec![]))
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        crate::SimError::Script {
+            node: NodeId(1),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn script_runtime_error_is_logged() {
+    let script = r#"
+        fn on_message(msg) { let x = 1 / 0; output(#{ id: 0x700 }); }
+        fn on_start() { print("hello"); }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out = run_to(&mut sim, 10);
+    assert_eq!(ids(&out), vec![(1, 0x100)]);
+    let logs = sim.drain_logs();
+    assert!(logs.iter().any(|l| l.contains("hello") && l.contains("N1")));
+    assert!(logs.iter().any(|l| l.contains("script error")));
+    assert!(sim.drain_logs().is_empty());
+}
+
+#[test]
+fn script_infinite_loop_is_stopped() {
+    let script = "fn on_message(msg) { loop {} }";
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    let out = run_to(&mut sim, 10);
+    assert_eq!(out.len(), 1);
+    assert!(sim.drain_logs().iter().any(|l| l.contains("script error")));
 }

@@ -28,14 +28,16 @@ pub enum SendType {
     #[default]
     Cyclic,
     /// Sent only when triggered.
-    Spontaneous,
+    #[serde(alias = "Spontaneous")]
+    Event,
     /// Sent when the payload is set to a different value; sends closer than
     /// `min_gap_ms` to the previous one are deferred and coalesced.
     OnChange { min_gap_ms: u32 },
     /// Cyclic, but only while the message is active.
     CyclicIfActive,
     /// Cyclic plus an extra send on trigger or payload set.
-    CyclicAndSpontaneous,
+    #[serde(alias = "CyclicAndSpontaneous")]
+    CyclicAndEvent,
 }
 
 /// Selects which frames a [`RouteRule`] applies to.
@@ -100,6 +102,9 @@ pub struct EcuConfig {
     /// UI canvas position; not used by the simulation itself.
     #[serde(default)]
     pub pos: (f32, f32),
+    /// Optional inline Rhai script run alongside the node's built-in behavior.
+    #[serde(default)]
+    pub script: Option<String>,
 }
 
 fn default_data_bitrate() -> u32 {

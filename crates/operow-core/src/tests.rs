@@ -19,6 +19,7 @@ fn topology_json_roundtrip() {
             }],
             kind: Default::default(),
             pos: (1.0, 2.0),
+            script: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -221,6 +222,7 @@ fn validate_rejects_bad_bus_references() {
                 }],
             },
             pos: (0.0, 0.0),
+            script: None,
         }],
         buses: ["A", "B"]
             .iter()
@@ -299,4 +301,22 @@ fn tx_message_without_send_type_loads_as_cyclic() {
     value.as_object_mut().unwrap().remove("send_type");
     let old: TxMessage = serde_json::from_value(value).unwrap();
     assert_eq!(old.send_type, SendType::Cyclic);
+}
+
+#[test]
+fn old_send_type_names_deserialize() {
+    use crate::SendType;
+    let old: SendType = serde_json::from_str(r#"{"type":"Spontaneous"}"#).unwrap();
+    assert_eq!(old, SendType::Event);
+    let old: SendType = serde_json::from_str(r#"{"type":"CyclicAndSpontaneous"}"#).unwrap();
+    assert_eq!(old, SendType::CyclicAndEvent);
+    let new: SendType = serde_json::from_str(r#"{"type":"Event"}"#).unwrap();
+    assert_eq!(new, SendType::Event);
+}
+
+#[test]
+fn ecu_without_script_field_loads() {
+    let json = r#"{"id":1,"name":"A","tx":[]}"#;
+    let ecu: EcuConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(ecu.script, None);
 }

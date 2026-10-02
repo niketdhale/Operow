@@ -100,6 +100,7 @@ impl Graph {
                 tx: Vec::new(),
                 kind: Default::default(),
                 pos: (pos.x, pos.y),
+                script: None,
             }),
         )
     }

@@ -201,7 +201,7 @@ fn to_topology_validates() {
     let dash = &topo.nodes[2];
     assert_eq!(dash.tx[0].period_ms, 100);
     assert!(dash.tx[0].enabled);
-    assert_eq!(dash.tx[0].send_type, SendType::Spontaneous);
+    assert_eq!(dash.tx[0].send_type, SendType::Event);
     assert_eq!(engine.tx[0].send_type, SendType::Cyclic);
     assert_eq!(dash.tx[0].frame.payload(), [128, 0]);
 
@@ -227,24 +227,24 @@ fn send_type_mapping() {
     let cases = [
         (Some("Cyclic"), Some(10), SendType::Cyclic),
         (Some("cyclic"), None, SendType::Cyclic),
-        (Some("Spontaneous"), Some(10), SendType::Spontaneous),
-        (Some("NoMsgSendType"), None, SendType::Spontaneous),
+        (Some("Spontaneous"), Some(10), SendType::Event),
+        (Some("NoMsgSendType"), None, SendType::Event),
         (Some("IfActive"), Some(10), SendType::CyclicIfActive),
         (Some("CyclicIfActive"), None, SendType::CyclicIfActive),
         (
             Some("CyclicAndSpontanX"),
             Some(10),
-            SendType::CyclicAndSpontaneous,
+            SendType::CyclicAndEvent,
         ),
         (
             Some("CyclicIfActiveAndSpontanWithDelay"),
             Some(10),
-            SendType::CyclicAndSpontaneous,
+            SendType::CyclicAndEvent,
         ),
         (Some("Bogus"), Some(10), SendType::Cyclic),
-        (Some("Bogus"), None, SendType::Spontaneous),
+        (Some("Bogus"), None, SendType::Event),
         (None, Some(10), SendType::Cyclic),
-        (None, None, SendType::Spontaneous),
+        (None, None, SendType::Event),
     ];
     for (name, cycle, want) in cases {
         let mut db = Database::parse(SAMPLE).unwrap();
