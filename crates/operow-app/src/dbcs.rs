@@ -72,12 +72,14 @@ pub fn stored_path(dbc: &Path, project_dir: Option<&Path>) -> String {
     let rel = project_dir
         .filter(|d| d.is_absolute() && dbc.is_absolute())
         .map(|d| relative_to(dbc, d));
-    let p = rel.as_deref().unwrap_or(dbc);
-    p.components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-        .replace("//", "/")
+    match rel {
+        Some(r) if r.is_relative() => r
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        _ => dbc.to_string_lossy().into_owned(),
+    }
 }
 
 /// `target` expressed relative to the directory `base` (both absolute).
@@ -150,40 +152,49 @@ pub fn bit_layout(sig: &SignalDef) -> String {
 mod tests {
     use super::*;
 
+    /// An absolute path for the current OS (drive-prefixed on Windows).
+    fn abs(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{p}"))
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
     #[test]
     fn stored_path_relative_to_project() {
-        let dir = Path::new("/home/u/proj");
+        let dir = abs("/home/u/proj");
+        let dir = dir.as_path();
         assert_eq!(
-            stored_path(Path::new("/home/u/proj/sample.dbc"), Some(dir)),
+            stored_path(&abs("/home/u/proj/sample.dbc"), Some(dir)),
             "sample.dbc"
         );
         assert_eq!(
-            stored_path(Path::new("/home/u/proj/db/a.dbc"), Some(dir)),
+            stored_path(&abs("/home/u/proj/db/a.dbc"), Some(dir)),
             "db/a.dbc"
         );
         assert_eq!(
-            stored_path(Path::new("/home/u/other/a.dbc"), Some(dir)),
+            stored_path(&abs("/home/u/other/a.dbc"), Some(dir)),
             "../other/a.dbc"
         );
-        assert_eq!(stored_path(Path::new("/data/a.dbc"), None), "/data/a.dbc");
+        let d = abs("/data/a.dbc");
+        assert_eq!(stored_path(&d, None), d.to_string_lossy());
     }
 
     #[test]
     fn resolve_relative_and_absolute() {
-        let dir = Path::new("/home/u/proj");
+        let dir = abs("/home/u/proj");
+        let dir = dir.as_path();
+        assert_eq!(resolve_path(Some(dir), "db/a.dbc"), dir.join("db/a.dbc"));
         assert_eq!(
-            resolve_path(Some(dir), "db/a.dbc"),
-            PathBuf::from("/home/u/proj/db/a.dbc")
-        );
-        assert_eq!(
-            resolve_path(Some(dir), "/abs/a.dbc"),
-            PathBuf::from("/abs/a.dbc")
+            resolve_path(Some(dir), &abs("/abs/a.dbc").to_string_lossy()),
+            abs("/abs/a.dbc")
         );
         assert_eq!(resolve_path(None, "a.dbc"), PathBuf::from("a.dbc"));
         // Round trip.
-        let p = Path::new("/home/u/other/a.dbc");
+        let p = abs("/home/u/other/a.dbc");
         assert_eq!(
-            resolve_path(Some(dir), &stored_path(p, Some(dir))),
+            resolve_path(Some(dir), &stored_path(&p, Some(dir))),
             dir.join("../other/a.dbc")
         );
     }
