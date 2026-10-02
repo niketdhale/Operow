@@ -1,3 +1,6 @@
+// Release builds on Windows should not open a console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Operow: a native desktop CAN bus simulation workbench.
 
 mod app;

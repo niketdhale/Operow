@@ -34,6 +34,10 @@ cargo run -p operow-app --release
 cargo run -p operow-app --release
 ```
 
+### Windows release build
+
+Windows x64 builds are produced by the "Release (Windows)" workflow. Pushes to `develop` publish a zip as an Actions artifact (`operow-windows-x64`, kept 30 days; open the workflow run under the Actions tab). Tags matching `v*` also create a GitHub Release with the zip attached, found under Releases. The zip contains `operow.exe`, `examples/`, `README.md` and `LICENSE`.
+
 ## Example
 
 Use the built-in example: File > Open `examples/basic.operow.json`. This network simulates 3 ECUs (Engine, Brake, Gateway) on a single CAN bus, generating approximately 180 frames per second at 4% bus load (500 kbit/s).
