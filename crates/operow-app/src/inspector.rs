@@ -204,6 +204,7 @@ impl Inspector {
                             frame: CanFrame::new(0x100, false, &[]).unwrap(),
                             period_ms: 100,
                             enabled: true,
+                            bus: None,
                         });
                     }
                     if let Some(i) = remove {

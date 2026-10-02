@@ -11,6 +11,60 @@ pub struct TxMessage {
     pub frame: CanFrame,
     pub period_ms: u32,
     pub enabled: bool,
+    /// Bus to transmit on. `None` sends on every bus the node is linked to.
+    #[serde(default)]
+    pub bus: Option<BusId>,
+}
+
+/// Selects which frames a [`RouteRule`] applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdFilter {
+    /// Every frame.
+    Any,
+    /// Frames with exactly this id and id format.
+    Exact { id: u32, extended: bool },
+    /// Frames whose id lies in `lo..=hi`.
+    Range { lo: u32, hi: u32 },
+    /// Frames where `frame.id & mask == id & mask`.
+    Mask { id: u32, mask: u32 },
+}
+
+impl IdFilter {
+    /// Whether `frame` is selected by this filter.
+    pub fn matches(&self, frame: &CanFrame) -> bool {
+        match *self {
+            IdFilter::Any => true,
+            IdFilter::Exact { id, extended } => frame.id == id && frame.extended == extended,
+            IdFilter::Range { lo, hi } => (lo..=hi).contains(&frame.id),
+            IdFilter::Mask { id, mask } => frame.id & mask == id & mask,
+        }
+    }
+}
+
+/// A gateway forwarding rule: frames arriving on `from_bus` that match
+/// `filter` are re-sent on every bus in `to_buses`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteRule {
+    pub from_bus: BusId,
+    pub to_buses: Vec<BusId>,
+    pub filter: IdFilter,
+    /// Replace the frame id when forwarding.
+    #[serde(default)]
+    pub remap_id: Option<u32>,
+    /// Forwarding latency in microseconds.
+    #[serde(default)]
+    pub delay_us: u32,
+}
+
+/// What a node does besides transmitting its own messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NodeKind {
+    /// A plain ECU.
+    #[default]
+    Ecu,
+    /// Forwards frames between the buses it is linked to.
+    Gateway { routes: Vec<RouteRule> },
 }
 
 /// Static configuration of a simulated ECU.
@@ -19,6 +73,8 @@ pub struct EcuConfig {
     pub id: NodeId,
     pub name: String,
     pub tx: Vec<TxMessage>,
+    #[serde(default)]
+    pub kind: NodeKind,
     /// UI canvas position; not used by the simulation itself.
     #[serde(default)]
     pub pos: (f32, f32),
@@ -75,6 +131,12 @@ pub enum TopologyError {
     InvalidBitrate(BusId),
     #[error("bus {0:?} has FD enabled but a non-positive data bitrate")]
     InvalidDataBitrate(BusId),
+    #[error("node {node:?} transmits on bus {bus:?} which it is not linked to")]
+    TxBusNotLinked { node: NodeId, bus: BusId },
+    #[error("gateway {node:?} routes via bus {bus:?} which it is not linked to")]
+    RouteBusNotLinked { node: NodeId, bus: BusId },
+    #[error("gateway {node:?} routes bus {bus:?} back onto itself")]
+    RouteToSameBus { node: NodeId, bus: BusId },
 }
 
 /// Errors returned by [`Topology::from_json`].
@@ -95,8 +157,9 @@ impl Topology {
         Ok(serde_json::from_str(s)?)
     }
 
-    /// Check that every link references a node/bus that exists, and that
-    /// every bus has a positive bitrate.
+    /// Check that every link references a node/bus that exists, that every
+    /// bus has a positive bitrate, and that tx buses and gateway routes only
+    /// use buses their node is linked to.
     pub fn validate(&self) -> Result<(), TopologyError> {
         for bus in &self.buses {
             if bus.bitrate == 0 {
@@ -112,6 +175,29 @@ impl Topology {
             }
             if !self.buses.iter().any(|b| b.id == link.bus) {
                 return Err(TopologyError::UnknownBus(link.bus));
+            }
+        }
+        for node in &self.nodes {
+            let linked = |bus: BusId| self.links.iter().any(|l| l.node == node.id && l.bus == bus);
+            for bus in node.tx.iter().filter_map(|m| m.bus) {
+                if !linked(bus) {
+                    return Err(TopologyError::TxBusNotLinked { node: node.id, bus });
+                }
+            }
+            if let NodeKind::Gateway { routes } = &node.kind {
+                for route in routes {
+                    for &bus in std::iter::once(&route.from_bus).chain(&route.to_buses) {
+                        if !linked(bus) {
+                            return Err(TopologyError::RouteBusNotLinked { node: node.id, bus });
+                        }
+                    }
+                    if route.to_buses.contains(&route.from_bus) {
+                        return Err(TopologyError::RouteToSameBus {
+                            node: node.id,
+                            bus: route.from_bus,
+                        });
+                    }
+                }
             }
         }
         Ok(())

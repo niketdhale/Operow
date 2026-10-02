@@ -77,6 +77,7 @@ impl Graph {
                 frame: operow_core::CanFrame::new_fd(0x400, false, true, &fd_data).unwrap(),
                 period_ms: 100,
                 enabled: true,
+                bus: None,
             });
         }
 
@@ -96,6 +97,7 @@ impl Graph {
                 id,
                 name: name.to_string(),
                 tx: Vec::new(),
+                kind: Default::default(),
                 pos: (pos.x, pos.y),
             }),
         )
@@ -236,6 +238,7 @@ fn tx(name: &str, id: u32, period_ms: u32, data: &[u8]) -> TxMessage {
         frame: operow_core::CanFrame::new(id, false, data).unwrap(),
         period_ms,
         enabled: true,
+        bus: None,
     }
 }
 

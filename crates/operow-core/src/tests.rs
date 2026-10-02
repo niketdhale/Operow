@@ -1,4 +1,7 @@
-use crate::{BusId, CanBusConfig, CanFrame, EcuConfig, Link, NodeId, Topology, TxMessage};
+use crate::{
+    BusId, CanBusConfig, CanFrame, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
+    Topology, TopologyError, TxMessage,
+};
 
 #[test]
 fn topology_json_roundtrip() {
@@ -11,7 +14,9 @@ fn topology_json_roundtrip() {
                 frame: CanFrame::new(0x100, false, &[1, 2, 3]).unwrap(),
                 period_ms: 10,
                 enabled: true,
+                bus: None,
             }],
+            kind: Default::default(),
             pos: (1.0, 2.0),
         }],
         buses: vec![CanBusConfig {
@@ -137,10 +142,138 @@ fn old_classic_json_still_loads_via_topology_from_json() {
     .unwrap();
     let topo = Topology::from_json(&json).expect("legacy classic topology must still parse");
     assert!(!topo.nodes.is_empty());
+    assert!(topo.validate().is_ok());
     for node in &topo.nodes {
         for tx in &node.tx {
             assert!(!tx.frame.fd);
             assert!(!tx.frame.brs);
         }
     }
+}
+
+#[test]
+fn gateway_example_loads_and_validates() {
+    let json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/gateway.operow.json"
+    ))
+    .unwrap();
+    let topo = Topology::from_json(&json).unwrap();
+    topo.validate().unwrap();
+    assert!(matches!(topo.nodes[2].kind, NodeKind::Gateway { .. }));
+}
+
+#[test]
+fn id_filter_matches() {
+    let std = CanFrame::new(0x123, false, &[]).unwrap();
+    let ext = CanFrame::new(0x123, true, &[]).unwrap();
+    assert!(IdFilter::Any.matches(&std));
+    let exact = IdFilter::Exact {
+        id: 0x123,
+        extended: false,
+    };
+    assert!(exact.matches(&std) && !exact.matches(&ext));
+    assert!(
+        IdFilter::Range {
+            lo: 0x120,
+            hi: 0x123
+        }
+        .matches(&std)
+    );
+    assert!(
+        !IdFilter::Range {
+            lo: 0x124,
+            hi: 0x130
+        }
+        .matches(&std)
+    );
+    assert!(
+        IdFilter::Mask {
+            id: 0x120,
+            mask: 0x7F0
+        }
+        .matches(&std)
+    );
+    assert!(
+        !IdFilter::Mask {
+            id: 0x130,
+            mask: 0x7F0
+        }
+        .matches(&std)
+    );
+}
+
+#[test]
+fn validate_rejects_bad_bus_references() {
+    let mut topo = Topology {
+        nodes: vec![EcuConfig {
+            id: NodeId(1),
+            name: "G".into(),
+            tx: vec![],
+            kind: NodeKind::Gateway {
+                routes: vec![RouteRule {
+                    from_bus: BusId(1),
+                    to_buses: vec![BusId(2)],
+                    filter: IdFilter::Any,
+                    remap_id: None,
+                    delay_us: 0,
+                }],
+            },
+            pos: (0.0, 0.0),
+        }],
+        buses: ["A", "B"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| CanBusConfig {
+                id: BusId(i as u32 + 1),
+                name: (*n).into(),
+                bitrate: 500_000,
+                fd_enabled: false,
+                data_bitrate: 2_000_000,
+            })
+            .collect(),
+        links: vec![Link {
+            node: NodeId(1),
+            bus: BusId(1),
+        }],
+    };
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::RouteBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(2)
+        })
+    );
+    topo.links.push(Link {
+        node: NodeId(1),
+        bus: BusId(2),
+    });
+    assert!(topo.validate().is_ok());
+
+    if let NodeKind::Gateway { routes } = &mut topo.nodes[0].kind {
+        routes[0].to_buses = vec![BusId(1)];
+    }
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::RouteToSameBus {
+            node: NodeId(1),
+            bus: BusId(1)
+        })
+    );
+
+    topo.nodes[0].kind = NodeKind::Ecu;
+    topo.nodes[0].tx.push(TxMessage {
+        name: "M".into(),
+        frame: CanFrame::new(1, false, &[]).unwrap(),
+        period_ms: 10,
+        enabled: true,
+        bus: Some(BusId(3)),
+    });
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::TxBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(3)
+        })
+    );
 }

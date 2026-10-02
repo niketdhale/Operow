@@ -24,7 +24,7 @@ pub enum Command {
     Resume,
     /// Real-time speed multiplier; 0 means "as fast as possible".
     SetSpeed(f64),
-    SendOnce(NodeId, CanFrame),
+    SendOnce(NodeId, Option<BusId>, CanFrame),
     Shutdown,
 }
 
@@ -226,9 +226,9 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
             }
         }
         Command::SetSpeed(speed) => state.speed = speed.max(0.0),
-        Command::SendOnce(node, frame) => {
+        Command::SendOnce(node, bus, frame) => {
             if let Some(sim) = state.sim.as_mut() {
-                sim.send_once(node, frame);
+                sim.send_once(node, bus, frame);
             }
         }
         Command::Shutdown => return false,

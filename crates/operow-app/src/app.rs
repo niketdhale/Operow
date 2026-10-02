@@ -407,7 +407,10 @@ impl OperowApp {
         let ecu_id = ecu.id;
         for msg in ecu.tx.clone() {
             if ui.button(format!("Send {}", msg.name)).clicked() {
-                let _ = self.engine.cmd.send(Command::SendOnce(ecu_id, msg.frame));
+                let _ = self
+                    .engine
+                    .cmd
+                    .send(Command::SendOnce(ecu_id, msg.bus, msg.frame));
             }
         }
     }
