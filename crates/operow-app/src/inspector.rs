@@ -205,6 +205,7 @@ impl Inspector {
                             period_ms: 100,
                             enabled: true,
                             bus: None,
+                            send_type: Default::default(),
                         });
                     }
                     if let Some(i) = remove {

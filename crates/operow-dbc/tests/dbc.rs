@@ -1,4 +1,4 @@
-use operow_core::{BusId, CanFrame};
+use operow_core::{BusId, CanFrame, SendType};
 use operow_dbc::{ByteOrder, Database, DbcError, Mux, SignalDef, ValueType};
 
 const SAMPLE: &str = include_str!("fixtures/sample.dbc");
@@ -200,7 +200,9 @@ fn to_topology_validates() {
 
     let dash = &topo.nodes[2];
     assert_eq!(dash.tx[0].period_ms, 100);
-    assert!(!dash.tx[0].enabled);
+    assert!(dash.tx[0].enabled);
+    assert_eq!(dash.tx[0].send_type, SendType::Spontaneous);
+    assert_eq!(engine.tx[0].send_type, SendType::Cyclic);
     assert_eq!(dash.tx[0].frame.payload(), [128, 0]);
 
     assert!(topo.nodes[1].tx[0].frame.extended);
@@ -218,4 +220,44 @@ fn to_topology_fd_frame() {
     assert!(f.fd && !f.brs);
     assert_eq!(f.dlc, 12);
     assert!(topo.buses[0].fd_enabled);
+}
+
+#[test]
+fn send_type_mapping() {
+    let cases = [
+        (Some("Cyclic"), Some(10), SendType::Cyclic),
+        (Some("cyclic"), None, SendType::Cyclic),
+        (Some("Spontaneous"), Some(10), SendType::Spontaneous),
+        (Some("NoMsgSendType"), None, SendType::Spontaneous),
+        (Some("IfActive"), Some(10), SendType::CyclicIfActive),
+        (Some("CyclicIfActive"), None, SendType::CyclicIfActive),
+        (
+            Some("CyclicAndSpontanX"),
+            Some(10),
+            SendType::CyclicAndSpontaneous,
+        ),
+        (
+            Some("CyclicIfActiveAndSpontanWithDelay"),
+            Some(10),
+            SendType::CyclicAndSpontaneous,
+        ),
+        (Some("Bogus"), Some(10), SendType::Cyclic),
+        (Some("Bogus"), None, SendType::Spontaneous),
+        (None, Some(10), SendType::Cyclic),
+        (None, None, SendType::Spontaneous),
+    ];
+    for (name, cycle, want) in cases {
+        let mut db = Database::parse(SAMPLE).unwrap();
+        let m = db
+            .messages
+            .iter_mut()
+            .find(|m| m.transmitter == "Engine")
+            .unwrap();
+        m.send_type = name.map(String::from);
+        m.cycle_time_ms = cycle;
+        let topo = db.to_topology(BusId(1), "P", 500_000);
+        let tx = &topo.nodes[0].tx[0];
+        assert_eq!(tx.send_type, want, "{name:?} {cycle:?}");
+        assert!(tx.enabled);
+    }
 }

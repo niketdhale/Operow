@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use operow_core::{BusId, CanFrame, EcuConfig, NodeKind, RouteRule};
 
-use crate::ecu::{Ecu, EcuCtx, FrameMeta, PeriodicEcu};
+use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 
 /// Timer ids at or above this value are delayed forwards; lower ids belong
 /// to the node's own periodic `tx` messages.
@@ -72,5 +72,9 @@ impl Ecu for GatewayEcu {
                 }
             }
         }
+    }
+
+    fn on_command(&mut self, cmd: &EcuCommand, ctx: &mut EcuCtx) {
+        self.own.on_command(cmd, ctx);
     }
 }

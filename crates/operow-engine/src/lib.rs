@@ -6,7 +6,7 @@ mod runner;
 mod sim;
 mod timing;
 
-pub use ecu::{Ecu, EcuCtx, FrameMeta, PeriodicEcu};
+pub use ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 pub use gateway::GatewayEcu;
 pub use runner::{Command, Engine, EngineEvent, EngineHandle, RunState};
 pub use sim::{BusStats, MAX_HOPS, Simulation};

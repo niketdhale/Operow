@@ -14,6 +14,28 @@ pub struct TxMessage {
     /// Bus to transmit on. `None` sends on every bus the node is linked to.
     #[serde(default)]
     pub bus: Option<BusId>,
+    /// When the message is transmitted (CANoe Interaction-Layer style).
+    #[serde(default)]
+    pub send_type: SendType,
+}
+
+/// Transmission trigger of a [`TxMessage`]. `enabled == false` suppresses
+/// every send type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SendType {
+    /// Sent at t=0 and then every `period_ms`.
+    #[default]
+    Cyclic,
+    /// Sent only when triggered.
+    Spontaneous,
+    /// Sent when the payload is set to a different value; sends closer than
+    /// `min_gap_ms` to the previous one are deferred and coalesced.
+    OnChange { min_gap_ms: u32 },
+    /// Cyclic, but only while the message is active.
+    CyclicIfActive,
+    /// Cyclic plus an extra send on trigger or payload set.
+    CyclicAndSpontaneous,
 }
 
 /// Selects which frames a [`RouteRule`] applies to.

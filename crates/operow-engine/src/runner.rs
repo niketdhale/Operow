@@ -5,6 +5,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
+use crate::ecu::EcuCommand;
 use crate::sim::{BusStats, Simulation};
 
 /// Coarse run state broadcast to listeners.
@@ -25,6 +26,8 @@ pub enum Command {
     /// Real-time speed multiplier; 0 means "as fast as possible".
     SetSpeed(f64),
     SendOnce(NodeId, Option<BusId>, CanFrame),
+    /// Deliver a command to an ECU.
+    Ecu(NodeId, EcuCommand),
     Shutdown,
 }
 
@@ -229,6 +232,11 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
         Command::SendOnce(node, bus, frame) => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.send_once(node, bus, frame);
+            }
+        }
+        Command::Ecu(node, cmd) => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.command(node, cmd);
             }
         }
         Command::Shutdown => return false,

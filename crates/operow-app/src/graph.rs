@@ -78,6 +78,7 @@ impl Graph {
                 period_ms: 100,
                 enabled: true,
                 bus: None,
+                send_type: Default::default(),
             });
         }
 
@@ -239,6 +240,7 @@ fn tx(name: &str, id: u32, period_ms: u32, data: &[u8]) -> TxMessage {
         period_ms,
         enabled: true,
         bus: None,
+        send_type: Default::default(),
     }
 }
 

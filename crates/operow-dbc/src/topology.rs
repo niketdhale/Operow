@@ -1,5 +1,5 @@
 use operow_core::{
-    BusId, CanBusConfig, CanFrame, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
+    BusId, CanBusConfig, CanFrame, EcuConfig, Link, NodeId, NodeKind, SendType, Topology, TxMessage,
 };
 
 use crate::model::{Database, MessageDef};
@@ -13,6 +13,24 @@ fn fd_len(len: usize) -> usize {
         .into_iter()
         .find(|&l| l >= len)
         .unwrap_or(64)
+}
+
+/// Map a `GenMsgSendType` value (case-insensitive); unknown or missing falls
+/// back to cyclic when a cycle time is present, else spontaneous.
+fn map_send_type(send_type: Option<&str>, has_cycle: bool) -> SendType {
+    match send_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("cyclic") => SendType::Cyclic,
+        Some("spontaneous" | "nomsgsendtype") => SendType::Spontaneous,
+        Some("ifactive" | "cyclicifactive") => SendType::CyclicIfActive,
+        Some(
+            "cyclicandspontanx"
+            | "cyclicandspontaneous"
+            | "cyclicifactiveandspontanwithdelay"
+            | "cyclicandspontanwithdelay",
+        ) => SendType::CyclicAndSpontaneous,
+        _ if has_cycle => SendType::Cyclic,
+        _ => SendType::Spontaneous,
+    }
 }
 
 impl MessageDef {
@@ -60,8 +78,12 @@ impl Database {
                             name: m.name.clone(),
                             frame: m.initial_frame()?,
                             period_ms: m.cycle_time_ms.unwrap_or(DEFAULT_PERIOD_MS),
-                            enabled: m.cycle_time_ms.is_some(),
+                            enabled: true,
                             bus: Some(bus),
+                            send_type: map_send_type(
+                                m.send_type.as_deref(),
+                                m.cycle_time_ms.is_some(),
+                            ),
                         })
                     })
                     .collect(),

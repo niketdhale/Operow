@@ -1,4 +1,4 @@
-use operow_core::{BusId, CanFrame, EcuConfig, NodeId, Timestamp, TxMessage};
+use operow_core::{BusId, CanFrame, EcuConfig, NodeId, SendType, Timestamp, TxMessage};
 
 /// Bookkeeping that travels with a frame through the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +106,18 @@ impl EcuCtx {
     }
 }
 
+/// A command delivered to an ECU from outside the simulation (e.g. the UI).
+/// `msg` indexes the node's `tx` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EcuCommand {
+    /// Fire a spontaneous send of the message.
+    Trigger { msg: usize },
+    /// Replace the payload bytes, keeping the frame id and flags.
+    SetPayload { msg: usize, data: Vec<u8> },
+    /// Activate or deactivate a `CyclicIfActive` message.
+    SetActive { msg: usize, active: bool },
+}
+
 /// Behavior of a simulated ECU.
 pub trait Ecu: Send {
     /// Called once at simulation start (virtual time 0).
@@ -114,41 +126,172 @@ pub trait Ecu: Send {
     fn on_timer(&mut self, _timer: u32, _ctx: &mut EcuCtx) {}
     /// Called when a frame sent by another node arrives on `bus`.
     fn on_frame(&mut self, _bus: BusId, _frame: &CanFrame, _ctx: &mut EcuCtx) {}
+    /// Called when an [`EcuCommand`] is delivered to this node.
+    fn on_command(&mut self, _cmd: &EcuCommand, _ctx: &mut EcuCtx) {}
 }
 
-/// An [`Ecu`] that periodically transmits the messages defined in an
-/// [`EcuConfig`]: each enabled message is first sent at t=0 and then re-sent
-/// every `period_ms`.
+/// Timer ids at or above this value are deferred on-change sends
+/// (`DEFERRED_TIMER_BASE + msg`); below it are cyclic timers.
+pub(crate) const DEFERRED_TIMER_BASE: u32 = 0x4000_0000;
+const MSG_BITS: u32 = 20;
+const MSG_MASK: u32 = (1 << MSG_BITS) - 1;
+const GEN_MASK: u32 = 0x3FF;
+
+/// Cyclic timer id: generation in bits 20..30, message index below.
+fn cyclic_timer(msg: usize, generation: u32) -> u32 {
+    ((generation & GEN_MASK) << MSG_BITS) | (msg as u32 & MSG_MASK)
+}
+
+struct MsgState {
+    msg: TxMessage,
+    active: bool,
+    last_send: Option<u64>,
+    /// A deferred on-change send is waiting for its timer.
+    pending: bool,
+    /// Bumped whenever the cycle is (re)started or stopped; cyclic timers
+    /// from an older generation are ignored.
+    generation: u32,
+}
+
+/// An [`Ecu`] that transmits the messages defined in an [`EcuConfig`]
+/// according to their [`SendType`]; see that type for the semantics.
+/// Cyclic messages are first sent at t=0 and then every `period_ms`.
 pub struct PeriodicEcu {
-    messages: Vec<TxMessage>,
+    messages: Vec<MsgState>,
 }
 
 impl PeriodicEcu {
     pub fn new(config: &EcuConfig) -> Self {
         PeriodicEcu {
-            messages: config.tx.clone(),
+            messages: config
+                .tx
+                .iter()
+                .map(|msg| MsgState {
+                    msg: msg.clone(),
+                    active: false,
+                    last_send: None,
+                    pending: false,
+                    generation: 0,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl MsgState {
+    fn cyclic_running(&self) -> bool {
+        self.msg.enabled
+            && match self.msg.send_type {
+                SendType::Cyclic | SendType::CyclicAndSpontaneous => true,
+                SendType::CyclicIfActive => self.active,
+                SendType::Spontaneous | SendType::OnChange { .. } => false,
+            }
+    }
+
+    fn send(&mut self, ctx: &mut EcuCtx) {
+        match self.msg.bus {
+            Some(bus) => ctx.send_on(bus, self.msg.frame),
+            None => ctx.send(self.msg.frame),
+        }
+        self.last_send = Some(ctx.now().0);
+    }
+
+    /// Send now, or for `OnChange` defer to `last_send + min_gap`.
+    fn send_on_change(&mut self, msg: usize, min_gap_ms: u32, ctx: &mut EcuCtx) {
+        let now = ctx.now().0;
+        let due = self
+            .last_send
+            .map_or(now, |t| t + min_gap_ms as u64 * 1_000_000);
+        if due <= now {
+            self.pending = false;
+            self.send(ctx);
+        } else if !self.pending {
+            self.pending = true;
+            ctx.set_timer(DEFERRED_TIMER_BASE + msg as u32, due - now);
         }
     }
 }
 
 impl Ecu for PeriodicEcu {
     fn on_start(&mut self, ctx: &mut EcuCtx) {
-        for (i, msg) in self.messages.iter().enumerate() {
-            if msg.enabled {
-                ctx.set_timer(i as u32, 0);
+        for (i, st) in self.messages.iter().enumerate() {
+            if st.cyclic_running() {
+                ctx.set_timer(cyclic_timer(i, st.generation), 0);
             }
         }
     }
 
     fn on_timer(&mut self, timer: u32, ctx: &mut EcuCtx) {
-        if let Some(msg) = self.messages.get(timer as usize)
-            && msg.enabled
-        {
-            match msg.bus {
-                Some(bus) => ctx.send_on(bus, msg.frame),
-                None => ctx.send(msg.frame),
+        if timer >= DEFERRED_TIMER_BASE {
+            if let Some(st) = self
+                .messages
+                .get_mut((timer - DEFERRED_TIMER_BASE) as usize)
+                && st.pending
+            {
+                st.pending = false;
+                if st.msg.enabled {
+                    st.send(ctx);
+                }
             }
-            ctx.set_timer(timer, msg.period_ms as u64 * 1_000_000);
+            return;
+        }
+        let idx = (timer & MSG_MASK) as usize;
+        let generation = timer >> MSG_BITS;
+        if let Some(st) = self.messages.get_mut(idx)
+            && st.generation & GEN_MASK == generation
+            && st.cyclic_running()
+        {
+            st.send(ctx);
+            ctx.set_timer(timer, st.msg.period_ms as u64 * 1_000_000);
+        }
+    }
+
+    fn on_command(&mut self, cmd: &EcuCommand, ctx: &mut EcuCtx) {
+        match cmd {
+            EcuCommand::Trigger { msg } => {
+                let Some(st) = self.messages.get_mut(*msg).filter(|s| s.msg.enabled) else {
+                    return;
+                };
+                match st.msg.send_type {
+                    SendType::Spontaneous | SendType::CyclicAndSpontaneous => st.send(ctx),
+                    SendType::OnChange { min_gap_ms } => st.send_on_change(*msg, min_gap_ms, ctx),
+                    SendType::Cyclic | SendType::CyclicIfActive => {}
+                }
+            }
+            EcuCommand::SetPayload { msg, data } => {
+                let Some(st) = self.messages.get_mut(*msg) else {
+                    return;
+                };
+                let old = st.msg.frame;
+                let len = (st.msg.frame.dlc as usize).min(data.len());
+                st.msg.frame.data[..len].copy_from_slice(&data[..len]);
+                if !st.msg.enabled {
+                    return;
+                }
+                match st.msg.send_type {
+                    SendType::CyclicAndSpontaneous => st.send(ctx),
+                    SendType::OnChange { min_gap_ms } if st.msg.frame != old => {
+                        st.send_on_change(*msg, min_gap_ms, ctx)
+                    }
+                    _ => {}
+                }
+            }
+            EcuCommand::SetActive { msg, active } => {
+                let Some(st) = self.messages.get_mut(*msg) else {
+                    return;
+                };
+                if st.active == *active {
+                    return;
+                }
+                st.active = *active;
+                if st.msg.send_type == SendType::CyclicIfActive {
+                    // Invalidate any timer chain, then start a fresh one.
+                    st.generation = st.generation.wrapping_add(1);
+                    if st.cyclic_running() {
+                        ctx.set_timer(cyclic_timer(*msg, st.generation), 0);
+                    }
+                }
+            }
         }
     }
 }

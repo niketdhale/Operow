@@ -1,6 +1,6 @@
 use crate::{
     BusId, CanBusConfig, CanFrame, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
-    Topology, TopologyError, TxMessage,
+    SendType, Topology, TopologyError, TxMessage,
 };
 
 #[test]
@@ -15,6 +15,7 @@ fn topology_json_roundtrip() {
                 period_ms: 10,
                 enabled: true,
                 bus: None,
+                send_type: Default::default(),
             }],
             kind: Default::default(),
             pos: (1.0, 2.0),
@@ -268,6 +269,7 @@ fn validate_rejects_bad_bus_references() {
         period_ms: 10,
         enabled: true,
         bus: Some(BusId(3)),
+        send_type: Default::default(),
     });
     assert_eq!(
         topo.validate(),
@@ -276,4 +278,25 @@ fn validate_rejects_bad_bus_references() {
             bus: BusId(3)
         })
     );
+}
+
+#[test]
+fn tx_message_without_send_type_loads_as_cyclic() {
+    let msg = TxMessage {
+        name: "M".into(),
+        frame: CanFrame::new(1, false, &[1]).unwrap(),
+        period_ms: 10,
+        enabled: true,
+        bus: None,
+        send_type: SendType::OnChange { min_gap_ms: 5 },
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains(r#""type":"OnChange""#));
+    let back: TxMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, msg);
+
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value.as_object_mut().unwrap().remove("send_type");
+    let old: TxMessage = serde_json::from_value(value).unwrap();
+    assert_eq!(old.send_type, SendType::Cyclic);
 }

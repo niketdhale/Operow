@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use operow_core::{
     BusId, CanBusConfig, CanFrame, Direction, EcuConfig, IdFilter, Link, NodeId, NodeKind,
-    RouteRule, Timestamp, Topology, TxMessage,
+    RouteRule, SendType, Timestamp, Topology, TxMessage,
 };
 
-use crate::ecu::{Ecu, EcuCtx};
+use crate::ecu::{Ecu, EcuCommand, EcuCtx};
 use crate::runner::{Command, Engine, EngineEvent};
 use crate::sim::{MAX_HOPS, Simulation};
 use crate::timing::{frame_bits, frame_duration_ns};
@@ -24,6 +24,7 @@ fn topo_with_two_senders() -> Topology {
                     period_ms: 1000,
                     enabled: true,
                     bus: None,
+                    send_type: Default::default(),
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
@@ -37,6 +38,7 @@ fn topo_with_two_senders() -> Topology {
                     period_ms: 1000,
                     enabled: true,
                     bus: None,
+                    send_type: Default::default(),
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
@@ -97,6 +99,7 @@ fn periodic_message_produces_expected_frame_count() {
                 period_ms: 10,
                 enabled: true,
                 bus: None,
+                send_type: Default::default(),
             }],
             kind: Default::default(),
             pos: (0.0, 0.0),
@@ -152,6 +155,7 @@ fn sender_does_not_receive_its_own_frame() {
                     period_ms: 10,
                     enabled: true,
                     bus: None,
+                    send_type: Default::default(),
                 }],
                 kind: Default::default(),
                 pos: (0.0, 0.0),
@@ -348,6 +352,7 @@ fn periodic(id: u32, period_ms: u32, bus: Option<u32>) -> TxMessage {
         period_ms,
         enabled: true,
         bus: bus.map(BusId),
+        send_type: Default::default(),
     }
 }
 
@@ -499,4 +504,197 @@ fn gateways_forwarding_to_each_other_stop_at_max_hops() {
     assert!(out.iter().all(|e| e.frame_uid == out[0].frame_uid));
     let drops: u64 = sim.stats().values().map(|s| s.routing_drops).sum();
     assert_eq!(drops, 1);
+}
+
+// ---- send types ----
+
+const MS: u64 = 1_000_000;
+
+fn send_type_sim(send_type: SendType, enabled: bool) -> Simulation {
+    let mut msg = periodic(0x200, 10, Some(1));
+    msg.send_type = send_type;
+    msg.enabled = enabled;
+    let topo = Topology {
+        nodes: vec![node(1, vec![msg], NodeKind::Ecu)],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1)],
+    };
+    Simulation::new(&topo).unwrap()
+}
+
+/// Run to `ms` (plus slack for the last frame to finish) and return events.
+fn run_to(sim: &mut Simulation, ms: u64) -> Vec<operow_core::BusEvent> {
+    let mut out = Vec::new();
+    sim.run_until(Timestamp(ms * MS + MS / 2), &mut out);
+    out
+}
+
+fn set(sim: &mut Simulation, byte: u8) {
+    sim.command(
+        NodeId(1),
+        EcuCommand::SetPayload {
+            msg: 0,
+            data: vec![byte],
+        },
+    );
+}
+
+#[test]
+fn send_type_cyclic_counts() {
+    let mut sim = send_type_sim(SendType::Cyclic, true);
+    assert_eq!(run_to(&mut sim, 100).len(), 11);
+    // Triggers do nothing for cyclic.
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    assert_eq!(run_to(&mut sim, 100).len(), 0);
+}
+
+#[test]
+fn send_type_disabled_suppresses_everything() {
+    for st in [
+        SendType::Cyclic,
+        SendType::Spontaneous,
+        SendType::OnChange { min_gap_ms: 0 },
+        SendType::CyclicIfActive,
+        SendType::CyclicAndSpontaneous,
+    ] {
+        let mut sim = send_type_sim(st, false);
+        sim.command(
+            NodeId(1),
+            EcuCommand::SetActive {
+                msg: 0,
+                active: true,
+            },
+        );
+        sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+        set(&mut sim, 9);
+        assert_eq!(run_to(&mut sim, 50).len(), 0, "{st:?}");
+    }
+}
+
+#[test]
+fn send_type_spontaneous_only_on_trigger() {
+    let mut sim = send_type_sim(SendType::Spontaneous, true);
+    assert_eq!(run_to(&mut sim, 100).len(), 0);
+    // Setting the payload alone does not send.
+    set(&mut sim, 5);
+    assert_eq!(run_to(&mut sim, 110).len(), 0);
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    let out = run_to(&mut sim, 120);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].frame.payload(), [5]);
+    assert_eq!(run_to(&mut sim, 300).len(), 0);
+}
+
+#[test]
+fn send_type_on_change() {
+    let mut sim = send_type_sim(SendType::OnChange { min_gap_ms: 50 }, true);
+    assert_eq!(run_to(&mut sim, 100).len(), 0);
+    // Same payload (initial is [1]): no send.
+    set(&mut sim, 1);
+    assert_eq!(run_to(&mut sim, 101).len(), 0);
+    // Change: immediate send.
+    set(&mut sim, 2);
+    let out = run_to(&mut sim, 102);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].frame.payload(), [2]);
+    let first = out[0].time.0;
+    // Two changes within the gap coalesce into one deferred send of the
+    // latest payload, 50ms after the first.
+    set(&mut sim, 3);
+    set(&mut sim, 4);
+    assert_eq!(run_to(&mut sim, 140).len(), 0);
+    let out = run_to(&mut sim, 200);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].frame.payload(), [4]);
+    assert_eq!(out[0].time.0 - first, 50 * MS);
+    // After the gap has elapsed a change sends immediately again.
+    assert_eq!(run_to(&mut sim, 210).len(), 0);
+    set(&mut sim, 5);
+    assert_eq!(run_to(&mut sim, 211).len(), 1);
+}
+
+#[test]
+fn send_type_cyclic_if_active_toggle_no_duplicates() {
+    let mut sim = send_type_sim(SendType::CyclicIfActive, true);
+    assert_eq!(run_to(&mut sim, 100).len(), 0);
+    let active = |a| EcuCommand::SetActive { msg: 0, active: a };
+    sim.command(NodeId(1), active(true));
+    // Sends at 100.5, 110.5, ..., 150.5.
+    assert_eq!(run_to(&mut sim, 155).len(), 6);
+    sim.command(NodeId(1), active(false));
+    assert_eq!(run_to(&mut sim, 250).len(), 0);
+    // Toggle off/on at the same instant while a timer is pending, then on
+    // again later: exactly one chain at 10ms period.
+    sim.command(NodeId(1), active(true));
+    sim.command(NodeId(1), active(false));
+    sim.command(NodeId(1), active(true));
+    // One chain only (no doubled sends).
+    assert_eq!(run_to(&mut sim, 300).len(), 5);
+    assert_eq!(run_to(&mut sim, 400).len(), 10);
+}
+
+#[test]
+fn send_type_cyclic_and_spontaneous() {
+    let mut sim = send_type_sim(SendType::CyclicAndSpontaneous, true);
+    // 0, 10, ..., 100.
+    assert_eq!(run_to(&mut sim, 100).len(), 11);
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    set(&mut sim, 7);
+    let out = run_to(&mut sim, 102);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[1].frame.payload(), [7]);
+    // The cycle is unaffected and now uses the new payload.
+    let out = run_to(&mut sim, 110);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].frame.payload(), [7]);
+}
+
+#[test]
+fn set_payload_keeps_id_and_ignores_extra_bytes() {
+    let mut msg = periodic(0x321, 10, Some(1));
+    msg.send_type = SendType::Spontaneous;
+    msg.frame = CanFrame::new(0x321, false, &[1, 2, 3]).unwrap();
+    let topo = Topology {
+        nodes: vec![node(1, vec![msg], NodeKind::Ecu)],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1)],
+    };
+    let mut sim = Simulation::new(&topo).unwrap();
+    // Shorter keeps the rest; longer is truncated to the frame length.
+    sim.command(
+        NodeId(1),
+        EcuCommand::SetPayload {
+            msg: 0,
+            data: vec![9],
+        },
+    );
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    let out = run_to(&mut sim, 1);
+    assert_eq!(out[0].frame.id, 0x321);
+    assert_eq!(out[0].frame.payload(), [9, 2, 3]);
+    sim.command(
+        NodeId(1),
+        EcuCommand::SetPayload {
+            msg: 0,
+            data: vec![4, 5, 6, 7, 8],
+        },
+    );
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    let out = run_to(&mut sim, 2);
+    assert_eq!(out[0].frame.payload(), [4, 5, 6]);
+}
+
+#[test]
+fn gateway_delegates_commands_to_own_tx() {
+    let mut msg = periodic(0x400, 10, None);
+    msg.send_type = SendType::Spontaneous;
+    let topo = Topology {
+        nodes: vec![node(1, vec![msg], NodeKind::Gateway { routes: Vec::new() })],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1)],
+    };
+    let mut sim = Simulation::new(&topo).unwrap();
+    assert_eq!(run_to(&mut sim, 50).len(), 0);
+    sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
+    assert_eq!(run_to(&mut sim, 51).len(), 1);
 }

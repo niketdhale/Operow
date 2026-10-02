@@ -6,7 +6,7 @@ use operow_core::{
     TopologyError,
 };
 
-use crate::ecu::{Ecu, EcuCtx, FrameMeta, PeriodicEcu};
+use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 use crate::gateway::GatewayEcu;
 use crate::timing::frame_duration_ns_any;
 
@@ -177,6 +177,12 @@ impl Simulation {
     pub fn send_once(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame) {
         self.ensure_started();
         self.enqueue_origin(node, bus, frame);
+    }
+
+    /// Deliver `cmd` to `node`'s ECU at the current virtual time.
+    pub fn command(&mut self, node: NodeId, cmd: EcuCommand) {
+        self.ensure_started();
+        self.run_callback(node, None, |ecu, ctx| ecu.on_command(&cmd, ctx));
     }
 
     /// Queue a newly originated frame (fresh uid, hop 0) on `bus`, or on all
