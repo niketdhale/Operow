@@ -93,6 +93,71 @@ fn frame_to_map(bus: BusId, frame: &CanFrame, now_ns: u64) -> Map {
     m
 }
 
+/// Build the Rhai engine with the script API registered against `shared`.
+fn build_engine(shared: &SharedRef) -> Engine {
+    let mut engine = Engine::new();
+    engine.set_max_operations(MAX_OPERATIONS);
+    let s = shared.clone();
+    engine.on_print(move |t| lock(&s).logs.push(t.to_string()));
+    let s = shared.clone();
+    engine.on_debug(move |t, _, _| lock(&s).logs.push(t.to_string()));
+    let s = shared.clone();
+    engine.register_fn(
+        "output",
+        move |msg: Map| -> Result<(), Box<EvalAltResult>> {
+            let out = parse_message(&msg).map_err(rt_err)?;
+            lock(&s).sends.push(out);
+            Ok(())
+        },
+    );
+    let s = shared.clone();
+    engine.register_fn("set_timer", move |id: i64, ms: i64| {
+        lock(&s).timers.push((id, ms.max(0)));
+    });
+    let s = shared.clone();
+    engine.register_fn("now_ns", move || lock(&s).now_ns as i64);
+    let s = shared.clone();
+    engine.register_fn("now_ms", move || (lock(&s).now_ns / 1_000_000) as i64);
+    let s = shared.clone();
+    engine.register_fn("trigger", move |msg: i64| {
+        if msg >= 0 {
+            lock(&s)
+                .commands
+                .push(EcuCommand::Trigger { msg: msg as usize });
+        }
+    });
+    let s = shared.clone();
+    engine.register_fn(
+        "set_payload",
+        move |msg: i64, data: rhai::Array| -> Result<(), Box<EvalAltResult>> {
+            let data = data
+                .iter()
+                .map(|b| b.as_int().map(|n| n as u8))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| rt_err("set_payload data must contain integers".into()))?;
+            if msg >= 0 {
+                lock(&s).commands.push(EcuCommand::SetPayload {
+                    msg: msg as usize,
+                    data,
+                });
+            }
+            Ok(())
+        },
+    );
+    engine
+}
+
+/// Compile `src` without running it, using the same engine setup as
+/// [`ScriptEcu`] so registered functions resolve. The error message includes
+/// the line/position.
+pub fn check_script(src: &str) -> Result<(), String> {
+    let shared: SharedRef = Arc::new(Mutex::new(Shared::default()));
+    build_engine(&shared)
+        .compile(src)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Wraps a node's normal ECU and additionally runs CAPL-like Rhai handlers
 /// (`on_start()`, `on_timer(id)`, `on_message(msg)`). Built-in transmission
 /// and routing of the inner ECU keep working.
@@ -120,58 +185,7 @@ impl ScriptEcu {
     /// Compile `source`; returns the compile error message on failure.
     pub fn new(inner: Box<dyn Ecu>, name: &str, source: &str) -> Result<Self, String> {
         let shared: SharedRef = Arc::new(Mutex::new(Shared::default()));
-        let mut engine = Engine::new();
-        engine.set_max_operations(MAX_OPERATIONS);
-
-        {
-            let s = shared.clone();
-            engine.on_print(move |t| lock(&s).logs.push(t.to_string()));
-            let s = shared.clone();
-            engine.on_debug(move |t, _, _| lock(&s).logs.push(t.to_string()));
-            let s = shared.clone();
-            engine.register_fn(
-                "output",
-                move |msg: Map| -> Result<(), Box<EvalAltResult>> {
-                    let out = parse_message(&msg).map_err(rt_err)?;
-                    lock(&s).sends.push(out);
-                    Ok(())
-                },
-            );
-            let s = shared.clone();
-            engine.register_fn("set_timer", move |id: i64, ms: i64| {
-                lock(&s).timers.push((id, ms.max(0)));
-            });
-            let s = shared.clone();
-            engine.register_fn("now_ns", move || lock(&s).now_ns as i64);
-            let s = shared.clone();
-            engine.register_fn("now_ms", move || (lock(&s).now_ns / 1_000_000) as i64);
-            let s = shared.clone();
-            engine.register_fn("trigger", move |msg: i64| {
-                if msg >= 0 {
-                    lock(&s)
-                        .commands
-                        .push(EcuCommand::Trigger { msg: msg as usize });
-                }
-            });
-            let s = shared.clone();
-            engine.register_fn(
-                "set_payload",
-                move |msg: i64, data: rhai::Array| -> Result<(), Box<EvalAltResult>> {
-                    let data = data
-                        .iter()
-                        .map(|b| b.as_int().map(|n| n as u8))
-                        .collect::<Result<Vec<u8>, _>>()
-                        .map_err(|_| rt_err("set_payload data must contain integers".into()))?;
-                    if msg >= 0 {
-                        lock(&s).commands.push(EcuCommand::SetPayload {
-                            msg: msg as usize,
-                            data,
-                        });
-                    }
-                    Ok(())
-                },
-            );
-        }
+        let engine = build_engine(&shared);
 
         let ast = engine.compile(source).map_err(|e| e.to_string())?;
         let has = |fname: &str, params: usize| {
@@ -315,5 +329,24 @@ impl Ecu for ScriptEcu {
 
     fn drain_logs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.logs)
+    }
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::check_script;
+
+    #[test]
+    fn valid_script_compiles() {
+        assert!(
+            check_script("fn on_message(msg) { output(#{ id: 1 }); set_timer(1, 10); }").is_ok()
+        );
+        assert!(check_script("").is_ok());
+    }
+
+    #[test]
+    fn syntax_error_reports_position() {
+        let err = check_script("fn on_start() {\n    let x = ;\n}\n").unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
     }
 }

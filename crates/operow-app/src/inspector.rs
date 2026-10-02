@@ -23,6 +23,8 @@ pub struct Inspector {
     live_payload: std::collections::HashMap<(NodeId, usize), String>,
     live_error: std::collections::HashMap<(NodeId, usize), String>,
     was_running: bool,
+    script_check: crate::script_editor::ScriptCheck,
+    script_window: bool,
 }
 
 /// Send-type discriminant without its parameters, for the combo box.
@@ -184,6 +186,7 @@ impl Inspector {
             self.id_buf.clear();
             self.route_buf.clear();
             self.error = None;
+            self.script_window = false;
         }
 
         ui.add_space(4.0);
@@ -404,6 +407,9 @@ impl Inspector {
                             }
                         });
                 }
+
+                ui.separator();
+                self.script_ui(ui, sel, &mut ecu.script, running);
             }
         }
 
@@ -414,6 +420,79 @@ impl Inspector {
 }
 
 impl Inspector {
+    /// Collapsible Rhai script section for ECU-like nodes.
+    fn script_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        sel: FlowId,
+        script: &mut Option<String>,
+        running: bool,
+    ) {
+        use crate::script_editor::{self as se, TEMPLATE};
+        let id = ui.make_persistent_id(("script_section", sel));
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id,
+            script.is_some(),
+        );
+        state
+            .show_header(ui, |ui| se::header_ui(ui, script.as_deref()))
+            .body(|ui| {
+                ui.horizontal(|ui| {
+                    if script.is_none() {
+                        if ui
+                            .add_enabled(!running, egui::Button::new("Add script"))
+                            .clicked()
+                        {
+                            *script = Some(TEMPLATE.to_string());
+                        }
+                    } else {
+                        if ui
+                            .add_enabled(!running, egui::Button::new("Remove script"))
+                            .clicked()
+                        {
+                            *script = None;
+                            self.script_window = false;
+                        }
+                        if ui.button("Open in window").clicked() {
+                            self.script_window = true;
+                        }
+                    }
+                });
+                if let Some(src) = script.as_mut() {
+                    se::editor_ui(
+                        ui,
+                        egui::Id::new(("script_edit", sel)),
+                        src,
+                        !running,
+                        &mut self.script_check,
+                        14,
+                    );
+                }
+            });
+        if self.script_window
+            && let Some(src) = script.as_mut()
+        {
+            let mut open = true;
+            egui::Window::new("Script")
+                .id(egui::Id::new(("script_window", sel)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([640.0, 480.0])
+                .show(ui.ctx(), |ui| {
+                    se::editor_ui(
+                        ui,
+                        egui::Id::new(("script_edit_win", sel)),
+                        src,
+                        !running,
+                        &mut self.script_check,
+                        28,
+                    );
+                });
+            self.script_window = open;
+        }
+    }
+
     fn routes_ui(
         ui: &mut egui::Ui,
         bufs: &mut std::collections::HashMap<(usize, u8), String>,

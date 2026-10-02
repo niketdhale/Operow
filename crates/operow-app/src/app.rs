@@ -38,6 +38,7 @@ pub struct OperowApp {
 
     theme: AppTheme,
     status_log: Vec<String>,
+    show_log: bool,
     last_error: Option<String>,
     /// Flow-space position of the last right-click on the canvas, where
     /// "Add ECU"/"Add CAN Bus" place the new node.
@@ -74,6 +75,7 @@ impl OperowApp {
             bus_stats: Default::default(),
             theme: AppTheme::Light,
             status_log: Vec::new(),
+            show_log: false,
             last_error: None,
             menu_pos: None,
             screenshot_path,
@@ -91,8 +93,10 @@ impl OperowApp {
         topology: Option<&std::path::Path>,
         select: Option<&str>,
         no_start: bool,
+        show_log: bool,
     ) {
         self.no_start = no_start;
+        self.show_log = show_log;
         if fixed_trace {
             self.trace.mode = TraceMode::Fixed;
         }
@@ -399,6 +403,30 @@ impl OperowApp {
         }
     }
 
+    fn log_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Log");
+            if icons::icon_button(ui, icons::clear(), "Clear log").clicked() {
+                self.status_log.clear();
+            }
+            ui.label(format!("{} lines", self.status_log.len()));
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.status_log {
+                    let text = egui::RichText::new(line).monospace();
+                    if crate::script_editor::is_error_line(line) {
+                        ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), text);
+                    } else {
+                        ui.label(text);
+                    }
+                }
+            });
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (color, label) = match self.run_state {
@@ -421,7 +449,11 @@ impl OperowApp {
                     format!("last error: {err}"),
                 );
             } else if let Some(last) = self.status_log.last() {
-                ui.weak(last);
+                if crate::script_editor::is_error_line(last) {
+                    ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), last);
+                } else {
+                    ui.weak(last);
+                }
             }
         });
     }
@@ -502,7 +534,15 @@ impl eframe::App for OperowApp {
             .resizable(true)
             .default_height(260.0)
             .show(ctx, |ui| {
-                self.trace.ui(ui);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.show_log, false, "Trace");
+                    ui.selectable_value(&mut self.show_log, true, "Log");
+                });
+                if self.show_log {
+                    self.log_ui(ui);
+                } else {
+                    self.trace.ui(ui);
+                }
             });
 
         egui::SidePanel::left("left_panel")

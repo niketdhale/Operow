@@ -4,6 +4,7 @@ mod app;
 mod graph;
 mod icons;
 mod inspector;
+mod script_editor;
 mod theme;
 mod trace;
 
@@ -15,6 +16,7 @@ fn main() -> eframe::Result<()> {
     let mut topology_path: Option<PathBuf> = None;
     let mut select: Option<String> = None;
     let mut no_start = false;
+    let mut show_log = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--screenshot" {
@@ -25,6 +27,8 @@ fn main() -> eframe::Result<()> {
             select = args.next();
         } else if arg == "--no-start" {
             no_start = true;
+        } else if arg == "--show-log" {
+            show_log = true;
         } else if arg == "--topology" {
             topology_path = args.next().map(PathBuf::from);
         }
@@ -49,6 +53,7 @@ fn main() -> eframe::Result<()> {
                 topology_path.as_deref(),
                 select.as_deref(),
                 no_start,
+                show_log,
             );
             Ok(Box::new(app))
         }),

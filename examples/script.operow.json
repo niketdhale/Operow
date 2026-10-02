@@ -18,7 +18,7 @@
       "name": "Responder",
       "tx": [],
       "pos": [400.0, 200.0],
-      "script": "fn on_start() {\n    this.counter = 0;\n    print(\"responder ready\");\n}\n\nfn on_message(msg) {\n    if msg.id == 0x100 {\n        this.counter += 1;\n        output(#{ id: 0x101, data: [this.counter % 256] });\n    }\n}\n"
+      "script": "fn on_start() {\n    this.counter = 0;\n    print(\"responder ready\");\n}\n\nfn on_message(msg) {\n    if msg.id == 0x100 {\n        this.counter += 1;\n        print(`request #${this.counter}`);\n        output(#{ id: 0x101, data: [this.counter % 256] });\n    }\n}\n"
     }
   ],
   "buses": [
