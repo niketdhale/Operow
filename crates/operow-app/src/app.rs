@@ -52,6 +52,7 @@ pub struct OperowApp {
     screenshot_path: Option<PathBuf>,
     screenshot_start: Option<std::time::Instant>,
     screenshot_taken: bool,
+    no_start: bool,
 }
 
 impl OperowApp {
@@ -78,12 +79,20 @@ impl OperowApp {
             screenshot_path,
             screenshot_start: None,
             screenshot_taken: false,
+            no_start: false,
         }
     }
 
     /// Startup options (mainly for headless screenshots): begin in
     /// fixed-position trace mode and/or load a topology file.
-    pub fn configure_startup(&mut self, fixed_trace: bool, topology: Option<&std::path::Path>) {
+    pub fn configure_startup(
+        &mut self,
+        fixed_trace: bool,
+        topology: Option<&std::path::Path>,
+        select: Option<&str>,
+        no_start: bool,
+    ) {
+        self.no_start = no_start;
         if fixed_trace {
             self.trace.mode = TraceMode::Fixed;
         }
@@ -98,6 +107,22 @@ impl OperowApp {
                 }
                 Err(e) => self.last_error = Some(format!("load error: {e}")),
             }
+        }
+        if let Some(name) = select {
+            self.select_by_name(name);
+        }
+    }
+
+    fn select_by_name(&mut self, name: &str) {
+        let id = self
+            .graph
+            .state
+            .nodes
+            .iter()
+            .find(|n| n.data.name() == name)
+            .map(|n| n.id);
+        if let Some(id) = id {
+            self.graph.select(id);
         }
     }
 
@@ -414,6 +439,7 @@ impl OperowApp {
         let ecu_id = ecu.id;
         for msg in ecu.tx.clone() {
             if ui.button(format!("Send {}", msg.name)).clicked() {
+                // `msg.bus` of None means all linked buses.
                 let _ = self
                     .engine
                     .cmd
@@ -456,7 +482,9 @@ impl eframe::App for OperowApp {
         if self.screenshot_path.is_some() && self.screenshot_start.is_none() {
             // Kick off the demo run automatically for headless verification.
             self.speed = 1.0;
-            self.start();
+            if !self.no_start {
+                self.start();
+            }
             self.screenshot_start = Some(std::time::Instant::now());
         }
 
@@ -480,7 +508,9 @@ impl eframe::App for OperowApp {
             .default_width(320.0)
             .show(ctx, |ui| {
                 let running = self.run_state != RunState::Stopped;
-                self.inspector.ui(ui, &mut self.graph, running);
+                for cmd in self.inspector.ui(ui, &mut self.graph, running) {
+                    let _ = self.engine.cmd.send(cmd);
+                }
                 self.send_once_ui(ui);
             });
 
