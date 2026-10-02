@@ -1,0 +1,147 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "name": "Engine",
+      "tx": [
+        {
+          "name": "EngineData",
+          "frame": {
+            "id": 256,
+            "extended": false,
+            "fd": false,
+            "brs": false,
+            "dlc": 8,
+            "data": [
+              48,
+              212,
+              127,
+              169,
+              1,
+              1,
+              0,
+              0
+            ]
+          },
+          "period_ms": 10,
+          "enabled": true,
+          "bus": 1,
+          "send_type": {
+            "type": "Cyclic"
+          }
+        }
+      ],
+      "kind": {
+        "type": "Ecu"
+      },
+      "pos": [
+        60.0,
+        60.0
+      ],
+      "script": null
+    },
+    {
+      "id": 2,
+      "name": "Gateway",
+      "tx": [
+        {
+          "name": "GatewayStatus",
+          "frame": {
+            "id": 1280,
+            "extended": true,
+            "fd": false,
+            "brs": false,
+            "dlc": 8,
+            "data": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "period_ms": 100,
+          "enabled": true,
+          "bus": 1,
+          "send_type": {
+            "type": "Cyclic"
+          }
+        }
+      ],
+      "kind": {
+        "type": "Ecu"
+      },
+      "pos": [
+        260.0,
+        60.0
+      ],
+      "script": null
+    },
+    {
+      "id": 3,
+      "name": "Dash",
+      "tx": [
+        {
+          "name": "DashCmd",
+          "frame": {
+            "id": 512,
+            "extended": false,
+            "fd": false,
+            "brs": false,
+            "dlc": 2,
+            "data": [
+              128,
+              0
+            ]
+          },
+          "period_ms": 100,
+          "enabled": true,
+          "bus": 1,
+          "send_type": {
+            "type": "Event"
+          }
+        }
+      ],
+      "kind": {
+        "type": "Ecu"
+      },
+      "pos": [
+        460.0,
+        60.0
+      ],
+      "script": null
+    }
+  ],
+  "buses": [
+    {
+      "id": 1,
+      "name": "Powertrain",
+      "bitrate": 500000,
+      "fd_enabled": false,
+      "data_bitrate": 2000000
+    }
+  ],
+  "links": [
+    {
+      "node": 1,
+      "bus": 1
+    },
+    {
+      "node": 2,
+      "bus": 1
+    },
+    {
+      "node": 3,
+      "bus": 1
+    }
+  ],
+  "databases": [
+    {
+      "path": "sample.dbc",
+      "bus": 1
+    }
+  ]
+}

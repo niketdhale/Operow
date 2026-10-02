@@ -4,8 +4,11 @@
 use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
 use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
-use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, Topology, TxMessage};
+use operow_core::{
+    BusEvent, BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
+};
 
+use crate::icons;
 use crate::theme::AppTheme;
 
 /// A node placed on the canvas: either a simulated ECU or a CAN bus.
@@ -31,6 +34,9 @@ pub struct Graph {
     pub state: FlowState<GraphNode, ()>,
     next_node_id: u32,
     next_bus_id: u32,
+    /// DBC files referenced by the project; round-tripped through the
+    /// topology but not shown on the canvas.
+    pub databases: Vec<DbcRef>,
 }
 
 impl Graph {
@@ -39,6 +45,7 @@ impl Graph {
             state: FlowState::new(),
             next_node_id: 1,
             next_bus_id: 1,
+            databases: Vec::new(),
         }
     }
 
@@ -77,6 +84,8 @@ impl Graph {
                 frame: operow_core::CanFrame::new_fd(0x400, false, true, &fd_data).unwrap(),
                 period_ms: 100,
                 enabled: true,
+                bus: None,
+                send_type: Default::default(),
             });
         }
 
@@ -96,9 +105,21 @@ impl Graph {
                 id,
                 name: name.to_string(),
                 tx: Vec::new(),
+                kind: Default::default(),
                 pos: (pos.x, pos.y),
+                script: None,
             }),
         )
+    }
+
+    /// Add a gateway node (an ECU-like node with an empty route table).
+    pub fn add_gateway(&mut self, pos: Pos2) -> FlowId {
+        let name = format!("Gateway {}", self.next_node_id);
+        let id = self.add_ecu(pos, &name);
+        if let Some(GraphNode::Ecu(e)) = self.node_mut(id) {
+            e.kind = NodeKind::Gateway { routes: vec![] };
+        }
+        id
     }
 
     pub fn add_bus(&mut self, pos: Pos2) -> FlowId {
@@ -127,6 +148,10 @@ impl Graph {
 
     /// Remove a node and the wires attached to it.
     pub fn remove(&mut self, id: FlowId) {
+        if let Some(GraphNode::Bus(b)) = self.node(id) {
+            let bus = b.id;
+            self.databases.retain(|d| d.bus != bus);
+        }
         self.state.remove_node(id);
     }
 
@@ -143,26 +168,14 @@ impl Graph {
         self.state.nodes.iter().find(|n| n.selected).map(|n| n.id)
     }
 
-    /// Send a particle down every wire leaving the ECU `sender`, to show it
-    /// transmitting a frame. No-op if the ECU isn't on the canvas.
-    pub fn pulse_sender(&mut self, sender: NodeId, style: PulseStyle) {
-        let Some(node) = self
-            .state
-            .nodes
-            .iter()
-            .find(|n| matches!(&n.data, GraphNode::Ecu(e) if e.id == sender))
-            .map(|n| n.id)
-        else {
-            return;
-        };
-        let edges: Vec<_> = self
-            .state
-            .edges
-            .iter()
-            .filter(|e| e.source == node)
-            .map(|e| e.id)
-            .collect();
-        for edge in edges {
+    /// Send a particle along the wire between ECU `node` and bus `bus`, in
+    /// the wire's own direction (ECU to bus). No-op if there is no such wire.
+    pub fn pulse_link(&mut self, node: NodeId, bus: BusId, style: PulseStyle) {
+        let edge = self.state.edges.iter().find(|e| {
+            matches!(self.node(e.source), Some(GraphNode::Ecu(n)) if n.id == node)
+                && matches!(self.node(e.target), Some(GraphNode::Bus(b)) if b.id == bus)
+        });
+        if let Some(edge) = edge.map(|e| e.id) {
             self.state.pulse_edge(edge, style);
         }
     }
@@ -199,12 +212,30 @@ impl Graph {
             nodes,
             buses,
             links,
+            databases: self.databases.clone(),
         }
     }
 
     /// Rebuild the graph from a loaded `Topology`, keeping saved positions.
     pub fn from_topology(topo: &Topology) -> Self {
+        Self::from_topology_keeping(topo, &Graph::new())
+    }
+
+    /// Like [`Graph::from_topology`], but buses that also exist in `old`
+    /// stay where the user put them (the topology does not store bus
+    /// positions).
+    pub fn from_topology_keeping(topo: &Topology, old: &Graph) -> Self {
+        let old_pos: std::collections::HashMap<BusId, Pos2> = old
+            .state
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                GraphNode::Bus(b) => Some((b.id, n.position)),
+                _ => None,
+            })
+            .collect();
         let mut g = Graph::new();
+        g.databases = topo.databases.clone();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 
@@ -215,7 +246,10 @@ impl Graph {
             ecu_map.insert(ecu.id, fid);
         }
         for (i, bus) in topo.buses.iter().enumerate() {
-            let pos = Pos2::new(160.0, 260.0 + 160.0 * i as f32);
+            let pos = old_pos
+                .get(&bus.id)
+                .copied()
+                .unwrap_or_else(|| Pos2::new(160.0, 260.0 + 160.0 * i as f32));
             let fid = g.state.add_node(pos, GraphNode::Bus(bus.clone()));
             g.next_bus_id = g.next_bus_id.max(bus.id.0 + 1);
             bus_map.insert(bus.id, fid);
@@ -236,6 +270,8 @@ fn tx(name: &str, id: u32, period_ms: u32, data: &[u8]) -> TxMessage {
         frame: operow_core::CanFrame::new(id, false, data).unwrap(),
         period_ms,
         enabled: true,
+        bus: None,
+        send_type: Default::default(),
     }
 }
 
@@ -248,25 +284,38 @@ pub struct GraphViewer {
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
     fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
-        let title = match &node.data {
-            GraphNode::Ecu(_) => format!("🖳 {}", node.data.name()),
-            GraphNode::Bus(b) if b.fd_enabled => format!(
-                "▬ {} (CAN FD {}/{})",
-                node.data.name(),
-                format_bitrate(b.bitrate),
-                format_bitrate(b.data_bitrate)
+        let (icon, title) = match &node.data {
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
+                (icons::gateway(), node.data.name().to_string())
+            }
+            GraphNode::Ecu(_) => (icons::ecu(), node.data.name().to_string()),
+            GraphNode::Bus(b) if b.fd_enabled => (
+                icons::bus(),
+                format!(
+                    "{} (CAN FD {}/{})",
+                    node.data.name(),
+                    format_bitrate(b.bitrate),
+                    format_bitrate(b.data_bitrate)
+                ),
             ),
-            GraphNode::Bus(b) => format!("▬ {} ({})", node.data.name(), format_bitrate(b.bitrate)),
+            GraphNode::Bus(b) => (
+                icons::bus(),
+                format!("{} ({})", node.data.name(), format_bitrate(b.bitrate)),
+            ),
         };
-        ui.label(egui::RichText::new(title).strong());
+        ui.horizontal(|ui| {
+            ui.add(icons::icon_image(ui, icon));
+            ui.label(egui::RichText::new(title).strong());
+            if let GraphNode::Ecu(e) = &node.data
+                && e.script.is_some()
+            {
+                ui.add(icons::icon_image(ui, icons::script()));
+            }
+        });
         if let GraphNode::Ecu(e) = &node.data
-            && !e.tx.is_empty()
+            && let Some(sub) = subtitle(e)
         {
-            ui.label(
-                egui::RichText::new(format!("{} msg(s)", e.tx.len()))
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(sub).small().weak());
         }
     }
 
@@ -278,10 +327,7 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
     }
 
     fn node_frame(&self, ui: &egui::Ui, node: &Node<GraphNode>) -> Frame {
-        let accent = match node.data {
-            GraphNode::Ecu(_) => self.theme.bus_color(1),
-            GraphNode::Bus(_) => self.theme.bus_color(0),
-        };
+        let accent = self.accent(&node.data);
         Frame::new()
             .fill(ui.visuals().window_fill)
             .stroke(Stroke::new(1.5_f32, accent))
@@ -290,11 +336,32 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
     }
 
     fn minimap_color(&self, node: &Node<GraphNode>) -> Option<egui::Color32> {
-        Some(match node.data {
+        Some(self.accent(&node.data))
+    }
+}
+
+impl GraphViewer {
+    fn accent(&self, data: &GraphNode) -> egui::Color32 {
+        match data {
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
+                self.theme.gateway_color()
+            }
             GraphNode::Ecu(_) => self.theme.bus_color(1),
             GraphNode::Bus(_) => self.theme.bus_color(0),
-        })
+        }
     }
+}
+
+/// Node subtitle, e.g. `3 route(s) · 2 msg(s)`; `None` when there is nothing to show.
+pub fn subtitle(e: &EcuConfig) -> Option<String> {
+    let mut parts = Vec::new();
+    if let NodeKind::Gateway { routes } = &e.kind {
+        parts.push(format!("{} route(s)", routes.len()));
+    }
+    if !e.tx.is_empty() {
+        parts.push(format!("{} msg(s)", e.tx.len()));
+    }
+    (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
 }
 
 /// Formats a bit/s value compactly, e.g. `500k`, `2M`.
@@ -305,5 +372,186 @@ pub fn format_bitrate(bps: u32) -> String {
         format!("{}k", bps / 1_000)
     } else {
         format!("{bps}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn databases_round_trip_and_bus_positions_kept() {
+        let mut g = Graph::new();
+        let bus = g.add_bus(Pos2::new(500.0, 400.0));
+        g.databases.push(DbcRef {
+            path: "a.dbc".into(),
+            bus: BusId(1),
+        });
+        let _ = bus;
+        let topo = g.to_topology();
+        assert_eq!(topo.databases, g.databases);
+        let g2 = Graph::from_topology_keeping(&topo, &g);
+        assert_eq!(g2.databases, g.databases);
+        let pos = g2.state.nodes[0].position;
+        assert_eq!(pos, Pos2::new(500.0, 400.0));
+        // Removing the bus drops its database reference.
+        let mut g3 = g2;
+        let id = g3.state.nodes[0].id;
+        g3.remove(id);
+        assert!(g3.databases.is_empty());
+    }
+
+    #[test]
+    fn gateway_creation_and_subtitle() {
+        let mut g = Graph::new();
+        let id = g.add_gateway(Pos2::ZERO);
+        let Some(GraphNode::Ecu(e)) = g.node(id) else {
+            panic!()
+        };
+        assert_eq!(e.name, "Gateway 1");
+        assert_eq!(subtitle(e).as_deref(), Some("0 route(s)"));
+        let mut e = e.clone();
+        e.tx.push(tx("A", 1, 10, &[]));
+        assert_eq!(subtitle(&e).as_deref(), Some("0 route(s) \u{b7} 1 msg(s)"));
+        e.kind = NodeKind::Ecu;
+        e.tx.clear();
+        assert_eq!(subtitle(&e), None);
+    }
+}
+
+/// Which way a pulse travels along an ECU-bus wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PulseDir {
+    /// ECU drives the frame onto the bus.
+    ToBus,
+    /// Bus delivers the frame to a receiving ECU.
+    FromBus,
+}
+
+/// Visual class of a pulse: originated (`Tx`) vs. gateway-forwarded
+/// (`Forwarded`), each optionally CAN FD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PulseKind {
+    pub forwarded: bool,
+    pub fd: bool,
+}
+
+/// One animated hop of a frame along an ECU-bus wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PulseSpec {
+    pub node: NodeId,
+    pub bus: BusId,
+    pub dir: PulseDir,
+    pub kind: PulseKind,
+}
+
+/// Map a batch of bus events onto a deduplicated list of wire pulses: the
+/// sender's wire to the bus, then the bus's wire to every other linked node.
+/// Order is first-seen, so the sender leg precedes the receiver legs.
+pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> {
+    let mut out: Vec<PulseSpec> = Vec::new();
+    let mut push = |spec: PulseSpec| {
+        if !out.contains(&spec) {
+            out.push(spec);
+        }
+    };
+    for ev in events {
+        let kind = PulseKind {
+            forwarded: ev.hop > 0,
+            fd: ev.frame.fd,
+        };
+        push(PulseSpec {
+            node: ev.sender,
+            bus: ev.bus,
+            dir: PulseDir::ToBus,
+            kind,
+        });
+        for l in links
+            .iter()
+            .filter(|l| l.bus == ev.bus && l.node != ev.sender)
+        {
+            push(PulseSpec {
+                node: l.node,
+                bus: ev.bus,
+                dir: PulseDir::FromBus,
+                kind,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+    use operow_core::{CanFrame, Direction, Timestamp};
+
+    fn ev(bus: u32, sender: u32, hop: u8, fd: bool) -> BusEvent {
+        let frame = if fd {
+            CanFrame::new_fd(0x100, false, false, &[0; 12]).unwrap()
+        } else {
+            CanFrame::new(0x100, false, &[0; 8]).unwrap()
+        };
+        BusEvent {
+            time: Timestamp(0),
+            bus: BusId(bus),
+            sender: NodeId(sender),
+            origin: NodeId(1),
+            dir: if hop > 0 {
+                Direction::Rx
+            } else {
+                Direction::Tx
+            },
+            frame_uid: 1,
+            hop,
+            frame,
+        }
+    }
+
+    fn links() -> Vec<Link> {
+        [(1, 1), (9, 1), (9, 2), (2, 2), (3, 2)]
+            .iter()
+            .map(|&(n, b)| Link {
+                node: NodeId(n),
+                bus: BusId(b),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_event_pulses_gateway_to_bus2() {
+        let p = pulses_for_events(&[ev(2, 9, 1, false)], &links());
+        assert_eq!(
+            p[0],
+            PulseSpec {
+                node: NodeId(9),
+                bus: BusId(2),
+                dir: PulseDir::ToBus,
+                kind: PulseKind {
+                    forwarded: true,
+                    fd: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn receivers_included_sender_excluded() {
+        let p = pulses_for_events(&[ev(2, 9, 1, false)], &links());
+        let from: Vec<_> = p
+            .iter()
+            .filter(|s| s.dir == PulseDir::FromBus)
+            .map(|s| s.node)
+            .collect();
+        assert_eq!(from, vec![NodeId(2), NodeId(3)]);
+        assert_eq!(p.len(), 3);
+    }
+
+    #[test]
+    fn duplicates_are_merged_but_styles_kept() {
+        let evs = [ev(1, 1, 0, false), ev(1, 1, 0, false), ev(1, 1, 0, true)];
+        let p = pulses_for_events(&evs, &links());
+        // 1 ToBus + 1 FromBus (node 9) per style.
+        assert_eq!(p.len(), 4);
     }
 }

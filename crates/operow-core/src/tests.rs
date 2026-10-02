@@ -1,4 +1,7 @@
-use crate::{BusId, CanBusConfig, CanFrame, EcuConfig, Link, NodeId, Topology, TxMessage};
+use crate::{
+    BusId, CanBusConfig, CanFrame, DbcRef, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
+    SendType, Topology, TopologyError, TxMessage,
+};
 
 #[test]
 fn topology_json_roundtrip() {
@@ -11,8 +14,12 @@ fn topology_json_roundtrip() {
                 frame: CanFrame::new(0x100, false, &[1, 2, 3]).unwrap(),
                 period_ms: 10,
                 enabled: true,
+                bus: None,
+                send_type: Default::default(),
             }],
+            kind: Default::default(),
             pos: (1.0, 2.0),
+            script: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -25,6 +32,7 @@ fn topology_json_roundtrip() {
             node: NodeId(1),
             bus: BusId(1),
         }],
+        databases: vec![],
     };
 
     let json = topo.to_json();
@@ -137,10 +145,201 @@ fn old_classic_json_still_loads_via_topology_from_json() {
     .unwrap();
     let topo = Topology::from_json(&json).expect("legacy classic topology must still parse");
     assert!(!topo.nodes.is_empty());
+    assert!(topo.validate().is_ok());
     for node in &topo.nodes {
         for tx in &node.tx {
             assert!(!tx.frame.fd);
             assert!(!tx.frame.brs);
         }
     }
+}
+
+#[test]
+fn gateway_example_loads_and_validates() {
+    let json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/gateway.operow.json"
+    ))
+    .unwrap();
+    let topo = Topology::from_json(&json).unwrap();
+    topo.validate().unwrap();
+    assert!(matches!(topo.nodes[2].kind, NodeKind::Gateway { .. }));
+}
+
+#[test]
+fn id_filter_matches() {
+    let std = CanFrame::new(0x123, false, &[]).unwrap();
+    let ext = CanFrame::new(0x123, true, &[]).unwrap();
+    assert!(IdFilter::Any.matches(&std));
+    let exact = IdFilter::Exact {
+        id: 0x123,
+        extended: false,
+    };
+    assert!(exact.matches(&std) && !exact.matches(&ext));
+    assert!(
+        IdFilter::Range {
+            lo: 0x120,
+            hi: 0x123
+        }
+        .matches(&std)
+    );
+    assert!(
+        !IdFilter::Range {
+            lo: 0x124,
+            hi: 0x130
+        }
+        .matches(&std)
+    );
+    assert!(
+        IdFilter::Mask {
+            id: 0x120,
+            mask: 0x7F0
+        }
+        .matches(&std)
+    );
+    assert!(
+        !IdFilter::Mask {
+            id: 0x130,
+            mask: 0x7F0
+        }
+        .matches(&std)
+    );
+}
+
+#[test]
+fn validate_rejects_bad_bus_references() {
+    let mut topo = Topology {
+        nodes: vec![EcuConfig {
+            id: NodeId(1),
+            name: "G".into(),
+            tx: vec![],
+            kind: NodeKind::Gateway {
+                routes: vec![RouteRule {
+                    from_bus: BusId(1),
+                    to_buses: vec![BusId(2)],
+                    filter: IdFilter::Any,
+                    remap_id: None,
+                    delay_us: 0,
+                }],
+            },
+            pos: (0.0, 0.0),
+            script: None,
+        }],
+        buses: ["A", "B"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| CanBusConfig {
+                id: BusId(i as u32 + 1),
+                name: (*n).into(),
+                bitrate: 500_000,
+                fd_enabled: false,
+                data_bitrate: 2_000_000,
+            })
+            .collect(),
+        links: vec![Link {
+            node: NodeId(1),
+            bus: BusId(1),
+        }],
+        databases: vec![],
+    };
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::RouteBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(2)
+        })
+    );
+    topo.links.push(Link {
+        node: NodeId(1),
+        bus: BusId(2),
+    });
+    assert!(topo.validate().is_ok());
+
+    if let NodeKind::Gateway { routes } = &mut topo.nodes[0].kind {
+        routes[0].to_buses = vec![BusId(1)];
+    }
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::RouteToSameBus {
+            node: NodeId(1),
+            bus: BusId(1)
+        })
+    );
+
+    topo.nodes[0].kind = NodeKind::Ecu;
+    topo.nodes[0].tx.push(TxMessage {
+        name: "M".into(),
+        frame: CanFrame::new(1, false, &[]).unwrap(),
+        period_ms: 10,
+        enabled: true,
+        bus: Some(BusId(3)),
+        send_type: Default::default(),
+    });
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::TxBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(3)
+        })
+    );
+}
+
+#[test]
+fn tx_message_without_send_type_loads_as_cyclic() {
+    let msg = TxMessage {
+        name: "M".into(),
+        frame: CanFrame::new(1, false, &[1]).unwrap(),
+        period_ms: 10,
+        enabled: true,
+        bus: None,
+        send_type: SendType::OnChange { min_gap_ms: 5 },
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains(r#""type":"OnChange""#));
+    let back: TxMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, msg);
+
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value.as_object_mut().unwrap().remove("send_type");
+    let old: TxMessage = serde_json::from_value(value).unwrap();
+    assert_eq!(old.send_type, SendType::Cyclic);
+}
+
+#[test]
+fn old_send_type_names_deserialize() {
+    use crate::SendType;
+    let old: SendType = serde_json::from_str(r#"{"type":"Spontaneous"}"#).unwrap();
+    assert_eq!(old, SendType::Event);
+    let old: SendType = serde_json::from_str(r#"{"type":"CyclicAndSpontaneous"}"#).unwrap();
+    assert_eq!(old, SendType::CyclicAndEvent);
+    let new: SendType = serde_json::from_str(r#"{"type":"Event"}"#).unwrap();
+    assert_eq!(new, SendType::Event);
+}
+
+#[test]
+fn ecu_without_script_field_loads() {
+    let json = r#"{"id":1,"name":"A","tx":[]}"#;
+    let ecu: EcuConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(ecu.script, None);
+}
+
+#[test]
+fn databases_default_empty_and_validated() {
+    let mut topo =
+        Topology::from_json(r#"{"buses":[{"id":1,"name":"A","bitrate":500000}]}"#).unwrap();
+    assert!(topo.databases.is_empty());
+    topo.databases.push(DbcRef {
+        path: "a.dbc".into(),
+        bus: BusId(1),
+    });
+    assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
+    assert_eq!(topo.validate(), Ok(()));
+    topo.databases[0].bus = BusId(5);
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::DatabaseUnknownBus {
+            path: "a.dbc".into(),
+            bus: BusId(5)
+        })
+    );
 }

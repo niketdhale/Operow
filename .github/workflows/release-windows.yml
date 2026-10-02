@@ -1,0 +1,42 @@
+name: "Release (Windows)"
+
+on:
+  push:
+    branches: [develop]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p operow-app --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') { $ver = $env:GITHUB_REF_NAME }
+          else { $ver = "develop-" + $env:GITHUB_SHA.Substring(0, 7) }
+          $dir = "dist/operow-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/operow.exe $dir
+          Copy-Item -Recurse examples "$dir/examples"
+          Copy-Item README.md, LICENSE $dir
+          $zip = "dist/operow-$ver-windows-x64.zip"
+          Compress-Archive -Path $dir -DestinationPath $zip -Force
+          "ZIP_PATH=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operow-windows-x64
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 30
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}

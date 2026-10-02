@@ -1,0 +1,42 @@
+VERSION "1.0"
+
+
+NS_ :
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+
+BS_:
+
+BU_: Engine Gateway Dash
+
+BO_ 256 EngineData: 8 Engine
+ SG_ EngineSpeed : 7|16@0+ (0.25,0) [0|16383.75] "rpm" Gateway,Dash
+ SG_ CoolantTemp : 16|8@1- (1,-40) [-40|215] "degC" Dash
+ SG_ Throttle : 24|10@1+ (0.1,0) [0|100] "%" Vector__XXX
+ SG_ Running : 40|1@1+ (1,0) [0|1] "" Dash
+
+BO_ 2147484928 GatewayStatus: 8 Gateway
+ SG_ Mode M : 0|4@1+ (1,0) [0|15] "" Dash
+ SG_ Voltage m0 : 8|12@1+ (0.01,0) [0|40.95] "V" Dash
+ SG_ Current m1 : 8|12@1- (0.1,0) [-204.8|204.7] "A" Dash
+
+BO_ 512 DashCmd: 2 Dash
+ SG_ Brightness : 0|8@1+ (1,0) [0|255] "" Engine
+
+CM_ BO_ 256 "Engine data,
+sent every 10 ms";
+CM_ SG_ 256 EngineSpeed "Crankshaft speed";
+BA_DEF_ BO_ "GenMsgCycleTime" INT 0 65535;
+BA_DEF_ BO_ "GenMsgSendType" ENUM "Cyclic","Event";
+BA_DEF_ SG_ "GenSigStartValue" INT 0 65535;
+BA_DEF_DEF_ "GenMsgCycleTime" 0;
+BA_ "GenMsgCycleTime" BO_ 256 10;
+BA_ "GenMsgCycleTime" BO_ 2147484928 100;
+BA_ "GenMsgSendType" BO_ 256 0;
+BA_ "GenMsgSendType" BO_ 512 1;
+BA_ "GenSigStartValue" SG_ 512 Brightness 128;
+VAL_ 256 Running 0 "Off" 1 "On" ;
+VAL_ 2147484928 Mode 0 "Voltage" 1 "Current" ;

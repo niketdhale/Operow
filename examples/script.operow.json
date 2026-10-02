@@ -1,0 +1,31 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "name": "Requester",
+      "tx": [
+        {
+          "name": "Request",
+          "frame": { "id": 256, "extended": false, "dlc": 1, "data": [0, 0, 0, 0, 0, 0, 0, 0] },
+          "period_ms": 100,
+          "enabled": true
+        }
+      ],
+      "pos": [100.0, 200.0]
+    },
+    {
+      "id": 2,
+      "name": "Responder",
+      "tx": [],
+      "pos": [400.0, 200.0],
+      "script": "fn on_start() {\n    this.counter = 0;\n    print(\"responder ready\");\n}\n\nfn on_message(msg) {\n    if msg.id == 0x100 {\n        this.counter += 1;\n        print(`request #${this.counter}`);\n        output(#{ id: 0x101, data: [this.counter % 256] });\n    }\n}\n"
+    }
+  ],
+  "buses": [
+    { "id": 1, "name": "CAN0", "bitrate": 500000, "fd_enabled": false }
+  ],
+  "links": [
+    { "node": 1, "bus": 1 },
+    { "node": 2, "bus": 1 }
+  ]
+}

@@ -43,6 +43,14 @@ impl AppTheme {
         };
         table[index % table.len()]
     }
+
+    /// Accent for gateway nodes.
+    pub fn gateway_color(self) -> Color32 {
+        match self {
+            AppTheme::Light => Color32::from_rgb(0x0e, 0x80, 0x8a),
+            AppTheme::Dark => Color32::from_rgb(0x4d, 0xdc, 0xe6),
+        }
+    }
 }
 
 fn light_visuals() -> Visuals {

@@ -74,3 +74,22 @@ fn test_example_smoke() {
         load
     );
 }
+
+#[test]
+fn test_script_example_smoke() {
+    let json_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/script.operow.json"
+    );
+    let json_content = std::fs::read_to_string(json_path).expect("read script example");
+    let topology = Topology::from_json(&json_content).expect("parse script example");
+    let mut sim = Simulation::new(&topology).expect("script example compiles");
+
+    let mut events = Vec::new();
+    sim.run_until(Timestamp::from_ms(1_000), &mut events);
+
+    let requests = events.iter().filter(|e| e.frame.id == 0x100).count();
+    let replies = events.iter().filter(|e| e.frame.id == 0x101).count();
+    assert!(requests > 0, "no 0x100 requests sent");
+    assert_eq!(requests, replies, "every 0x100 should get a 0x101 reply");
+}

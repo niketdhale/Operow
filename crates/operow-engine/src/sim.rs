@@ -2,11 +2,27 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use operow_core::{
-    BusEvent, BusId, CanBusConfig, CanFrame, NodeId, Timestamp, Topology, TopologyError,
+    BusEvent, BusId, CanBusConfig, CanFrame, Direction, NodeId, NodeKind, Timestamp, Topology,
+    TopologyError,
 };
 
-use crate::ecu::{Ecu, EcuCtx, PeriodicEcu};
+use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
+use crate::gateway::GatewayEcu;
+use crate::script::ScriptEcu;
 use crate::timing::frame_duration_ns_any;
+
+/// Maximum number of gateway hops a frame may take; forwards beyond it are
+/// dropped and counted in [`BusStats::routing_drops`].
+pub const MAX_HOPS: u8 = 8;
+
+/// Errors returned by [`Simulation::new`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SimError {
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+    #[error("script of node {node:?} failed to compile: {msg}")]
+    Script { node: NodeId, msg: String },
+}
 
 /// Per-bus utilization counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -16,6 +32,8 @@ pub struct BusStats {
     /// Frames that could not be transmitted (currently: CAN FD frames sent
     /// onto a bus that does not have `fd_enabled` set).
     pub error_frames: u64,
+    /// Forwarded frames dropped because they exceeded [`MAX_HOPS`].
+    pub routing_drops: u64,
 }
 
 impl BusStats {
@@ -39,7 +57,7 @@ enum EventKind {
     },
     TxComplete {
         bus: BusId,
-        sender: NodeId,
+        meta: FrameMeta,
         frame: CanFrame,
         duration_ns: u64,
     },
@@ -90,16 +108,17 @@ pub struct Simulation {
     heap: BinaryHeap<Reverse<Scheduled>>,
     seq: u64,
     bus_busy: HashMap<BusId, bool>,
-    bus_pending: HashMap<BusId, Vec<(CanFrame, NodeId)>>,
+    bus_pending: HashMap<BusId, Vec<(CanFrame, FrameMeta)>>,
+    next_uid: u64,
     stats: HashMap<BusId, BusStats>,
     started: bool,
 }
 
 impl Simulation {
     /// Build a simulation from a validated topology. Every node gets a
-    /// default [`PeriodicEcu`]; use [`Simulation::set_ecu`] to override a
+    /// default [`PeriodicEcu`] (or a [`GatewayEcu`] for gateways); use [`Simulation::set_ecu`] to override a
     /// node's behavior before the first call to `run_until`.
-    pub fn new(topology: &Topology) -> Result<Self, TopologyError> {
+    pub fn new(topology: &Topology) -> Result<Self, SimError> {
         topology.validate()?;
 
         let mut node_buses: HashMap<NodeId, Vec<BusId>> = HashMap::new();
@@ -122,7 +141,17 @@ impl Simulation {
 
         let mut ecus: HashMap<NodeId, Box<dyn Ecu>> = HashMap::new();
         for node in &topology.nodes {
-            ecus.insert(node.id, Box::new(PeriodicEcu::new(node)));
+            let mut ecu: Box<dyn Ecu> = match node.kind {
+                NodeKind::Ecu => Box::new(PeriodicEcu::new(node)),
+                NodeKind::Gateway { .. } => Box::new(GatewayEcu::new(node)),
+            };
+            if let Some(source) = &node.script {
+                ecu = Box::new(
+                    ScriptEcu::new(ecu, &node.name, source)
+                        .map_err(|msg| SimError::Script { node: node.id, msg })?,
+                );
+            }
+            ecus.insert(node.id, ecu);
             node_buses.entry(node.id).or_default();
         }
 
@@ -136,6 +165,7 @@ impl Simulation {
             seq: 0,
             bus_busy,
             bus_pending,
+            next_uid: 0,
             stats,
             started: false,
         })
@@ -145,6 +175,22 @@ impl Simulation {
     /// `run_until`/`send_once` call, i.e. before the simulation has started.
     pub fn set_ecu(&mut self, node: NodeId, ecu: Box<dyn Ecu>) {
         self.ecus.insert(node, ecu);
+    }
+
+    /// Take the log lines (e.g. script output) produced by all ECUs since
+    /// the last call, ordered by node id.
+    pub fn drain_logs(&mut self) -> Vec<String> {
+        let mut nodes: Vec<NodeId> = self.ecus.keys().copied().collect();
+        nodes.sort();
+        nodes
+            .into_iter()
+            .flat_map(|n| {
+                self.ecus
+                    .get_mut(&n)
+                    .map(|e| e.drain_logs())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Current virtual simulation time.
@@ -158,12 +204,42 @@ impl Simulation {
     }
 
     /// Inject a one-off frame transmission from `node`, outside of any ECU
-    /// callback (e.g. from a UI "send" button).
-    pub fn send_once(&mut self, node: NodeId, frame: CanFrame) {
+    /// callback (e.g. from a UI "send" button). `bus` selects a single bus;
+    /// `None` sends on every bus the node is linked to.
+    pub fn send_once(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame) {
         self.ensure_started();
-        let buses = self.node_buses.get(&node).cloned().unwrap_or_default();
-        for bus in buses {
-            self.bus_pending.entry(bus).or_default().push((frame, node));
+        self.enqueue_origin(node, bus, frame);
+    }
+
+    /// Deliver `cmd` to `node`'s ECU at the current virtual time.
+    pub fn command(&mut self, node: NodeId, cmd: EcuCommand) {
+        self.ensure_started();
+        self.run_callback(node, None, |ecu, ctx| ecu.on_command(&cmd, ctx));
+    }
+
+    /// Queue a newly originated frame (fresh uid, hop 0) on `bus`, or on all
+    /// of the node's buses when `bus` is `None`. Unlinked buses are ignored.
+    fn enqueue_origin(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame) {
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let meta = FrameMeta {
+            sender: node,
+            origin: node,
+            uid,
+            hop: 0,
+        };
+        self.enqueue(node, bus, frame, meta);
+    }
+
+    fn enqueue(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame, meta: FrameMeta) {
+        let linked = self.node_buses.get(&node).cloned().unwrap_or_default();
+        let targets: Vec<BusId> = match bus {
+            Some(b) if linked.contains(&b) => vec![b],
+            Some(_) => Vec::new(),
+            None => linked,
+        };
+        for bus in targets {
+            self.bus_pending.entry(bus).or_default().push((frame, meta));
             self.schedule(self.now, EventKind::Arbitrate { bus });
         }
     }
@@ -193,33 +269,45 @@ impl Simulation {
         let mut nodes: Vec<NodeId> = self.ecus.keys().copied().collect();
         nodes.sort();
         for node in nodes {
-            self.run_callback(node, |ecu, ctx| ecu.on_start(ctx));
+            self.run_callback(node, None, |ecu, ctx| ecu.on_start(ctx));
         }
     }
 
-    fn run_callback(&mut self, node: NodeId, f: impl FnOnce(&mut dyn Ecu, &mut EcuCtx)) {
+    fn run_callback(
+        &mut self,
+        node: NodeId,
+        incoming: Option<FrameMeta>,
+        f: impl FnOnce(&mut dyn Ecu, &mut EcuCtx),
+    ) {
         let Some(mut ecu) = self.ecus.remove(&node) else {
             return;
         };
-        let buses = self.node_buses.get(&node).cloned().unwrap_or_default();
-        let mut ctx = EcuCtx::new(node, Timestamp(self.now), buses);
+        let mut ctx = EcuCtx::new(node, Timestamp(self.now), incoming);
         f(ecu.as_mut(), &mut ctx);
         self.ecus.insert(node, ecu);
         self.apply_ctx(node, ctx);
     }
 
     fn apply_ctx(&mut self, node: NodeId, ctx: EcuCtx) {
-        let mut touched: Vec<BusId> = Vec::new();
-        for frame in ctx.sends {
-            for &bus in &ctx.buses {
-                self.bus_pending.entry(bus).or_default().push((frame, node));
-                if !touched.contains(&bus) {
-                    touched.push(bus);
+        for out in ctx.sends {
+            match out.forward_of {
+                None => self.enqueue_origin(node, out.bus, out.frame),
+                Some(prev) => {
+                    let meta = FrameMeta {
+                        sender: node,
+                        origin: prev.origin,
+                        uid: prev.uid,
+                        hop: prev.hop.saturating_add(1),
+                    };
+                    if meta.hop > MAX_HOPS {
+                        if let Some(bus) = out.bus {
+                            self.stats.entry(bus).or_default().routing_drops += 1;
+                        }
+                        continue;
+                    }
+                    self.enqueue(node, out.bus, out.frame, meta);
                 }
             }
-        }
-        for bus in touched {
-            self.schedule(self.now, EventKind::Arbitrate { bus });
         }
         for (timer, delay_ns) in ctx.timers {
             self.schedule(self.now + delay_ns, EventKind::Timer { node, timer });
@@ -249,7 +337,7 @@ impl Simulation {
                 .min_by_key(|(_, (frame, _))| arbitration_key(frame))
                 .map(|(i, _)| i)
                 .expect("pending is non-empty");
-            let (frame, sender) = pending.remove(winner_idx);
+            let (frame, meta) = pending.remove(winner_idx);
 
             let fd_enabled = self
                 .bus_configs
@@ -273,7 +361,7 @@ impl Simulation {
                 self.now + duration_ns,
                 EventKind::TxComplete {
                     bus,
-                    sender,
+                    meta,
                     frame,
                     duration_ns,
                 },
@@ -285,14 +373,14 @@ impl Simulation {
     fn handle_event(&mut self, kind: EventKind, out: &mut Vec<BusEvent>) {
         match kind {
             EventKind::Timer { node, timer } => {
-                self.run_callback(node, |ecu, ctx| ecu.on_timer(timer, ctx));
+                self.run_callback(node, None, |ecu, ctx| ecu.on_timer(timer, ctx));
             }
             EventKind::Arbitrate { bus } => {
                 self.try_arbitrate(bus);
             }
             EventKind::TxComplete {
                 bus,
-                sender,
+                meta,
                 frame,
                 duration_ns,
             } => {
@@ -304,16 +392,24 @@ impl Simulation {
                 out.push(BusEvent {
                     time: Timestamp(self.now),
                     bus,
-                    sender,
+                    sender: meta.sender,
+                    origin: meta.origin,
+                    dir: if meta.hop == 0 {
+                        Direction::Tx
+                    } else {
+                        Direction::Rx
+                    },
+                    frame_uid: meta.uid,
+                    hop: meta.hop,
                     frame,
                 });
 
                 let receivers = self.bus_nodes.get(&bus).cloned().unwrap_or_default();
                 for node in receivers {
-                    if node == sender {
+                    if node == meta.sender {
                         continue;
                     }
-                    self.run_callback(node, |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
+                    self.run_callback(node, Some(meta), |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
                 }
 
                 self.try_arbitrate(bus);
