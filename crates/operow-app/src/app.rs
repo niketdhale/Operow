@@ -6,9 +6,10 @@ use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunSta
 use egui_flow::{Flow, FlowOptions, PulseStyle};
 
 use crate::graph::{Graph, GraphNode, GraphViewer};
+use crate::icons;
 use crate::inspector::Inspector;
 use crate::theme::AppTheme;
-use crate::trace::{NameLookup, Trace};
+use crate::trace::{NameLookup, Trace, TraceMode};
 
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
@@ -77,6 +78,26 @@ impl OperowApp {
             screenshot_path,
             screenshot_start: None,
             screenshot_taken: false,
+        }
+    }
+
+    /// Startup options (mainly for headless screenshots): begin in
+    /// fixed-position trace mode and/or load a topology file.
+    pub fn configure_startup(&mut self, fixed_trace: bool, topology: Option<&std::path::Path>) {
+        if fixed_trace {
+            self.trace.mode = TraceMode::Fixed;
+        }
+        if let Some(path) = topology {
+            match std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| Topology::from_json(&s).map_err(|e| e.to_string()))
+            {
+                Ok(topo) => {
+                    self.graph = Graph::from_topology(&topo);
+                    self.names.rebuild(&topo);
+                }
+                Err(e) => self.last_error = Some(format!("load error: {e}")),
+            }
         }
     }
 
@@ -184,8 +205,10 @@ impl OperowApp {
                 for f in &frames {
                     let bus_name = self.names.bus_name(f.bus);
                     let sender_name = self.names.node_name(f.sender);
-                    let msg_name = self.names.msg_name(f.sender, f.frame.id);
-                    self.trace.push(f, &bus_name, &sender_name, &msg_name);
+                    let origin_name = self.names.node_name(f.origin);
+                    let msg_name = self.names.msg_name(f.origin, f.frame.id);
+                    self.trace
+                        .push(f, &bus_name, &sender_name, &origin_name, &msg_name);
                     self.sim_time = f.time;
                 }
                 // One particle per sending ECU per batch: shows live traffic on
@@ -236,49 +259,33 @@ impl OperowApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    self.new_topology();
-                    ui.close();
-                }
-                if ui.button("Open...").clicked() {
-                    self.open_topology();
-                    ui.close();
-                }
-                if ui.button("Save As...").clicked() {
-                    self.save_topology();
-                    ui.close();
-                }
-            });
+            if icons::icon_button(ui, icons::new(), "New topology").clicked() {
+                self.new_topology();
+            }
+            if icons::icon_button(ui, icons::open(), "Open topology...").clicked() {
+                self.open_topology();
+            }
+            if icons::icon_button(ui, icons::save(), "Save topology as...").clicked() {
+                self.save_topology();
+            }
             ui.separator();
 
             let running = self.run_state == RunState::Running;
             let paused = self.run_state == RunState::Paused;
 
-            if ui
-                .add_enabled(
-                    !running && !paused,
-                    egui::Button::new(
-                        egui::RichText::new("⚡ Start")
-                            .color(egui::Color32::from_rgb(0x1a, 0x9c, 0x3a))
-                            .strong(),
-                    ),
-                )
-                .clicked()
+            if icons::icon_button_enabled(ui, !running && !paused, icons::play(), "Start").clicked()
             {
                 self.start();
             }
-            if ui
-                .add_enabled(running || paused, egui::Button::new("■ Stop"))
-                .clicked()
-            {
+            if icons::icon_button_enabled(ui, running || paused, icons::stop(), "Stop").clicked() {
                 self.stop();
             }
-            let pr_label = if paused { "▶ Resume" } else { "⏸ Pause" };
-            if ui
-                .add_enabled(running || paused, egui::Button::new(pr_label))
-                .clicked()
-            {
+            let (pr_icon, pr_tip) = if paused {
+                (icons::play(), "Resume")
+            } else {
+                (icons::pause(), "Pause")
+            };
+            if icons::icon_button_enabled(ui, running || paused, pr_icon, pr_tip).clicked() {
                 self.pause_resume();
             }
 

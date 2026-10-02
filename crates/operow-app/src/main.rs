@@ -2,6 +2,7 @@
 
 mod app;
 mod graph;
+mod icons;
 mod inspector;
 mod theme;
 mod trace;
@@ -10,10 +11,16 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     let mut screenshot_path: Option<PathBuf> = None;
+    let mut fixed_trace = false;
+    let mut topology_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--screenshot" {
             screenshot_path = args.next().map(PathBuf::from);
+        } else if arg == "--fixed-trace" {
+            fixed_trace = true;
+        } else if arg == "--topology" {
+            topology_path = args.next().map(PathBuf::from);
         }
     }
 
@@ -28,8 +35,11 @@ fn main() -> eframe::Result<()> {
         "Operow",
         native_options,
         Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::AppTheme::Light.apply(&cc.egui_ctx);
-            Ok(Box::new(app::OperowApp::new(screenshot_path)))
+            let mut app = app::OperowApp::new(screenshot_path);
+            app.configure_startup(fixed_trace, topology_path.as_deref());
+            Ok(Box::new(app))
         }),
     )
 }

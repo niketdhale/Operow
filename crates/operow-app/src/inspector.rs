@@ -5,6 +5,7 @@ use egui_flow::NodeId as FlowId;
 use operow_core::CanFrame;
 
 use crate::graph::{Graph, GraphNode};
+use crate::icons;
 
 #[derive(Default)]
 pub struct Inspector {
@@ -20,16 +21,10 @@ impl Inspector {
     pub fn ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, running: bool) {
         ui.heading("Palette");
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!running, egui::Button::new("+ ECU"))
-                .clicked()
-            {
+            if icons::icon_button_enabled(ui, !running, icons::ecu(), "Add ECU").clicked() {
                 graph.add_ecu(egui::pos2(40.0, 40.0), "NewEcu");
             }
-            if ui
-                .add_enabled(!running, egui::Button::new("+ Bus"))
-                .clicked()
-            {
+            if icons::icon_button_enabled(ui, !running, icons::bus(), "Add CAN bus").clicked() {
                 graph.add_bus(egui::pos2(40.0, 200.0));
             }
         });
@@ -165,7 +160,9 @@ impl Inspector {
 
                                 ui.add(egui::DragValue::new(&mut msg.period_ms).range(1..=60_000));
                                 ui.checkbox(&mut msg.enabled, "");
-                                if ui.small_button("🗑").clicked() {
+                                if icons::icon_button(ui, icons::clear(), "Remove message")
+                                    .clicked()
+                                {
                                     remove = Some(i);
                                 }
                                 ui.end_row();

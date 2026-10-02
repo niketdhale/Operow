@@ -6,6 +6,7 @@ use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyl
 
 use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, Topology, TxMessage};
 
+use crate::icons;
 use crate::theme::AppTheme;
 
 /// A node placed on the canvas: either a simulated ECU or a CAN bus.
@@ -254,17 +255,26 @@ pub struct GraphViewer {
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
     fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
-        let title = match &node.data {
-            GraphNode::Ecu(_) => format!("🖳 {}", node.data.name()),
-            GraphNode::Bus(b) if b.fd_enabled => format!(
-                "▬ {} (CAN FD {}/{})",
-                node.data.name(),
-                format_bitrate(b.bitrate),
-                format_bitrate(b.data_bitrate)
+        let (icon, title) = match &node.data {
+            GraphNode::Ecu(_) => (icons::ecu(), node.data.name().to_string()),
+            GraphNode::Bus(b) if b.fd_enabled => (
+                icons::bus(),
+                format!(
+                    "{} (CAN FD {}/{})",
+                    node.data.name(),
+                    format_bitrate(b.bitrate),
+                    format_bitrate(b.data_bitrate)
+                ),
             ),
-            GraphNode::Bus(b) => format!("▬ {} ({})", node.data.name(), format_bitrate(b.bitrate)),
+            GraphNode::Bus(b) => (
+                icons::bus(),
+                format!("{} ({})", node.data.name(), format_bitrate(b.bitrate)),
+            ),
         };
-        ui.label(egui::RichText::new(title).strong());
+        ui.horizontal(|ui| {
+            ui.add(icons::icon_image(ui, icon));
+            ui.label(egui::RichText::new(title).strong());
+        });
         if let GraphNode::Ecu(e) = &node.data
             && !e.tx.is_empty()
         {
