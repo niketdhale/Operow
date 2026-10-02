@@ -2,7 +2,7 @@
 //! `egui-flow`, convertible to/from an `operow_core::Topology`.
 
 use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
-use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, Side};
+use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
 use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, Topology, TxMessage};
 
@@ -141,6 +141,30 @@ impl Graph {
     /// The selected node shown in the properties inspector, if any.
     pub fn selected(&self) -> Option<FlowId> {
         self.state.nodes.iter().find(|n| n.selected).map(|n| n.id)
+    }
+
+    /// Send a particle down every wire leaving the ECU `sender`, to show it
+    /// transmitting a frame. No-op if the ECU isn't on the canvas.
+    pub fn pulse_sender(&mut self, sender: NodeId, style: PulseStyle) {
+        let Some(node) = self
+            .state
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.data, GraphNode::Ecu(e) if e.id == sender))
+            .map(|n| n.id)
+        else {
+            return;
+        };
+        let edges: Vec<_> = self
+            .state
+            .edges
+            .iter()
+            .filter(|e| e.source == node)
+            .map(|e| e.id)
+            .collect();
+        for edge in edges {
+            self.state.pulse_edge(edge, style);
+        }
     }
 
     /// Convert the graph into a `Topology` for the simulation engine.

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use operow_core::{BusId, Timestamp, Topology};
 use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunState};
 
-use egui_flow::{Flow, FlowOptions};
+use egui_flow::{Flow, FlowOptions, PulseStyle};
 
 use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::inspector::Inspector;
@@ -187,6 +187,24 @@ impl OperowApp {
                     let msg_name = self.names.msg_name(f.sender, f.frame.id);
                     self.trace.push(f, &bus_name, &sender_name, &msg_name);
                     self.sim_time = f.time;
+                }
+                // One particle per sending ECU per batch: shows live traffic on
+                // the wires without a dot for each of the hundreds of frames/s.
+                let mut senders: std::collections::HashMap<operow_core::NodeId, bool> =
+                    std::collections::HashMap::new();
+                for f in &frames {
+                    *senders.entry(f.sender).or_default() |= f.frame.fd;
+                }
+                for (sender, fd) in senders {
+                    let color = self.theme.bus_color(if fd { 2 } else { 0 });
+                    self.graph.pulse_sender(
+                        sender,
+                        PulseStyle {
+                            color: Some(color),
+                            radius: 4.0,
+                            duration: 0.6,
+                        },
+                    );
                 }
             }
             EngineEvent::Stats { time, buses } => {
