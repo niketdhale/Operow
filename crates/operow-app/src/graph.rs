@@ -4,7 +4,7 @@
 use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
 use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
-use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, Topology, TxMessage};
+use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage};
 
 use crate::icons;
 use crate::theme::AppTheme;
@@ -104,6 +104,16 @@ impl Graph {
                 script: None,
             }),
         )
+    }
+
+    /// Add a gateway node (an ECU-like node with an empty route table).
+    pub fn add_gateway(&mut self, pos: Pos2) -> FlowId {
+        let name = format!("Gateway {}", self.next_node_id);
+        let id = self.add_ecu(pos, &name);
+        if let Some(GraphNode::Ecu(e)) = self.node_mut(id) {
+            e.kind = NodeKind::Gateway { routes: vec![] };
+        }
+        id
     }
 
     pub fn add_bus(&mut self, pos: Pos2) -> FlowId {
@@ -256,6 +266,9 @@ pub struct GraphViewer {
 impl FlowViewer<GraphNode, ()> for GraphViewer {
     fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
         let (icon, title) = match &node.data {
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
+                (icons::gateway(), node.data.name().to_string())
+            }
             GraphNode::Ecu(_) => (icons::ecu(), node.data.name().to_string()),
             GraphNode::Bus(b) if b.fd_enabled => (
                 icons::bus(),
@@ -274,15 +287,16 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
         ui.horizontal(|ui| {
             ui.add(icons::icon_image(ui, icon));
             ui.label(egui::RichText::new(title).strong());
+            if let GraphNode::Ecu(e) = &node.data
+                && e.script.is_some()
+            {
+                ui.add(icons::icon_image(ui, icons::script()));
+            }
         });
         if let GraphNode::Ecu(e) = &node.data
-            && !e.tx.is_empty()
+            && let Some(sub) = subtitle(e)
         {
-            ui.label(
-                egui::RichText::new(format!("{} msg(s)", e.tx.len()))
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(sub).small().weak());
         }
     }
 
@@ -294,10 +308,7 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
     }
 
     fn node_frame(&self, ui: &egui::Ui, node: &Node<GraphNode>) -> Frame {
-        let accent = match node.data {
-            GraphNode::Ecu(_) => self.theme.bus_color(1),
-            GraphNode::Bus(_) => self.theme.bus_color(0),
-        };
+        let accent = self.accent(&node.data);
         Frame::new()
             .fill(ui.visuals().window_fill)
             .stroke(Stroke::new(1.5_f32, accent))
@@ -306,11 +317,32 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
     }
 
     fn minimap_color(&self, node: &Node<GraphNode>) -> Option<egui::Color32> {
-        Some(match node.data {
+        Some(self.accent(&node.data))
+    }
+}
+
+impl GraphViewer {
+    fn accent(&self, data: &GraphNode) -> egui::Color32 {
+        match data {
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
+                self.theme.gateway_color()
+            }
             GraphNode::Ecu(_) => self.theme.bus_color(1),
             GraphNode::Bus(_) => self.theme.bus_color(0),
-        })
+        }
     }
+}
+
+/// Node subtitle, e.g. `3 route(s) · 2 msg(s)`; `None` when there is nothing to show.
+pub fn subtitle(e: &EcuConfig) -> Option<String> {
+    let mut parts = Vec::new();
+    if let NodeKind::Gateway { routes } = &e.kind {
+        parts.push(format!("{} route(s)", routes.len()));
+    }
+    if !e.tx.is_empty() {
+        parts.push(format!("{} msg(s)", e.tx.len()));
+    }
+    (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
 }
 
 /// Formats a bit/s value compactly, e.g. `500k`, `2M`.
@@ -321,5 +353,27 @@ pub fn format_bitrate(bps: u32) -> String {
         format!("{}k", bps / 1_000)
     } else {
         format!("{bps}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_creation_and_subtitle() {
+        let mut g = Graph::new();
+        let id = g.add_gateway(Pos2::ZERO);
+        let Some(GraphNode::Ecu(e)) = g.node(id) else {
+            panic!()
+        };
+        assert_eq!(e.name, "Gateway 1");
+        assert_eq!(subtitle(e).as_deref(), Some("0 route(s)"));
+        let mut e = e.clone();
+        e.tx.push(tx("A", 1, 10, &[]));
+        assert_eq!(subtitle(&e).as_deref(), Some("0 route(s) \u{b7} 1 msg(s)"));
+        e.kind = NodeKind::Ecu;
+        e.tx.clear();
+        assert_eq!(subtitle(&e), None);
     }
 }

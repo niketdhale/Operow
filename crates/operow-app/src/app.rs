@@ -136,7 +136,9 @@ impl OperowApp {
     fn start(&mut self) {
         let topo = self.graph.to_topology();
         if let Err(e) = topo.validate() {
-            self.last_error = Some(format!("invalid topology: {e}"));
+            let msg = format!("invalid topology: {e}");
+            self.log(format!("error: {msg}"));
+            self.last_error = Some(msg);
             return;
         }
         self.names.rebuild(&topo);
@@ -505,7 +507,7 @@ impl eframe::App for OperowApp {
 
         egui::SidePanel::left("left_panel")
             .resizable(true)
-            .default_width(320.0)
+            .default_width(660.0)
             .show(ctx, |ui| {
                 let running = self.run_state != RunState::Stopped;
                 for cmd in self.inspector.ui(ui, &mut self.graph, running) {
@@ -540,6 +542,11 @@ impl eframe::App for OperowApp {
                     ui.set_min_width(160.0);
                     if ui.button("Add ECU").clicked() {
                         let id = self.graph.add_ecu(pos, "NewEcu");
+                        self.graph.select(id);
+                        ui.close();
+                    }
+                    if ui.button("Add Gateway").clicked() {
+                        let id = self.graph.add_gateway(pos);
                         self.graph.select(id);
                         ui.close();
                     }

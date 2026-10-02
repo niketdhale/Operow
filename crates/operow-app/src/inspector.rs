@@ -2,7 +2,7 @@
 //! ECU or CAN bus.
 
 use egui_flow::NodeId as FlowId;
-use operow_core::{BusId, CanFrame, NodeId, SendType, TxMessage};
+use operow_core::{BusId, CanFrame, IdFilter, NodeId, NodeKind, RouteRule, SendType, TxMessage};
 use operow_engine::{Command, EcuCommand};
 
 use crate::graph::{Graph, GraphNode};
@@ -14,6 +14,8 @@ pub struct Inspector {
     /// can type invalid-but-in-progress hex without losing their place.
     data_buf: std::collections::HashMap<usize, String>,
     id_buf: std::collections::HashMap<usize, String>,
+    /// Route-table hex scratch buffers keyed by (route index, field).
+    route_buf: std::collections::HashMap<(usize, u8), String>,
     error: Option<String>,
     last_sel: Option<FlowId>,
     /// Live (running-only) UI state, keyed by (ECU, tx-message index).
@@ -154,6 +156,9 @@ impl Inspector {
             if icons::icon_button_enabled(ui, !running, icons::ecu(), "Add ECU").clicked() {
                 graph.add_ecu(egui::pos2(40.0, 40.0), "NewEcu");
             }
+            if icons::icon_button_enabled(ui, !running, icons::gateway(), "Add gateway").clicked() {
+                graph.add_gateway(egui::pos2(40.0, 120.0));
+            }
             if icons::icon_button_enabled(ui, !running, icons::bus(), "Add CAN bus").clicked() {
                 graph.add_bus(egui::pos2(40.0, 200.0));
             }
@@ -177,11 +182,12 @@ impl Inspector {
             self.last_sel = Some(sel);
             self.data_buf.clear();
             self.id_buf.clear();
+            self.route_buf.clear();
             self.error = None;
         }
 
         ui.add_space(4.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::both().show(ui, |ui| {
             self.node_ui(ui, graph, sel, running, &mut cmds);
         });
         cmds
@@ -196,6 +202,10 @@ impl Inspector {
         cmds: &mut Vec<Command>,
     ) {
         let linked = linked_buses(graph, sel);
+        if matches!(graph.node(sel), Some(GraphNode::Ecu(e)) if matches!(e.kind, NodeKind::Gateway { .. }))
+        {
+            ui.strong("Gateway");
+        }
         let node = graph.node_mut(sel).expect("selected node exists");
         match node {
             GraphNode::Bus(bus) => {
@@ -240,6 +250,27 @@ impl Inspector {
                         ui.label("Name:");
                         ui.text_edit_singleline(&mut ecu.name);
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Node type:");
+                        let is_gw = matches!(ecu.kind, NodeKind::Gateway { .. });
+                        egui::ComboBox::from_id_salt(("node_type", sel))
+                            .selected_text(if is_gw { "Gateway" } else { "ECU" })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(!is_gw, "ECU (drops routes)").clicked()
+                                    && is_gw
+                                {
+                                    ecu.kind = NodeKind::Ecu;
+                                    self.route_buf.clear();
+                                }
+                                if ui.selectable_label(is_gw, "Gateway").clicked() && !is_gw {
+                                    ecu.kind = NodeKind::Gateway { routes: vec![] };
+                                }
+                            });
+                    });
+                    if let NodeKind::Gateway { routes } = &mut ecu.kind {
+                        ui.separator();
+                        Self::routes_ui(ui, &mut self.route_buf, sel, routes, &linked);
+                    }
                     ui.separator();
                     ui.label("TX messages:");
 
@@ -263,7 +294,7 @@ impl Inspector {
 
                             for (i, msg) in ecu.tx.iter_mut().enumerate() {
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut msg.name).desired_width(80.0),
+                                    egui::TextEdit::singleline(&mut msg.name).desired_width(110.0),
                                 );
 
                                 let id_buf = self
@@ -383,6 +414,138 @@ impl Inspector {
 }
 
 impl Inspector {
+    fn routes_ui(
+        ui: &mut egui::Ui,
+        bufs: &mut std::collections::HashMap<(usize, u8), String>,
+        sel: FlowId,
+        routes: &mut Vec<RouteRule>,
+        linked: &[(BusId, String)],
+    ) {
+        ui.label("Routes:");
+        if linked.len() < 2 {
+            ui.label(
+                egui::RichText::new("Connect this gateway to at least two buses")
+                    .weak()
+                    .italics(),
+            );
+        }
+        let mut remove: Option<usize> = None;
+        if !routes.is_empty() {
+            egui::Grid::new(("route_grid", sel))
+                .num_columns(7)
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in [
+                        "",
+                        "From",
+                        "To",
+                        "Filter",
+                        "Remap ID (hex)",
+                        "Delay (\u{b5}s)",
+                        "",
+                    ] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for (i, r) in routes.iter_mut().enumerate() {
+                        if let Some(issue) = route_issue(r, linked) {
+                            ui.label(egui::RichText::new("\u{26a0}").color(RED))
+                                .on_hover_text(issue);
+                        } else {
+                            ui.label("");
+                        }
+                        egui::ComboBox::from_id_salt(("route_from", sel, i))
+                            .selected_text(bus_label(Some(r.from_bus), linked))
+                            .show_ui(ui, |ui| {
+                                for (id, name) in linked {
+                                    ui.selectable_value(&mut r.from_bus, *id, name);
+                                }
+                            });
+                        let to_text = if r.to_buses.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            r.to_buses
+                                .iter()
+                                .map(|b| bus_label(Some(*b), linked))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        ui.menu_button(to_text, |ui| {
+                            for (id, name) in linked.iter().filter(|(id, _)| *id != r.from_bus) {
+                                let mut on = r.to_buses.contains(id);
+                                if ui.checkbox(&mut on, name).changed() {
+                                    if on {
+                                        r.to_buses.push(*id);
+                                    } else {
+                                        r.to_buses.retain(|b| b != id);
+                                    }
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let cur = FilterKind::of(r.filter);
+                            egui::ComboBox::from_id_salt(("route_filter", sel, i))
+                                .width(70.0)
+                                .selected_text(cur.label())
+                                .show_ui(ui, |ui| {
+                                    for k in FilterKind::ALL {
+                                        if ui.selectable_label(cur == k, k.label()).clicked()
+                                            && cur != k
+                                        {
+                                            r.filter = k.to_filter(r.filter);
+                                            bufs.retain(|(row, f), _| *row != i || *f == 10);
+                                        }
+                                    }
+                                });
+                            match &mut r.filter {
+                                IdFilter::Any => {}
+                                IdFilter::Exact { id, extended } => {
+                                    hex_edit(ui, bufs, (i, 0), id, 52.0);
+                                    ui.checkbox(extended, "Ext");
+                                }
+                                IdFilter::Range { lo, hi } => {
+                                    hex_edit(ui, bufs, (i, 0), lo, 52.0);
+                                    ui.label("..");
+                                    hex_edit(ui, bufs, (i, 1), hi, 52.0);
+                                }
+                                IdFilter::Mask { id, mask } => {
+                                    hex_edit(ui, bufs, (i, 0), id, 52.0);
+                                    ui.label("&");
+                                    hex_edit(ui, bufs, (i, 1), mask, 52.0);
+                                }
+                            }
+                        });
+                        let buf = bufs.entry((i, 10)).or_insert_with(|| {
+                            r.remap_id.map(|v| format!("{v:X}")).unwrap_or_default()
+                        });
+                        let parsed = parse_optional_hex(buf);
+                        let mut te = egui::TextEdit::singleline(buf).desired_width(52.0);
+                        if parsed.is_none() {
+                            te = te.text_color(RED);
+                        }
+                        ui.add(te);
+                        if let Some(v) = parsed {
+                            r.remap_id = v;
+                        }
+                        ui.add(egui::DragValue::new(&mut r.delay_us).range(0..=10_000_000));
+                        if icons::icon_button(ui, icons::clear(), "Remove route").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+        if ui.button("+ Add route").clicked()
+            && let Some(r) = default_route(linked)
+        {
+            routes.push(r);
+        }
+        if let Some(i) = remove {
+            routes.remove(i);
+            bufs.clear();
+        }
+    }
+
     fn edit_behavior_ui(
         ui: &mut egui::Ui,
         sel: FlowId,
@@ -508,6 +671,134 @@ impl Inspector {
     }
 }
 
+const RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
+
+/// Filter discriminant without its parameters, for the combo box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterKind {
+    Any,
+    Exact,
+    Range,
+    Mask,
+}
+
+impl FilterKind {
+    pub const ALL: [FilterKind; 4] = [
+        FilterKind::Any,
+        FilterKind::Exact,
+        FilterKind::Range,
+        FilterKind::Mask,
+    ];
+
+    pub fn of(f: IdFilter) -> Self {
+        match f {
+            IdFilter::Any => FilterKind::Any,
+            IdFilter::Exact { .. } => FilterKind::Exact,
+            IdFilter::Range { .. } => FilterKind::Range,
+            IdFilter::Mask { .. } => FilterKind::Mask,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterKind::Any => "Any",
+            FilterKind::Exact => "Exact",
+            FilterKind::Range => "Range",
+            FilterKind::Mask => "Mask",
+        }
+    }
+
+    /// Convert `current` to this kind, carrying over its first id value.
+    pub fn to_filter(self, current: IdFilter) -> IdFilter {
+        if FilterKind::of(current) == self {
+            return current;
+        }
+        let id = match current {
+            IdFilter::Any => 0,
+            IdFilter::Exact { id, .. } | IdFilter::Mask { id, .. } => id,
+            IdFilter::Range { lo, .. } => lo,
+        };
+        match self {
+            FilterKind::Any => IdFilter::Any,
+            FilterKind::Exact => IdFilter::Exact {
+                id,
+                extended: false,
+            },
+            FilterKind::Range => IdFilter::Range { lo: id, hi: id },
+            FilterKind::Mask => IdFilter::Mask { id, mask: 0x7FF },
+        }
+    }
+}
+
+/// A new route: first linked bus to all other linked buses, any id.
+pub fn default_route(linked: &[(BusId, String)]) -> Option<RouteRule> {
+    let (from, _) = linked.first()?;
+    Some(RouteRule {
+        from_bus: *from,
+        to_buses: linked.iter().skip(1).map(|(b, _)| *b).collect(),
+        filter: IdFilter::Any,
+        remap_id: None,
+        delay_us: 0,
+    })
+}
+
+/// Per-row problem with a route, mirroring `Topology::validate`.
+pub fn route_issue(r: &RouteRule, linked: &[(BusId, String)]) -> Option<String> {
+    let is_linked = |b: &BusId| linked.iter().any(|(id, _)| id == b);
+    if !is_linked(&r.from_bus) {
+        return Some("From bus is not linked to this gateway".into());
+    }
+    if r.to_buses.is_empty() {
+        return Some("No destination buses selected".into());
+    }
+    if r.to_buses.iter().any(|b| !is_linked(b)) {
+        return Some("A destination bus is not linked to this gateway".into());
+    }
+    if r.to_buses.contains(&r.from_bus) {
+        return Some("From bus is also a destination".into());
+    }
+    None
+}
+
+fn parse_hex_u32(s: &str) -> Option<u32> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u32::from_str_radix(s, 16).ok()
+}
+
+/// `Some(None)` for empty input, `Some(Some(v))` for a valid hex value,
+/// `None` when invalid.
+pub fn parse_optional_hex(s: &str) -> Option<Option<u32>> {
+    if s.trim().is_empty() {
+        Some(None)
+    } else {
+        parse_hex_u32(s).map(Some)
+    }
+}
+
+/// Hex text field bound to `value`; invalid text is shown red and not applied.
+fn hex_edit(
+    ui: &mut egui::Ui,
+    bufs: &mut std::collections::HashMap<(usize, u8), String>,
+    key: (usize, u8),
+    value: &mut u32,
+    width: f32,
+) {
+    let buf = bufs.entry(key).or_insert_with(|| format!("{:X}", *value));
+    let parsed = parse_hex_u32(buf);
+    let mut te = egui::TextEdit::singleline(buf).desired_width(width);
+    if parsed.is_none() {
+        te = te.text_color(RED);
+    }
+    ui.add(te);
+    if let Some(v) = parsed {
+        *value = v;
+    }
+}
+
 fn hex_bytes(data: &[u8]) -> String {
     data.iter()
         .map(|b| format!("{b:02X}"))
@@ -592,6 +883,66 @@ mod tests {
             .unwrap()
             .id;
         assert_eq!(linked_buses(&g, ecu).len(), 1);
+    }
+
+    fn linked2() -> Vec<(BusId, String)> {
+        vec![(BusId(1), "A".into()), (BusId(2), "B".into())]
+    }
+
+    #[test]
+    fn filter_kind_conversions() {
+        for k in FilterKind::ALL {
+            assert_eq!(FilterKind::of(k.to_filter(IdFilter::Any)), k);
+        }
+        let f = FilterKind::Range.to_filter(IdFilter::Exact {
+            id: 0x123,
+            extended: true,
+        });
+        assert_eq!(
+            f,
+            IdFilter::Range {
+                lo: 0x123,
+                hi: 0x123
+            }
+        );
+        let ex = IdFilter::Exact {
+            id: 5,
+            extended: true,
+        };
+        assert_eq!(FilterKind::Exact.to_filter(ex), ex);
+    }
+
+    #[test]
+    fn default_route_and_issues() {
+        assert!(default_route(&[]).is_none());
+        let r = default_route(&linked2()).unwrap();
+        assert_eq!(r.from_bus, BusId(1));
+        assert_eq!(r.to_buses, vec![BusId(2)]);
+        assert_eq!(route_issue(&r, &linked2()), None);
+
+        let mut bad = r.clone();
+        bad.to_buses.clear();
+        assert!(route_issue(&bad, &linked2()).is_some());
+        bad.to_buses = vec![BusId(1)];
+        assert!(route_issue(&bad, &linked2()).unwrap().contains("also"));
+        bad.from_bus = BusId(9);
+        assert!(route_issue(&bad, &linked2()).unwrap().contains("From"));
+        bad.from_bus = BusId(1);
+        bad.to_buses = vec![BusId(7)];
+        assert!(
+            route_issue(&bad, &linked2())
+                .unwrap()
+                .contains("destination")
+        );
+    }
+
+    #[test]
+    fn optional_hex() {
+        assert_eq!(parse_optional_hex(""), Some(None));
+        assert_eq!(parse_optional_hex("  "), Some(None));
+        assert_eq!(parse_optional_hex("1F"), Some(Some(0x1F)));
+        assert_eq!(parse_optional_hex("0x200"), Some(Some(0x200)));
+        assert_eq!(parse_optional_hex("xyz"), None);
     }
 
     #[test]
