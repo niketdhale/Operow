@@ -63,6 +63,7 @@ fn topo_with_two_senders() -> Topology {
                 bus: BusId(1),
             },
         ],
+        databases: vec![],
     }
 }
 
@@ -118,6 +119,7 @@ fn periodic_message_produces_expected_frame_count() {
             node: NodeId(1),
             bus: BusId(1),
         }],
+        databases: vec![],
     };
 
     let mut sim = Simulation::new(&topo).unwrap();
@@ -190,6 +192,7 @@ fn sender_does_not_receive_its_own_frame() {
                 bus: BusId(1),
             },
         ],
+        databases: vec![],
     };
 
     let sender_count = Arc::new(AtomicU32::new(0));
@@ -276,6 +279,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             node: NodeId(1),
             bus: BusId(1),
         }],
+        databases: vec![],
     }
 }
 
@@ -373,6 +377,7 @@ fn gateway_topo(routes: Vec<RouteRule>) -> Topology {
         ],
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(2, 2), link(3, 1), link(3, 2)],
+        databases: vec![],
     }
 }
 
@@ -389,6 +394,7 @@ fn send_on_only_hits_chosen_bus() {
         nodes: vec![node(1, vec![periodic(0x100, 1000, Some(2))], NodeKind::Ecu)],
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2)],
+        databases: vec![],
     };
     let out = run_ms(&topo, 5);
     assert_eq!(out.len(), 1);
@@ -412,6 +418,7 @@ fn send_fans_out_with_shared_uid() {
         nodes: vec![node(1, vec![periodic(0x100, 1000, None)], NodeKind::Ecu)],
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2)],
+        databases: vec![],
     };
     let out = run_ms(&topo, 5);
     assert_eq!(out.len(), 2);
@@ -502,6 +509,7 @@ fn gateways_forwarding_to_each_other_stop_at_max_hops() {
         ],
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(3, 1), link(3, 2), link(4, 1), link(4, 2)],
+        databases: vec![],
     };
     let mut sim = Simulation::new(&topo).unwrap();
     let mut out = Vec::new();
@@ -525,6 +533,7 @@ fn send_type_sim(send_type: SendType, enabled: bool) -> Simulation {
         nodes: vec![node(1, vec![msg], NodeKind::Ecu)],
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
+        databases: vec![],
     };
     Simulation::new(&topo).unwrap()
 }
@@ -665,6 +674,7 @@ fn set_payload_keeps_id_and_ignores_extra_bytes() {
         nodes: vec![node(1, vec![msg], NodeKind::Ecu)],
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
+        databases: vec![],
     };
     let mut sim = Simulation::new(&topo).unwrap();
     // Shorter keeps the rest; longer is truncated to the frame length.
@@ -699,6 +709,7 @@ fn gateway_delegates_commands_to_own_tx() {
         nodes: vec![node(1, vec![msg], NodeKind::Gateway { routes: Vec::new() })],
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
+        databases: vec![],
     };
     let mut sim = Simulation::new(&topo).unwrap();
     assert_eq!(run_to(&mut sim, 50).len(), 0);
@@ -719,6 +730,7 @@ fn script_topo(script: &str, tx: Vec<TxMessage>) -> Topology {
         ],
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2), link(2, 1)],
+        databases: vec![],
     }
 }
 

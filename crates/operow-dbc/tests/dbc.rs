@@ -1,5 +1,5 @@
-use operow_core::{BusId, CanFrame, SendType};
-use operow_dbc::{ByteOrder, Database, DbcError, Mux, SignalDef, ValueType};
+use operow_core::{BusId, CanFrame, EcuConfig, Link, NodeId, SendType, Topology};
+use operow_dbc::{BusTarget, ByteOrder, Database, DbcError, MergeError, Mux, SignalDef, ValueType};
 
 const SAMPLE: &str = include_str!("fixtures/sample.dbc");
 
@@ -260,4 +260,115 @@ fn send_type_mapping() {
         assert_eq!(tx.send_type, want, "{name:?} {cycle:?}");
         assert!(tx.enabled);
     }
+}
+
+fn existing_ecu(id: u32, name: &str) -> EcuConfig {
+    EcuConfig {
+        id: NodeId(id),
+        name: name.into(),
+        tx: vec![],
+        kind: Default::default(),
+        pos: (60.0, 60.0),
+        script: None,
+    }
+}
+
+fn base_topology() -> Topology {
+    let mut t = Database::default().to_topology(BusId(1), "Old", 250_000);
+    t.nodes.push(existing_ecu(7, "Engine"));
+    t.links.push(Link {
+        node: NodeId(7),
+        bus: BusId(1),
+    });
+    t
+}
+
+#[test]
+fn merge_new_bus_allocates_fresh_ids_and_links() {
+    let db = Database::parse(SAMPLE).unwrap();
+    let base = base_topology();
+    let target = BusTarget::New {
+        name: "PT".into(),
+        bitrate: 500_000,
+    };
+    let (topo, bus) = db.merge_into(&base, target, true).unwrap();
+    assert_eq!(bus, BusId(2));
+    assert_eq!(topo.buses.len(), 2);
+    // Engine reused (id 7); Gateway and Dash get 8 and 9.
+    let ids: Vec<_> = topo
+        .nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.id.0))
+        .collect();
+    assert_eq!(ids, [("Engine", 7), ("Gateway", 8), ("Dash", 9)]);
+    for n in &topo.nodes {
+        assert!(topo.links.contains(&Link { node: n.id, bus }), "{}", n.name);
+    }
+    topo.validate().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    assert!(topo.nodes.iter().all(|n| seen.insert(n.id)));
+    // New nodes are placed in distinct spots.
+    assert_ne!(topo.nodes[1].pos, topo.nodes[2].pos);
+}
+
+#[test]
+fn merge_reuses_node_by_name_without_duplicating_tx() {
+    let db = Database::parse(SAMPLE).unwrap();
+    let base = base_topology();
+    let target = BusTarget::Existing(BusId(1));
+    let (once, _) = db.merge_into(&base, target.clone(), true).unwrap();
+    let engine = once.nodes.iter().find(|n| n.name == "Engine").unwrap();
+    assert_eq!(engine.id, NodeId(7));
+    assert_eq!(engine.tx.len(), 1);
+    assert_eq!(engine.tx[0].name, "EngineData");
+    assert_eq!(engine.tx[0].bus, Some(BusId(1)));
+    // Merging again changes nothing: no duplicate nodes, tx or links.
+    let (twice, _) = db.merge_into(&once, target, true).unwrap();
+    assert_eq!(twice, once);
+    // Case-sensitive: "engine" is a different node.
+    let mut lower = base.clone();
+    lower.nodes[0].name = "engine".into();
+    let (t, _) = db
+        .merge_into(&lower, BusTarget::Existing(BusId(1)), true)
+        .unwrap();
+    assert_eq!(
+        t.nodes
+            .iter()
+            .filter(|n| n.name.eq_ignore_ascii_case("engine"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn merge_without_nodes_and_unknown_bus() {
+    let db = Database::parse(SAMPLE).unwrap();
+    let base = base_topology();
+    let (t, bus) = db
+        .merge_into(
+            &base,
+            BusTarget::New {
+                name: "X".into(),
+                bitrate: 125_000,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!((t.nodes.len(), t.links.len(), t.buses.len()), (1, 1, 2));
+    assert_eq!(bus, BusId(2));
+    assert_eq!(
+        db.merge_into(&base, BusTarget::Existing(BusId(9)), true),
+        Err(MergeError::UnknownBus(BusId(9)))
+    );
+}
+
+#[test]
+fn message_lookup_by_id_and_format() {
+    let db = Database::parse(SAMPLE).unwrap();
+    assert_eq!(db.message(256, false).unwrap().name, "EngineData");
+    assert!(db.message(256, true).is_none());
+    assert_eq!(
+        db.message(0x500, true).map(|m| m.name.as_str()),
+        Some("GatewayStatus")
+    );
 }

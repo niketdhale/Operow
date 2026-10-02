@@ -1,13 +1,14 @@
 //! The bottom trace panel: a virtualized log of bus events, either
 //! chronological (ring-buffered) or fixed-position (one row per frame key).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui_extras::{Column, TableBuilder};
 use operow_core::{BusEvent, BusId, Direction, NodeId};
 
+use crate::dbcs::{self, DbcStore};
 use crate::icons;
 
 const MAX_ROWS: usize = 100_000;
@@ -16,6 +17,8 @@ const HIGHLIGHT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct TraceRow {
+    /// Monotonic push counter; identifies a row for signal expansion.
+    pub seq: u64,
     pub time_s: f64,
     pub bus_name: String,
     pub sender_name: String,
@@ -111,7 +114,7 @@ impl TraceFilter {
 
 /// Identity of a row in fixed-position mode. Field order gives the display
 /// order: bus, then ID.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FixedKey {
     bus_name: String,
     id: u32,
@@ -160,6 +163,13 @@ pub struct Trace {
     pub filter: TraceFilter,
     pub autoscroll: bool,
     pub mode: TraceMode,
+    /// Chronological rows (by `seq`) whose signals are shown.
+    expanded: HashSet<u64>,
+    /// Fixed-mode keys whose signals are shown.
+    expanded_fixed: HashSet<FixedKey>,
+    /// Show the signals of every fixed-mode row.
+    pub expand_all: bool,
+    next_seq: u64,
 }
 
 impl Default for Trace {
@@ -172,6 +182,10 @@ impl Default for Trace {
             filter: TraceFilter::default(),
             autoscroll: true,
             mode: TraceMode::default(),
+            expanded: HashSet::new(),
+            expanded_fixed: HashSet::new(),
+            expand_all: false,
+            next_seq: 0,
         }
     }
 }
@@ -181,6 +195,7 @@ impl Trace {
         self.rows.clear();
         self.fixed.clear();
         self.buses.clear();
+        self.expanded.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -222,7 +237,10 @@ impl Trace {
         if !self.buses.contains(bus_name) {
             self.buses.insert(bus_name.to_string());
         }
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let row = TraceRow {
+            seq,
             time_s: ev.time.as_secs_f64(),
             bus_name: bus_name.to_string(),
             sender_name: sender_name.to_string(),
@@ -269,13 +287,15 @@ impl Trace {
             }
         }
 
-        if self.rows.len() >= MAX_ROWS {
-            self.rows.pop_front();
+        if self.rows.len() >= MAX_ROWS
+            && let Some(old) = self.rows.pop_front()
+        {
+            self.expanded.remove(&old.seq);
         }
         self.rows.push_back(row);
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, names: &NameLookup) {
         let rx_color = if ui.visuals().dark_mode {
             egui::Color32::from_rgb(0x7f, 0xb4, 0xff)
         } else {
@@ -312,6 +332,11 @@ impl Trace {
                 !fixed_mode,
                 egui::Checkbox::new(&mut self.autoscroll, "Autoscroll"),
             );
+            ui.add_enabled(
+                fixed_mode,
+                egui::Checkbox::new(&mut self.expand_all, "Expand signals"),
+            )
+            .on_hover_text("Fixed mode: show decoded DBC signals for every row");
             ui.separator();
             ui.add(icons::icon_image(ui, icons::filter()));
             ui.text_edit_singleline(&mut self.filter.text)
@@ -348,11 +373,12 @@ impl Trace {
         let filter = &self.filter;
         let views: Vec<RowView> = if fixed_mode {
             self.fixed
-                .values()
-                .filter(|f| filter.matches(&f.row))
-                .map(|f| RowView {
+                .iter()
+                .filter(|(_, f)| filter.matches(&f.row))
+                .map(|(k, f)| RowView {
                     row: &f.row,
                     fixed: Some(f),
+                    key: Some(k),
                 })
                 .collect()
         } else {
@@ -362,6 +388,7 @@ impl Trace {
                 .map(|r| RowView {
                     row: r,
                     fixed: None,
+                    key: None,
                 })
                 .collect()
         };
@@ -372,6 +399,31 @@ impl Trace {
         {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
+
+        // Flat list of table rows: frames plus, for expanded ones, one row
+        // per decoded signal. Decoding happens only for expanded rows.
+        let (expanded, expanded_fixed, expand_all) =
+            (&self.expanded, &self.expanded_fixed, self.expand_all);
+        let mut display: Vec<DisplayRow> = Vec::with_capacity(views.len());
+        for (i, v) in views.iter().enumerate() {
+            let msg_def = message_def(names, v.row);
+            display.push(DisplayRow::Frame {
+                view: i,
+                decodable: msg_def.is_some(),
+            });
+            let open = match v.key {
+                Some(k) => expand_all || expanded_fixed.contains(k),
+                None => expanded.contains(&v.row.seq),
+            };
+            if let (true, Some(def)) = (open, msg_def) {
+                let frame = row_frame(v.row);
+                for line in dbcs::decode_lines(def, &frame) {
+                    display.push(DisplayRow::Signal(line));
+                }
+            }
+        }
+        let mut toggled: Option<(Option<FixedKey>, u64)> = None;
+        let n_cols = if fixed_mode { 13 } else { 11 };
 
         let mut table = TableBuilder::new(ui)
             .id_salt(("trace_table", fixed_mode))
@@ -397,7 +449,7 @@ impl Trace {
             .column(Column::exact(160.0)); // sender
 
         if self.autoscroll && !fixed_mode {
-            table = table.scroll_to_row(views.len(), Some(egui::Align::BOTTOM));
+            table = table.scroll_to_row(display.len(), Some(egui::Align::BOTTOM));
         }
 
         table
@@ -414,8 +466,25 @@ impl Trace {
                 }
             })
             .body(|body| {
-                body.rows(text_height, views.len(), |mut row| {
-                    let v = &views[row.index()];
+                body.rows(text_height, display.len(), |mut row| {
+                    let (vi, decodable) = match &display[row.index()] {
+                        DisplayRow::Frame { view, decodable } => (*view, *decodable),
+                        DisplayRow::Signal(line) => {
+                            for c in 0..n_cols {
+                                row.col(|ui| {
+                                    if c == 3 {
+                                        ui.add_space(22.0);
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(line).monospace())
+                                                .truncate(),
+                                        );
+                                    }
+                                });
+                            }
+                            return;
+                        }
+                    };
+                    let v = &views[vi];
                     let r = v.row;
                     let tint = (r.dir == Direction::Rx).then_some(rx_color);
                     let cell = |ui: &mut egui::Ui| {
@@ -437,6 +506,38 @@ impl Trace {
                     });
                     row.col(|ui| {
                         cell(ui);
+                        if decodable {
+                            let open = match v.key {
+                                Some(k) => expand_all || expanded_fixed.contains(k),
+                                None => expanded.contains(&r.seq),
+                            };
+                            let (rect, resp) = ui
+                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                            let c = rect.center();
+                            let pts = if open {
+                                vec![
+                                    c + egui::vec2(-4.0, -2.0),
+                                    c + egui::vec2(4.0, -2.0),
+                                    c + egui::vec2(0.0, 3.0),
+                                ]
+                            } else {
+                                vec![
+                                    c + egui::vec2(-2.0, -4.0),
+                                    c + egui::vec2(-2.0, 4.0),
+                                    c + egui::vec2(3.0, 0.0),
+                                ]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                pts,
+                                ui.visuals().text_color(),
+                                egui::Stroke::NONE,
+                            ));
+                            if resp.on_hover_text("Show decoded signals").clicked() {
+                                toggled = Some((v.key.cloned(), r.seq));
+                            }
+                        } else {
+                            ui.add_space(14.0 + ui.spacing().item_spacing.x);
+                        }
                         ui.label(&r.msg_name);
                     });
                     row.col(|ui| {
@@ -490,6 +591,50 @@ impl Trace {
                     });
                 });
             });
+
+        if let Some((key, seq)) = toggled {
+            match key {
+                Some(k) => {
+                    if self.expand_all {
+                        // Leaving "expand all": keep the other rows open.
+                        self.expand_all = false;
+                        self.expanded_fixed.extend(self.fixed.keys().cloned());
+                    }
+                    if !self.expanded_fixed.insert(k.clone()) {
+                        self.expanded_fixed.remove(&k);
+                    }
+                }
+                None => {
+                    if !self.expanded.insert(seq) {
+                        self.expanded.remove(&seq);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One line of the table: a frame, or a decoded signal under it.
+enum DisplayRow {
+    Frame { view: usize, decodable: bool },
+    Signal(String),
+}
+
+/// DBC definition of the message in `row`, via the DBC attached to its bus.
+fn message_def<'a>(names: &'a NameLookup, row: &TraceRow) -> Option<&'a operow_dbc::MessageDef> {
+    names
+        .dbc_for_bus_name(&row.bus_name)?
+        .message(row.id, row.extended)
+}
+
+fn row_frame(r: &TraceRow) -> operow_core::CanFrame {
+    operow_core::CanFrame {
+        id: r.id,
+        extended: r.extended,
+        fd: r.fd,
+        brs: r.brs,
+        dlc: r.dlc,
+        data: r.data,
     }
 }
 
@@ -497,6 +642,7 @@ impl Trace {
 struct RowView<'a> {
     row: &'a TraceRow,
     fixed: Option<&'a FixedRow>,
+    key: Option<&'a FixedKey>,
 }
 
 /// Data bytes, truncated to 8 with a hover for the full payload. Bytes that
@@ -561,6 +707,8 @@ pub struct NameLookup {
     pub node_names: HashMap<NodeId, String>,
     pub bus_names: HashMap<BusId, String>,
     pub msg_names: HashMap<(NodeId, u32), String>,
+    /// DBC databases per bus; their message names take precedence.
+    pub dbcs: DbcStore,
 }
 
 impl NameLookup {
@@ -593,7 +741,23 @@ impl NameLookup {
             .unwrap_or_else(|| format!("Bus{}", id.0))
     }
 
-    pub fn msg_name(&self, sender: NodeId, id: u32) -> String {
+    /// The database attached to the bus called `name`.
+    pub fn dbc_for_bus_name(&self, name: &str) -> Option<&operow_dbc::Database> {
+        let (bus, _) = self.bus_names.iter().find(|(_, n)| n.as_str() == name)?;
+        self.dbcs.by_bus.get(bus).map(|d| &**d)
+    }
+
+    /// Message name: from the bus's DBC when it knows the id, else the
+    /// sending node's own tx message name, else empty.
+    pub fn msg_name(&self, bus: BusId, sender: NodeId, id: u32, extended: bool) -> String {
+        if let Some(m) = self
+            .dbcs
+            .by_bus
+            .get(&bus)
+            .and_then(|d| d.message(id, extended))
+        {
+            return m.name.clone();
+        }
         self.msg_names
             .get(&(sender, id))
             .cloned()

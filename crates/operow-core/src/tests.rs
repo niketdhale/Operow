@@ -1,5 +1,5 @@
 use crate::{
-    BusId, CanBusConfig, CanFrame, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
+    BusId, CanBusConfig, CanFrame, DbcRef, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
     SendType, Topology, TopologyError, TxMessage,
 };
 
@@ -32,6 +32,7 @@ fn topology_json_roundtrip() {
             node: NodeId(1),
             bus: BusId(1),
         }],
+        databases: vec![],
     };
 
     let json = topo.to_json();
@@ -239,6 +240,7 @@ fn validate_rejects_bad_bus_references() {
             node: NodeId(1),
             bus: BusId(1),
         }],
+        databases: vec![],
     };
     assert_eq!(
         topo.validate(),
@@ -319,4 +321,25 @@ fn ecu_without_script_field_loads() {
     let json = r#"{"id":1,"name":"A","tx":[]}"#;
     let ecu: EcuConfig = serde_json::from_str(json).unwrap();
     assert_eq!(ecu.script, None);
+}
+
+#[test]
+fn databases_default_empty_and_validated() {
+    let mut topo =
+        Topology::from_json(r#"{"buses":[{"id":1,"name":"A","bitrate":500000}]}"#).unwrap();
+    assert!(topo.databases.is_empty());
+    topo.databases.push(DbcRef {
+        path: "a.dbc".into(),
+        bus: BusId(1),
+    });
+    assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
+    assert_eq!(topo.validate(), Ok(()));
+    topo.databases[0].bus = BusId(5);
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::DatabaseUnknownBus {
+            path: "a.dbc".into(),
+            bus: BusId(5)
+        })
+    );
 }

@@ -4,7 +4,9 @@
 use egui::{CornerRadius, Frame, Margin, Pos2, Stroke};
 use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyle, Side};
 
-use operow_core::{BusId, CanBusConfig, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage};
+use operow_core::{
+    BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
+};
 
 use crate::icons;
 use crate::theme::AppTheme;
@@ -32,6 +34,9 @@ pub struct Graph {
     pub state: FlowState<GraphNode, ()>,
     next_node_id: u32,
     next_bus_id: u32,
+    /// DBC files referenced by the project; round-tripped through the
+    /// topology but not shown on the canvas.
+    pub databases: Vec<DbcRef>,
 }
 
 impl Graph {
@@ -40,6 +45,7 @@ impl Graph {
             state: FlowState::new(),
             next_node_id: 1,
             next_bus_id: 1,
+            databases: Vec::new(),
         }
     }
 
@@ -142,6 +148,10 @@ impl Graph {
 
     /// Remove a node and the wires attached to it.
     pub fn remove(&mut self, id: FlowId) {
+        if let Some(GraphNode::Bus(b)) = self.node(id) {
+            let bus = b.id;
+            self.databases.retain(|d| d.bus != bus);
+        }
         self.state.remove_node(id);
     }
 
@@ -214,12 +224,30 @@ impl Graph {
             nodes,
             buses,
             links,
+            databases: self.databases.clone(),
         }
     }
 
     /// Rebuild the graph from a loaded `Topology`, keeping saved positions.
     pub fn from_topology(topo: &Topology) -> Self {
+        Self::from_topology_keeping(topo, &Graph::new())
+    }
+
+    /// Like [`Graph::from_topology`], but buses that also exist in `old`
+    /// stay where the user put them (the topology does not store bus
+    /// positions).
+    pub fn from_topology_keeping(topo: &Topology, old: &Graph) -> Self {
+        let old_pos: std::collections::HashMap<BusId, Pos2> = old
+            .state
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                GraphNode::Bus(b) => Some((b.id, n.position)),
+                _ => None,
+            })
+            .collect();
         let mut g = Graph::new();
+        g.databases = topo.databases.clone();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 
@@ -230,7 +258,10 @@ impl Graph {
             ecu_map.insert(ecu.id, fid);
         }
         for (i, bus) in topo.buses.iter().enumerate() {
-            let pos = Pos2::new(160.0, 260.0 + 160.0 * i as f32);
+            let pos = old_pos
+                .get(&bus.id)
+                .copied()
+                .unwrap_or_else(|| Pos2::new(160.0, 260.0 + 160.0 * i as f32));
             let fid = g.state.add_node(pos, GraphNode::Bus(bus.clone()));
             g.next_bus_id = g.next_bus_id.max(bus.id.0 + 1);
             bus_map.insert(bus.id, fid);
@@ -359,6 +390,28 @@ pub fn format_bitrate(bps: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn databases_round_trip_and_bus_positions_kept() {
+        let mut g = Graph::new();
+        let bus = g.add_bus(Pos2::new(500.0, 400.0));
+        g.databases.push(DbcRef {
+            path: "a.dbc".into(),
+            bus: BusId(1),
+        });
+        let _ = bus;
+        let topo = g.to_topology();
+        assert_eq!(topo.databases, g.databases);
+        let g2 = Graph::from_topology_keeping(&topo, &g);
+        assert_eq!(g2.databases, g.databases);
+        let pos = g2.state.nodes[0].position;
+        assert_eq!(pos, Pos2::new(500.0, 400.0));
+        // Removing the bus drops its database reference.
+        let mut g3 = g2;
+        let id = g3.state.nodes[0].id;
+        g3.remove(id);
+        assert!(g3.databases.is_empty());
+    }
 
     #[test]
     fn gateway_creation_and_subtitle() {

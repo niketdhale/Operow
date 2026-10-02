@@ -10,3 +10,4 @@ mod topology;
 
 pub use model::{ByteOrder, Database, MessageDef, Mux, SignalDef, ValueType};
 pub use parser::DbcError;
+pub use topology::{BusTarget, MergeError};

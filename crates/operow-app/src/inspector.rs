@@ -5,6 +5,7 @@ use egui_flow::NodeId as FlowId;
 use operow_core::{BusId, CanFrame, IdFilter, NodeId, NodeKind, RouteRule, SendType, TxMessage};
 use operow_engine::{Command, EcuCommand};
 
+use crate::dbcs::{self, DbcStore};
 use crate::graph::{Graph, GraphNode};
 use crate::icons;
 
@@ -145,7 +146,13 @@ pub fn msg_summary(msg: &TxMessage, linked: &[(BusId, String)]) -> String {
 
 impl Inspector {
     /// Draws the inspector; returns engine commands issued by live controls.
-    pub fn ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, running: bool) -> Vec<Command> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        graph: &mut Graph,
+        running: bool,
+        dbcs: &DbcStore,
+    ) -> Vec<Command> {
         let mut cmds = Vec::new();
         if running != self.was_running {
             self.was_running = running;
@@ -191,7 +198,7 @@ impl Inspector {
 
         ui.add_space(4.0);
         egui::ScrollArea::both().show(ui, |ui| {
-            self.node_ui(ui, graph, sel, running, &mut cmds);
+            self.node_ui(ui, graph, sel, running, dbcs, &mut cmds);
         });
         cmds
     }
@@ -202,6 +209,7 @@ impl Inspector {
         graph: &mut Graph,
         sel: FlowId,
         running: bool,
+        dbcs: &DbcStore,
         cmds: &mut Vec<Command>,
     ) {
         let linked = linked_buses(graph, sel);
@@ -402,6 +410,9 @@ impl Inspector {
                             ui.add_enabled_ui(!running, |ui| {
                                 Self::edit_behavior_ui(ui, sel, i, msg, &linked);
                             });
+                            if let Some(def) = dbcs.message_for_tx(msg, &linked) {
+                                Self::dbc_ui(ui, sel, i, def);
+                            }
                             if running {
                                 self.live_ui(ui, ecu_id, i, msg, cmds);
                             }
@@ -623,6 +634,40 @@ impl Inspector {
             routes.remove(i);
             bufs.clear();
         }
+    }
+
+    /// Read-only DBC view of a transmit message: its name and signal table.
+    fn dbc_ui(ui: &mut egui::Ui, sel: FlowId, i: usize, def: &operow_dbc::MessageDef) {
+        ui.horizontal(|ui| {
+            ui.label("DBC message:");
+            ui.strong(&def.name);
+        });
+        egui::CollapsingHeader::new(format!("Signals ({})", def.signals.len()))
+            .id_salt(("dbc_signals", sel, i))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(("dbc_grid", sel, i))
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 2.0])
+                    .show(ui, |ui| {
+                        for h in ["Signal", "Bits", "Factor / offset", "Unit"] {
+                            ui.label(egui::RichText::new(h).small().weak());
+                        }
+                        ui.end_row();
+                        for s in &def.signals {
+                            ui.label(&s.name);
+                            ui.monospace(dbcs::bit_layout(s));
+                            ui.monospace(format!(
+                                "{} / {}",
+                                dbcs::format_value(s.factor, 0.5),
+                                dbcs::format_value(s.offset, 0.5)
+                            ));
+                            ui.label(&s.unit);
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     fn edit_behavior_ui(

@@ -136,6 +136,15 @@ pub struct Link {
     pub bus: BusId,
 }
 
+/// A DBC database file referenced by a project (CANoe-style: by path, not
+/// embedded). Relative paths are resolved against the project file's folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbcRef {
+    pub path: String,
+    /// The bus this database describes.
+    pub bus: BusId,
+}
+
 /// The full static network description of a simulation.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Topology {
@@ -145,6 +154,9 @@ pub struct Topology {
     pub buses: Vec<CanBusConfig>,
     #[serde(default)]
     pub links: Vec<Link>,
+    /// DBC files attached to buses; used for trace decoding only.
+    #[serde(default)]
+    pub databases: Vec<DbcRef>,
 }
 
 /// Errors returned by [`Topology::validate`].
@@ -154,6 +166,8 @@ pub enum TopologyError {
     UnknownNode(NodeId),
     #[error("link references unknown bus {0:?}")]
     UnknownBus(BusId),
+    #[error("database {path:?} references unknown bus {bus:?}")]
+    DatabaseUnknownBus { path: String, bus: BusId },
     #[error("bus {0:?} has a non-positive bitrate")]
     InvalidBitrate(BusId),
     #[error("bus {0:?} has FD enabled but a non-positive data bitrate")]
@@ -202,6 +216,14 @@ impl Topology {
             }
             if !self.buses.iter().any(|b| b.id == link.bus) {
                 return Err(TopologyError::UnknownBus(link.bus));
+            }
+        }
+        for db in &self.databases {
+            if !self.buses.iter().any(|b| b.id == db.bus) {
+                return Err(TopologyError::DatabaseUnknownBus {
+                    path: db.path.clone(),
+                    bus: db.bus,
+                });
             }
         }
         for node in &self.nodes {

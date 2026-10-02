@@ -2350,6 +2350,7 @@ dependencies = [
  "egui_extras",
  "image",
  "operow-core",
+ "operow-dbc",
  "operow-engine",
  "rfd",
  "serde_json",
