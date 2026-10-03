@@ -6,6 +6,7 @@ use egui_flow::{FlowState, FlowViewer, Handle, Node, NodeId as FlowId, PulseStyl
 
 use operow_core::{
     BusEvent, BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
+    UserSignalDef,
 };
 
 use crate::icons;
@@ -37,6 +38,8 @@ pub struct Graph {
     /// DBC files referenced by the project; round-tripped through the
     /// topology but not shown on the canvas.
     pub databases: Vec<DbcRef>,
+    /// User-defined signals; round-tripped through the topology.
+    pub user_signals: Vec<UserSignalDef>,
 }
 
 impl Graph {
@@ -46,6 +49,7 @@ impl Graph {
             next_node_id: 1,
             next_bus_id: 1,
             databases: Vec::new(),
+            user_signals: Vec::new(),
         }
     }
 
@@ -213,6 +217,7 @@ impl Graph {
             buses,
             links,
             databases: self.databases.clone(),
+            user_signals: self.user_signals.clone(),
             workspace: None,
         }
     }
@@ -237,6 +242,7 @@ impl Graph {
             .collect();
         let mut g = Graph::new();
         g.databases = topo.databases.clone();
+        g.user_signals = topo.user_signals.clone();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 

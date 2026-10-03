@@ -1,6 +1,6 @@
 use crate::{
     BusId, CanBusConfig, CanFrame, DbcRef, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
-    SendType, Topology, TopologyError, TxMessage,
+    SendType, SignalByteOrder, Topology, TopologyError, TxMessage, UserSignalDef, UserSignalId,
 };
 
 #[test]
@@ -33,6 +33,7 @@ fn topology_json_roundtrip() {
             bus: BusId(1),
         }],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
 
@@ -242,6 +243,7 @@ fn validate_rejects_bad_bus_references() {
             bus: BusId(1),
         }],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     assert_eq!(
@@ -344,4 +346,26 @@ fn databases_default_empty_and_validated() {
             bus: BusId(5)
         })
     );
+}
+
+#[test]
+fn user_signals_round_trip_and_default_empty() {
+    let mut topo = Topology::from_json("{}").unwrap();
+    assert!(topo.user_signals.is_empty());
+    assert!(!topo.to_json().contains("user_signals"));
+    topo.user_signals.push(UserSignalDef {
+        id: UserSignalId(3),
+        name: "Speed".into(),
+        bus: BusId(1),
+        msg_id: 0x100,
+        extended: false,
+        start_bit: 8,
+        size: 16,
+        byte_order: SignalByteOrder::Motorola,
+        signed: true,
+        factor: 0.5,
+        offset: -10.0,
+        unit: "km/h".into(),
+    });
+    assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
 }

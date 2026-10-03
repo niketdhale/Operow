@@ -2,14 +2,27 @@
 
 use egui::{CollapsingHeader, RichText};
 use egui_flow::NodeId as FlowId;
-use operow_core::NodeKind;
+use operow_core::{NodeKind, UserSignalDef, UserSignalId};
 
 use crate::dbcs::DbcStore;
 use crate::graph::{Graph, GraphNode};
 use crate::icons;
 
-/// Draws the tree; returns the canvas node the user clicked, if any.
-pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> Option<FlowId> {
+/// What the user did in the tree this frame.
+#[derive(Default)]
+pub struct TreeOutput {
+    /// The canvas node that was clicked.
+    pub picked: Option<FlowId>,
+    /// "+ New signal..." was clicked.
+    pub new_signal: bool,
+    /// "Add to graph" was chosen for a user signal.
+    pub add_signal_to_graph: Option<UserSignalId>,
+    pub delete_signal: Option<UserSignalId>,
+}
+
+/// Draws the tree.
+pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
+    let mut out = TreeOutput::default();
     let mut picked = None;
     let selected = graph.selected();
     let topo = graph.to_topology();
@@ -126,6 +139,32 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> Option<FlowId> {
                     }
                 });
 
+            CollapsingHeader::new(RichText::new("User signals").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    if graph.user_signals.is_empty() {
+                        ui.weak("No user signals");
+                    }
+                    for u in &graph.user_signals {
+                        let resp = ui
+                            .selectable_label(false, user_signal_label(u))
+                            .on_hover_text(user_signal_tooltip(u, &topo));
+                        resp.context_menu(|ui| {
+                            if ui.button("Add to graph").clicked() {
+                                out.add_signal_to_graph = Some(u.id);
+                                ui.close();
+                            }
+                            if ui.button("Delete").clicked() {
+                                out.delete_signal = Some(u.id);
+                                ui.close();
+                            }
+                        });
+                    }
+                    if ui.button("+ New signal\u{2026}").clicked() {
+                        out.new_signal = true;
+                    }
+                });
+
             CollapsingHeader::new(RichText::new("Scripts").strong())
                 .default_open(true)
                 .show(ui, |ui| {
@@ -151,5 +190,36 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> Option<FlowId> {
                     }
                 });
         });
-    picked
+    out.picked = picked;
+    out
+}
+
+fn user_signal_label(u: &UserSignalDef) -> String {
+    if u.unit.is_empty() {
+        u.name.clone()
+    } else {
+        format!("{}  [{}]", u.name, u.unit)
+    }
+}
+
+fn user_signal_tooltip(u: &UserSignalDef, topo: &operow_core::Topology) -> String {
+    let bus = topo
+        .buses
+        .iter()
+        .find(|b| b.id == u.bus)
+        .map_or("?", |b| b.name.as_str());
+    let order = match u.byte_order {
+        operow_core::SignalByteOrder::Intel => 1,
+        operow_core::SignalByteOrder::Motorola => 0,
+    };
+    format!(
+        "{bus} 0x{:X}{}  {}|{}@{order}{}\nfactor {} offset {}",
+        u.msg_id,
+        if u.extended { "x" } else { "" },
+        u.start_bit,
+        u.size,
+        if u.signed { "-" } else { "+" },
+        u.factor,
+        u.offset
+    )
 }

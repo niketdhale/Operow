@@ -13,8 +13,11 @@ use crate::icons;
 use crate::inspector::Inspector;
 use crate::project_tree;
 use crate::settings::{self, AppSettings, WhenFull};
+use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
+use crate::signals::SignalRef;
+use crate::store::FrameStore;
 use crate::theme::AppTheme;
-use crate::trace::{NameLookup, Trace, TraceMode};
+use crate::trace::{NameLookup, Trace, TraceAction, TraceMode};
 use crate::windows::WindowViewer;
 use crate::workspace::{self, Dock, LayoutPreset, WindowId, WindowKind};
 
@@ -50,6 +53,11 @@ pub struct StartupOptions {
     pub open_settings: bool,
     /// `--layout-demo`: open extra windows (Trace 2, Graph 1, Generator 1).
     pub layout_demo: bool,
+    /// `--demo-filters`: open "Body debug", a second trace with the bus and
+    /// ID filters active, and focus it.
+    pub demo_filters: bool,
+    /// `--open-new-signal`: open the "New user signal" dialog.
+    pub open_new_signal: bool,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -72,6 +80,8 @@ pub struct OperowApp {
     layout_preset: Option<LayoutPreset>,
     /// Per-instance state of every open Trace window.
     traces: HashMap<WindowId, Trace>,
+    /// Every bus event, shared by all windows.
+    store: FrameStore,
     settings: AppSettings,
     show_settings: bool,
     show_tree: bool,
@@ -97,6 +107,7 @@ pub struct OperowApp {
     /// stored relative to its folder.
     project_path: Option<PathBuf>,
     import_dialog: Option<ImportDialog>,
+    new_signal: Option<NewSignalDialog>,
     /// Flow-space position of the last right-click on the canvas, where
     /// "Add ECU"/"Add CAN Bus" place the new node.
     menu_pos: Option<egui::Pos2>,
@@ -125,6 +136,7 @@ impl OperowApp {
             dock: workspace::default_layout(),
             layout_preset: Some(LayoutPreset::Default),
             traces: HashMap::new(),
+            store: FrameStore::new(settings.frame_buffer_size),
             settings,
             show_settings: false,
             show_tree: true,
@@ -143,6 +155,7 @@ impl OperowApp {
             last_error: None,
             project_path: None,
             import_dialog: None,
+            new_signal: None,
             menu_pos: None,
             screenshot_path,
             screenshot_start: None,
@@ -154,16 +167,16 @@ impl OperowApp {
     }
 
     /// Keep one `Trace` per open Trace window (dropping closed ones) and
-    /// apply the buffer capacity from the settings.
+    /// apply the buffer settings to the frame store.
     fn sync_instances(&mut self) {
         let open = workspace::open_windows(&self.dock);
         self.traces.retain(|id, _| open.contains(id));
         for id in open.iter().filter(|w| w.kind == WindowKind::Trace) {
             self.traces.entry(*id).or_default();
         }
-        for t in self.traces.values_mut() {
-            t.capacity = self.settings.frame_buffer_size;
-        }
+        self.store.set_capacity(self.settings.frame_buffer_size);
+        self.store
+            .set_reject_when_full(self.settings.when_full == WhenFull::StopMeasurement);
     }
 
     fn open_window(&mut self, kind: WindowKind, force_new: bool) {
@@ -176,9 +189,72 @@ impl OperowApp {
         self.layout_preset = Some(preset);
     }
 
+    /// Clear what every Trace window shows; the shared store keeps its frames.
     fn clear_traces(&mut self) {
         for t in self.traces.values_mut() {
-            t.clear();
+            t.clear(&self.store);
+        }
+    }
+
+    /// Hook for step 4: put `sig` on a graph window.
+    fn on_add_signal_to_graph(&mut self, sig: SignalRef) {
+        // TODO(step 4): create or pick a Graph window and add the signal.
+        let label = sig.label(&self.names, &self.graph.user_signals);
+        self.log(format!("add to graph: {label} (graph wiring comes next)"));
+    }
+
+    fn handle_trace_actions(&mut self, actions: Vec<TraceAction>) {
+        for a in actions {
+            match a {
+                TraceAction::AddSignalToGraph(sig) => self.on_add_signal_to_graph(sig),
+                TraceAction::CopyAsGenerator(frame) => self.log(format!(
+                    "frame 0x{:X} copied as JSON (generator import comes later)",
+                    frame.id
+                )),
+                TraceAction::Log(msg) => {
+                    if msg.starts_with("error") {
+                        self.log_error(msg);
+                    } else {
+                        self.log(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    fn next_user_signal_id(&self) -> operow_core::UserSignalId {
+        operow_core::UserSignalId(
+            self.graph
+                .user_signals
+                .iter()
+                .map(|u| u.id.0 + 1)
+                .max()
+                .unwrap_or(1),
+        )
+    }
+
+    fn open_new_signal_dialog(&mut self) {
+        let first = self.graph.to_topology().buses.first().map(|b| b.id);
+        self.new_signal = Some(NewSignalDialog::new(first));
+    }
+
+    fn new_signal_dialog_ui(&mut self, ctx: &egui::Context) {
+        if self.new_signal.is_none() {
+            return;
+        }
+        let buses = self.graph.to_topology().buses;
+        let next = self.next_user_signal_id();
+        let Some(dlg) = &mut self.new_signal else {
+            return;
+        };
+        match dlg.ui(ctx, &buses, &self.graph.user_signals, &self.store, next) {
+            DialogOutcome::Open => {}
+            DialogOutcome::Cancel => self.new_signal = None,
+            DialogOutcome::Save(def) => {
+                self.log(format!("added user signal {}", def.name));
+                self.graph.user_signals.push(def);
+                self.new_signal = None;
+            }
         }
     }
 
@@ -211,7 +287,33 @@ impl OperowApp {
             self.open_window(WindowKind::Graph, true);
             self.open_window(WindowKind::Generator, true);
         }
+        let demo_trace = opts.demo_filters.then(|| {
+            let id = workspace::open_or_focus(&mut self.dock, WindowKind::Trace, true);
+            self.layout_preset = None;
+            id
+        });
         self.sync_instances();
+        if let Some(id) = demo_trace {
+            if let Some(t) = self.traces.get_mut(&id) {
+                t.title = Some("Body debug".into());
+                t.filters.bus.enabled = true;
+                t.filters.bus.selected.insert("Body".into());
+                t.filters.id.enabled = true;
+                t.filters.id.text = "100-2FF".into();
+            }
+            workspace::focus(&mut self.dock, id);
+        }
+        if opts.open_new_signal {
+            self.open_new_signal_dialog();
+            if let Some(d) = &mut self.new_signal {
+                d.name = "EngineSpeed".into();
+                d.id_hex = "100".into();
+                d.start_bit = 8;
+                d.size = 16;
+                d.factor = 0.25;
+                d.unit = "rpm".into();
+            }
+        }
         for t in self.traces.values_mut() {
             if opts.fixed_trace {
                 t.mode = TraceMode::Fixed;
@@ -247,6 +349,13 @@ impl OperowApp {
         };
         self.dock = saved.unwrap_or_else(workspace::default_layout);
         self.sync_instances();
+        if let Some(ws) = &topo.workspace {
+            for (id, view) in workspace::traces_from_json(ws) {
+                if let Some(t) = self.traces.get_mut(&id) {
+                    t.apply_view(view);
+                }
+            }
+        }
         self.reload_dbcs();
     }
 
@@ -474,7 +583,7 @@ impl OperowApp {
             return;
         }
         self.names.rebuild(&topo);
-        self.clear_traces();
+        self.store.clear();
         self.buffer_stop_sent = false;
         self.bus_stats.clear();
         self.sim_time = Timestamp::ZERO;
@@ -507,7 +616,7 @@ impl OperowApp {
         self.names.rebuild(&self.graph.to_topology());
         self.names.dbcs = Default::default();
         self.project_path = None;
-        self.clear_traces();
+        self.store.clear();
     }
 
     fn open_topology(&mut self) {
@@ -548,7 +657,8 @@ impl OperowApp {
                 d.path = dbcs::stored_path(&abs, new_dir.as_deref());
             }
             let mut topo = self.graph.to_topology();
-            topo.workspace = workspace::layout_to_json(&self.dock);
+            let views = self.traces.iter().map(|(id, t)| (*id, t.view())).collect();
+            topo.workspace = workspace::layout_to_json_with(&self.dock, views);
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
                 self.last_error = Some(format!("write error: {e}"));
@@ -614,17 +724,9 @@ impl OperowApp {
     fn handle_event(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::Frames(frames) => {
-                for f in &frames {
-                    let bus_name = self.names.bus_name(f.bus);
-                    let sender_name = self.names.node_name(f.sender);
-                    let origin_name = self.names.node_name(f.origin);
-                    let msg_name =
-                        self.names
-                            .msg_name(f.bus, f.origin, f.frame.id, f.frame.extended);
-                    for trace in self.traces.values_mut() {
-                        trace.push(f, &bus_name, &sender_name, &origin_name, &msg_name);
-                    }
-                    self.sim_time = f.time;
+                self.store.push_batch(&frames);
+                if let Some(last) = frames.last() {
+                    self.sim_time = last.time;
                 }
                 if self.animate_traffic {
                     self.animate_frames(&frames);
@@ -884,10 +986,14 @@ impl OperowApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let rows = self.traces.values().map(|t| t.len()).max().unwrap_or(0);
                 ui.label(format!(
                     "Buffer: {} / {} frames",
-                    rows, self.settings.frame_buffer_size
+                    self.store.len(),
+                    self.store.capacity()
+                ))
+                .on_hover_text(format!(
+                    "{} frames received in total (the oldest are dropped when full)",
+                    self.store.total_pushed()
                 ));
                 ui.separator();
                 let red = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
@@ -948,7 +1054,7 @@ impl OperowApp {
                                     .changed();
                             });
                             ui.weak(format!(
-                                "Estimated RAM \u{2248} {} per trace window ({} bytes/frame)",
+                                "Estimated RAM \u{2248} {} for the shared frame store ({} bytes/frame)",
                                 settings::format_bytes(s.estimated_ram_bytes()),
                                 settings::BYTES_PER_FRAME
                             ));
@@ -1007,7 +1113,7 @@ impl OperowApp {
         if self.settings.when_full != WhenFull::StopMeasurement
             || self.buffer_stop_sent
             || self.run_state == RunState::Stopped
-            || !self.traces.values().any(|t| t.is_full())
+            || !self.store.is_full()
         {
             return;
         }
@@ -1068,6 +1174,10 @@ impl eframe::App for OperowApp {
         }
 
         self.sync_instances();
+        let now = std::time::Instant::now();
+        for t in self.traces.values_mut() {
+            t.update(&self.store, &self.names, now);
+        }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
@@ -1077,7 +1187,7 @@ impl eframe::App for OperowApp {
             self.status_bar(ui);
         });
 
-        let mut picked = None;
+        let mut tree = project_tree::TreeOutput::default();
         if self.show_tree {
             egui::SidePanel::left("project_tree")
                 .resizable(true)
@@ -1085,12 +1195,21 @@ impl eframe::App for OperowApp {
                 .show(ctx, |ui| {
                     ui.heading("Project");
                     ui.separator();
-                    picked = project_tree::ui(ui, &self.graph, &self.names.dbcs);
+                    tree = project_tree::ui(ui, &self.graph, &self.names.dbcs);
                 });
         }
-        if let Some(id) = picked {
+        if let Some(id) = tree.picked {
             self.graph.select(id);
             self.open_window(WindowKind::Properties, false);
+        }
+        if tree.new_signal {
+            self.open_new_signal_dialog();
+        }
+        if let Some(id) = tree.add_signal_to_graph {
+            self.on_add_signal_to_graph(SignalRef::User(id));
+        }
+        if let Some(id) = tree.delete_signal {
+            self.graph.user_signals.retain(|u| u.id != id);
         }
 
         egui::CentralPanel::default()
@@ -1100,6 +1219,7 @@ impl eframe::App for OperowApp {
                     graph: &mut self.graph,
                     inspector: &mut self.inspector,
                     traces: &mut self.traces,
+                    store: &self.store,
                     names: &self.names,
                     status_log: &mut self.status_log,
                     bus_stats: &self.bus_stats,
@@ -1108,6 +1228,7 @@ impl eframe::App for OperowApp {
                     menu_pos: &mut self.menu_pos,
                     cmds: Vec::new(),
                     graph_changed: false,
+                    trace_actions: Vec::new(),
                 };
                 let style = egui_dock::Style::from_egui(ui.style().as_ref());
                 egui_dock::DockArea::new(&mut self.dock)
@@ -1115,7 +1236,9 @@ impl eframe::App for OperowApp {
                     .show_add_buttons(false)
                     .show_close_buttons(true)
                     .show_inside(ui, &mut viewer);
-                let (cmds, changed) = (viewer.cmds, viewer.graph_changed);
+                let (cmds, changed, actions) =
+                    (viewer.cmds, viewer.graph_changed, viewer.trace_actions);
+                self.handle_trace_actions(actions);
                 for cmd in cmds {
                     let _ = self.engine.cmd.send(cmd);
                 }
@@ -1126,6 +1249,7 @@ impl eframe::App for OperowApp {
 
         self.settings_ui(ctx);
         self.import_dialog_ui(ctx);
+        self.new_signal_dialog_ui(ctx);
         self.take_screenshot_if_needed(ctx);
 
         if let Some(path) = self.screenshot_path.clone() {

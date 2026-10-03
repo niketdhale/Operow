@@ -11,8 +11,9 @@ use crate::app::LiveBusStats;
 use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::store::FrameStore;
 use crate::theme::AppTheme;
-use crate::trace::{NameLookup, Trace};
+use crate::trace::{NameLookup, Trace, TraceAction};
 use crate::workspace::{WindowId, WindowKind};
 
 const ERROR_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
@@ -22,6 +23,7 @@ pub struct WindowViewer<'a> {
     pub graph: &'a mut Graph,
     pub inspector: &'a mut Inspector,
     pub traces: &'a mut HashMap<WindowId, Trace>,
+    pub store: &'a FrameStore,
     pub names: &'a NameLookup,
     pub status_log: &'a mut Vec<String>,
     pub bus_stats: &'a HashMap<BusId, LiveBusStats>,
@@ -32,6 +34,8 @@ pub struct WindowViewer<'a> {
     pub cmds: Vec<Command>,
     /// A node was deleted, so loaded databases need pruning.
     pub graph_changed: bool,
+    /// Requests from trace windows (graph wiring, generator, log lines).
+    pub trace_actions: Vec<TraceAction>,
 }
 
 impl WindowViewer<'_> {
@@ -214,7 +218,22 @@ impl TabViewer for WindowViewer<'_> {
     type Tab = WindowId;
 
     fn title(&mut self, tab: &mut WindowId) -> egui::WidgetText {
-        tab.title().into()
+        match self.traces.get(tab).and_then(|t| t.title.as_deref()) {
+            Some(t) if tab.kind == WindowKind::Trace => {
+                format!("{} \u{b7} {t}", tab.title()).into()
+            }
+            _ => tab.title().into(),
+        }
+    }
+
+    fn on_tab_button(&mut self, tab: &mut WindowId, response: &egui::Response) {
+        // Double-click a Trace tab to rename it.
+        if tab.kind == WindowKind::Trace
+            && response.double_clicked()
+            && let Some(trace) = self.traces.get_mut(tab)
+        {
+            trace.begin_rename();
+        }
     }
 
     fn id(&mut self, tab: &mut WindowId) -> egui::Id {
@@ -235,7 +254,8 @@ impl TabViewer for WindowViewer<'_> {
             WindowKind::Properties => self.properties_ui(ui),
             WindowKind::Trace => {
                 if let Some(trace) = self.traces.get_mut(&id) {
-                    trace.ui(ui, self.names);
+                    let actions = trace.ui(ui, self.store, self.names);
+                    self.trace_actions.extend(actions);
                 }
             }
             WindowKind::Log => self.log_ui(ui),

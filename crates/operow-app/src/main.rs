@@ -5,12 +5,16 @@
 
 mod app;
 mod dbcs;
+mod filters;
 mod graph;
 mod icons;
 mod inspector;
 mod project_tree;
 mod script_editor;
 mod settings;
+mod signal_dialog;
+mod signals;
+mod store;
 mod theme;
 mod trace;
 mod windows;
@@ -36,6 +40,8 @@ fn main() -> eframe::Result<()> {
             "--open-import-dialog" => opts.import_dialog = args.next().map(PathBuf::from),
             "--open-settings" => opts.open_settings = true,
             "--layout-demo" => opts.layout_demo = true,
+            "--demo-filters" => opts.demo_filters = true,
+            "--open-new-signal" => opts.open_new_signal = true,
             _ => {}
         }
     }

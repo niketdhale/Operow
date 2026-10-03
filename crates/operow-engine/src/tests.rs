@@ -64,6 +64,7 @@ fn topo_with_two_senders() -> Topology {
             },
         ],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     }
 }
@@ -121,6 +122,7 @@ fn periodic_message_produces_expected_frame_count() {
             bus: BusId(1),
         }],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
 
@@ -195,6 +197,7 @@ fn sender_does_not_receive_its_own_frame() {
             },
         ],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
 
@@ -283,6 +286,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             bus: BusId(1),
         }],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     }
 }
@@ -382,6 +386,7 @@ fn gateway_topo(routes: Vec<RouteRule>) -> Topology {
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(2, 2), link(3, 1), link(3, 2)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     }
 }
@@ -400,6 +405,7 @@ fn send_on_only_hits_chosen_bus() {
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     let out = run_ms(&topo, 5);
@@ -425,6 +431,7 @@ fn send_fans_out_with_shared_uid() {
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     let out = run_ms(&topo, 5);
@@ -517,6 +524,7 @@ fn gateways_forwarding_to_each_other_stop_at_max_hops() {
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(3, 1), link(3, 2), link(4, 1), link(4, 2)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     let mut sim = Simulation::new(&topo).unwrap();
@@ -542,6 +550,7 @@ fn send_type_sim(send_type: SendType, enabled: bool) -> Simulation {
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     Simulation::new(&topo).unwrap()
@@ -684,6 +693,7 @@ fn set_payload_keeps_id_and_ignores_extra_bytes() {
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     let mut sim = Simulation::new(&topo).unwrap();
@@ -720,6 +730,7 @@ fn gateway_delegates_commands_to_own_tx() {
         buses: vec![bus(1, "A")],
         links: vec![link(1, 1)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     };
     let mut sim = Simulation::new(&topo).unwrap();
@@ -742,6 +753,7 @@ fn script_topo(script: &str, tx: Vec<TxMessage>) -> Topology {
         buses: vec![bus(1, "A"), bus(2, "B")],
         links: vec![link(1, 1), link(1, 2), link(2, 1)],
         databases: vec![],
+        user_signals: vec![],
         workspace: None,
     }
 }

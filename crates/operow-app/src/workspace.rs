@@ -4,6 +4,8 @@
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
+use crate::trace::TraceView;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WindowKind {
     Network,
@@ -189,9 +191,22 @@ const LAYOUT_VERSION: u32 = 1;
 struct SavedLayout {
     version: u32,
     dock: Dock,
+    /// Per-window settings of the Trace windows (title, filters, ...).
+    #[serde(default)]
+    traces: Vec<(WindowId, TraceView)>,
 }
 
+#[cfg(test)]
 pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
+    layout_to_json_with(dock, Vec::new())
+}
+
+/// Like [`layout_to_json`], also saving the settings of Trace windows.
+pub fn layout_to_json_with(
+    dock: &Dock,
+    mut traces: Vec<(WindowId, TraceView)>,
+) -> Option<serde_json::Value> {
+    traces.sort_by_key(|(id, _)| (id.kind, id.n));
     // Unlaid-out rects are infinite, which JSON cannot represent. Rects are
     // recomputed on the next frame, so store zeros.
     let mut dock = dock.clone();
@@ -204,8 +219,16 @@ pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
     serde_json::to_value(SavedLayout {
         version: LAYOUT_VERSION,
         dock,
+        traces,
     })
     .ok()
+}
+
+/// Saved Trace window settings; empty when absent or invalid.
+pub fn traces_from_json(value: &serde_json::Value) -> Vec<(WindowId, TraceView)> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .map(|s| s.traces)
+        .unwrap_or_default()
 }
 
 /// Parse a saved layout; `None` when invalid, an unknown version or empty.
@@ -294,6 +317,29 @@ mod tests {
         let back = Topology::from_json(&topo.to_json()).unwrap();
         let restored = layout_from_json(back.workspace.as_ref().unwrap()).unwrap();
         assert_eq!(open_windows(&restored), open_windows(&dock));
+    }
+
+    #[test]
+    fn trace_settings_persist_in_workspace_json() {
+        let mut dock = default_layout();
+        let id = open_or_focus(&mut dock, WindowKind::Trace, true);
+        let mut view = TraceView {
+            title: Some("Body debug".into()),
+            ..Default::default()
+        };
+        view.filters.id.enabled = true;
+        view.filters.id.text = "100-2FF".into();
+        let json = layout_to_json_with(&dock, vec![(id, view)]).unwrap();
+        let back = traces_from_json(&json);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, id);
+        assert_eq!(back[0].1.title.as_deref(), Some("Body debug"));
+        assert_eq!(back[0].1.filters.id.text, "100-2FF");
+        assert!(layout_from_json(&json).is_some());
+        // Layouts saved before trace settings existed still load.
+        let old = layout_to_json(&dock).unwrap();
+        assert!(traces_from_json(&old).is_empty());
+        assert!(traces_from_json(&serde_json::json!("x")).is_empty());
     }
 
     #[test]
