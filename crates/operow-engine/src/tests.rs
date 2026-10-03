@@ -1029,3 +1029,209 @@ fn generator_commands_through_runner() {
     assert!(n >= 5);
     handle.shutdown();
 }
+
+// ---- replay node ----
+
+/// Write an ASC log of `(ms, channel, id)` records (one data byte) to a
+/// unique temp file and return its path.
+fn write_log(records: &[(u64, u8, u32)], extra: &str) -> String {
+    use operow_log::{AscDate, AscWriter, LogRecord, LogWriter, RecordKind};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "operow-replay-{}-{}.asc",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let mut w = AscWriter::new(Vec::new(), AscDate::from_unix_ms(0)).unwrap();
+    for &(ms, channel, id) in records {
+        let r = LogRecord {
+            time: Timestamp::from_ms(ms),
+            channel,
+            dir: Direction::Tx,
+            kind: RecordKind::Frame(CanFrame::new(id, false, &[ms as u8]).unwrap()),
+        };
+        w.write(&r).unwrap();
+    }
+    let mut text = String::from_utf8(w.into_inner()).unwrap();
+    text.push_str(extra);
+    text.push_str("End TriggerBlock\n");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn replay_kind(
+    path: &str,
+    map: &[(u8, u32)],
+    looped: bool,
+    offset_ms: i64,
+    filter: Option<&str>,
+) -> NodeKind {
+    NodeKind::Replay {
+        path: path.into(),
+        channel_map: map.iter().map(|&(c, b)| (c, BusId(b))).collect(),
+        looped,
+        time_offset_ms: offset_ms,
+        id_filter: filter.map(Into::into),
+    }
+}
+
+/// Replay node 1 on bus 1 (and bus 2 when `two`).
+fn replay_topo(kind: NodeKind, two: bool) -> Topology {
+    let mut topo = Topology {
+        nodes: vec![node(1, vec![], kind)],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1)],
+        ..Default::default()
+    };
+    if two {
+        topo.buses.push(bus(2, "B"));
+        topo.links.push(link(1, 2));
+    }
+    topo
+}
+
+fn times_ms(out: &[operow_core::BusEvent]) -> Vec<u64> {
+    // Frames take ~0.2 ms on the wire; round down to the send time.
+    out.iter().map(|e| e.time.0 / 1_000_000).collect()
+}
+
+#[test]
+fn replay_frames_appear_on_mapped_bus_at_log_times() {
+    let path = write_log(&[(10, 1, 0x100), (20, 2, 0x200), (35, 1, 0x101)], "");
+    let topo = replay_topo(replay_kind(&path, &[(1, 1), (2, 2)], false, 0, None), true);
+    let out = run_ms(&topo, 100);
+    assert_eq!(times_ms(&out), [10, 20, 35]);
+    assert_eq!(
+        out.iter().map(|e| (e.bus, e.frame.id)).collect::<Vec<_>>(),
+        [(BusId(1), 0x100), (BusId(2), 0x200), (BusId(1), 0x101)]
+    );
+    assert!(out.iter().all(|e| e.sender == NodeId(1) && e.hop == 0));
+    assert!(out.iter().all(|e| e.dir == Direction::Tx));
+    // On the wire right after the log time (frame duration < 1 ms).
+    assert!(out[0].time.0 > 10_000_000);
+}
+
+#[test]
+fn replay_skips_unmapped_channels_error_frames_and_filtered_ids() {
+    let path = write_log(
+        &[
+            (1, 1, 0x100),
+            (2, 3, 0x100),
+            (3, 1, 0x150),
+            (4, 1, 0x7DF),
+            (5, 1, 0x1FF),
+        ],
+        "   0.006000 1  ErrorFrame\n",
+    );
+    let topo = replay_topo(
+        replay_kind(&path, &[(1, 1)], false, 0, Some("100-1FF, !150")),
+        false,
+    );
+    let out = run_ms(&topo, 50);
+    assert_eq!(
+        out.iter().map(|e| e.frame.id).collect::<Vec<_>>(),
+        [0x100, 0x1FF]
+    );
+}
+
+#[test]
+fn replay_offset_shifts_and_drops_negative_times() {
+    let path = write_log(&[(5, 1, 0x1), (20, 1, 0x2)], "");
+    let later = replay_topo(replay_kind(&path, &[(1, 1)], false, 30, None), false);
+    assert_eq!(times_ms(&run_ms(&later, 100)), [35, 50]);
+    let earlier = replay_topo(replay_kind(&path, &[(1, 1)], false, -10, None), false);
+    let out = run_ms(&earlier, 100);
+    assert_eq!(
+        times_ms(&out),
+        [10],
+        "the record shifted before t=0 is dropped"
+    );
+}
+
+#[test]
+fn replay_loop_restarts_after_the_last_record() {
+    let path = write_log(&[(10, 1, 0x1), (20, 1, 0x2)], "");
+    let topo = replay_topo(replay_kind(&path, &[(1, 1)], true, 0, None), false);
+    let out = run_ms(&topo, 85);
+    // Cycle length is the last record's time (20 ms).
+    assert_eq!(times_ms(&out), [10, 20, 30, 40, 50, 60, 70, 80]);
+    let unlooped = replay_topo(replay_kind(&path, &[(1, 1)], false, 0, None), false);
+    assert_eq!(run_ms(&unlooped, 85).len(), 2);
+}
+
+#[test]
+fn replay_loop_with_nothing_to_send_terminates() {
+    let path = write_log(&[(10, 2, 0x1)], "");
+    let topo = replay_topo(replay_kind(&path, &[(1, 1)], true, 0, None), false);
+    assert!(run_ms(&topo, 100).is_empty());
+}
+
+#[test]
+fn replayed_frames_are_forwarded_by_a_gateway() {
+    let path = write_log(&[(10, 1, 0x123)], "");
+    let topo = Topology {
+        nodes: vec![
+            node(1, vec![], replay_kind(&path, &[(1, 1)], false, 0, None)),
+            node(
+                3,
+                vec![],
+                NodeKind::Gateway {
+                    routes: vec![route(1, 2, IdFilter::Any, None, 0)],
+                },
+            ),
+        ],
+        buses: vec![bus(1, "A"), bus(2, "B")],
+        links: vec![link(1, 1), link(3, 1), link(3, 2)],
+        ..Default::default()
+    };
+    let out = run_ms(&topo, 50);
+    assert_eq!(out.len(), 2);
+    assert_eq!((out[0].bus, out[0].hop), (BusId(1), 0));
+    assert_eq!(
+        (out[1].bus, out[1].hop, out[1].sender),
+        (BusId(2), 1, NodeId(3))
+    );
+    assert_eq!(out[1].origin, NodeId(1));
+}
+
+#[test]
+fn replay_load_errors_name_the_node() {
+    let missing = replay_topo(
+        replay_kind("/nonexistent/none.asc", &[(1, 1)], false, 0, None),
+        false,
+    );
+    match Simulation::new(&missing) {
+        Err(crate::SimError::Replay { node, msg }) => {
+            assert_eq!(node, "N1");
+            assert!(msg.contains("none.asc"), "{msg}");
+        }
+        other => panic!("expected a replay error, got {:?}", other.err()),
+    }
+    let empty = replay_topo(replay_kind("", &[], false, 0, None), false);
+    assert!(matches!(
+        Simulation::new(&empty),
+        Err(crate::SimError::Replay { .. })
+    ));
+    let path = write_log(&[(1, 1, 0x1)], "");
+    let bad_filter = replay_topo(replay_kind(&path, &[(1, 1)], false, 0, Some("zz")), false);
+    assert!(matches!(
+        Simulation::new(&bad_filter),
+        Err(crate::SimError::Replay { .. })
+    ));
+    let broken = write_log(&[(1, 1, 0x1)], "   0.5 1  12 Tx   d 9 00\n");
+    let bad_file = replay_topo(replay_kind(&broken, &[(1, 1)], false, 0, None), false);
+    assert!(matches!(
+        Simulation::new(&bad_file),
+        Err(crate::SimError::Replay { .. })
+    ));
+}
+
+#[test]
+fn replay_streams_logs_larger_than_one_chunk() {
+    let records: Vec<(u64, u8, u32)> = (0..5000).map(|i| (i, 1, 0x100 + (i % 16) as u32)).collect();
+    let path = write_log(&records, "");
+    let topo = replay_topo(replay_kind(&path, &[(1, 1)], false, 0, None), false);
+    let out = run_ms(&topo, 6000);
+    assert_eq!(out.len(), 5000);
+    assert!(out.windows(2).all(|w| w[0].time <= w[1].time));
+}

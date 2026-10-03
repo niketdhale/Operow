@@ -17,6 +17,7 @@ rfd = "0.15"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 operow-core = { workspace = true }
+operow-log = { path = "../operow-log" }
 operow-engine = { path = "../operow-engine" }
 operow-dbc = { path = "../operow-dbc" }
 egui_dock = { version = "0.18", features = ["serde"] }

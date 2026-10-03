@@ -35,6 +35,8 @@ pub struct WindowViewer<'a> {
     pub run_state: RunState,
     pub theme: AppTheme,
     pub menu_pos: &'a mut Option<egui::Pos2>,
+    /// Folder of the project file, for relative log paths.
+    pub project_dir: Option<std::path::PathBuf>,
     /// Engine commands issued by windows this frame.
     pub cmds: Vec<Command>,
     /// Requests from trace windows (graph wiring, generator, log lines).
@@ -60,6 +62,9 @@ impl WindowViewer<'_> {
                 }
                 if icons::icon_text_button(ui, icons::gateway(), "Gateway").clicked() {
                     self.graph.add_gateway(egui::pos2(40.0, 120.0));
+                }
+                if icons::icon_text_button(ui, icons::replay(), "Replay").clicked() {
+                    self.graph.add_replay(egui::pos2(40.0, 160.0));
                 }
                 if icons::icon_text_button(ui, icons::bus(), "Bus").clicked() {
                     self.graph.add_bus(egui::pos2(40.0, 200.0));
@@ -137,6 +142,11 @@ impl WindowViewer<'_> {
                 self.graph.select(id);
                 ui.close();
             }
+            if ui.button("Add Replay node").clicked() {
+                let id = self.graph.add_replay(pos);
+                self.graph.select(id);
+                ui.close();
+            }
             if ui.button("Add CAN Bus").clicked() {
                 let id = self.graph.add_bus(pos);
                 self.graph.select(id);
@@ -164,7 +174,13 @@ impl WindowViewer<'_> {
 
     fn properties_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
-        let cmds = self.inspector.ui(ui, self.graph, running, &self.names.dbcs);
+        let cmds = self.inspector.ui(
+            ui,
+            self.graph,
+            running,
+            &self.names.dbcs,
+            self.project_dir.as_deref(),
+        );
         self.cmds.extend(cmds);
         self.send_once_ui(ui);
     }

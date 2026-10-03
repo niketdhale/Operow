@@ -9,15 +9,20 @@ use egui_flow::{EdgeId, PulseShape, PulseStyle};
 
 use crate::dbcs;
 use crate::generator_window::{AutoChange, DbcRow, GenRow, GeneratorWindow, SendMode, SigEdit};
-use crate::graph::{Graph, PulseDir, pulses_for_events};
+use crate::graph::{Graph, GraphNode, PulseDir, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::logging::{
+    CmpOp, Condition, LogContext, LogRuntime, LogState, LoggingConfig, SigCmp, StartTrigger,
+};
+use crate::logging_window::{self, LoggingInput};
 use crate::network_view::NetworkView;
 use crate::project_tree;
+use crate::replay::{self, LogInfo, ReplaySource};
 use crate::settings::{self, AppSettings, WhenFull};
 use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
-use crate::signals::SignalRef;
+use crate::signals::{RawKind, SignalRef};
 use crate::store::FrameStore;
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceAction, TraceMode};
@@ -73,6 +78,12 @@ pub struct StartupOptions {
     pub demo_generator: bool,
     /// `--network-view freeform|busline`: the Network window layout.
     pub network_view: Option<NetworkView>,
+    /// `--demo-logging`: open the Logging window with a signal trigger and
+    /// log into the temp folder while the measurement runs.
+    pub demo_logging: bool,
+    /// `--open-log <path>`: open an offline session (channels mapped to the
+    /// buses in order) and play it at x1.
+    pub open_log: Option<PathBuf>,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -84,6 +95,44 @@ struct ImportDialog {
     new_name: String,
     new_bitrate: u32,
     create_nodes: bool,
+}
+
+/// The "Open log" modal: the channels of an ASC file and where to put them.
+struct OpenLogDialog {
+    path: PathBuf,
+    info: LogInfo,
+    /// Per channel: an existing bus, or `None` for a new one.
+    targets: Vec<(u8, Option<BusId>)>,
+}
+
+/// Playback speeds of the replay bar; `None` is "as fast as possible".
+const REPLAY_SPEEDS: [(Option<f64>, &str); 7] = [
+    (Some(0.1), "\u{d7}0.1"),
+    (Some(0.5), "\u{d7}0.5"),
+    (Some(1.0), "\u{d7}1"),
+    (Some(2.0), "\u{d7}2"),
+    (Some(10.0), "\u{d7}10"),
+    (Some(100.0), "\u{d7}100"),
+    (None, "Max"),
+];
+/// Virtual time between the statistics updates of an offline session.
+const OFFLINE_STATS_NS: u64 = 200_000_000;
+
+/// An open offline session: a log streamed into the frame store while the
+/// simulation stays stopped.
+struct Offline {
+    source: ReplaySource,
+    /// File name for the status bar.
+    file: String,
+    /// Seek slider value (seconds) while it is being dragged.
+    drag: Option<f64>,
+    /// Text of the jump-to-time field.
+    jump: String,
+    /// Bus load counters built from the replayed frames.
+    acc: HashMap<BusId, BusStats>,
+    /// Nominal and data bitrate of each bus, for the load.
+    rates: HashMap<BusId, (u32, u32)>,
+    last_stats: Timestamp,
 }
 
 const BITRATES: [u32; 5] = [125_000, 250_000, 500_000, 800_000, 1_000_000];
@@ -108,6 +157,10 @@ pub struct OperowApp {
     demo_generator_pending: Option<WindowId>,
     /// Every bus event, shared by all windows.
     store: FrameStore,
+    /// ASC logging settings (saved with the project) and its task.
+    logging: LoggingConfig,
+    log_rt: LogRuntime,
+    show_logging: bool,
     settings: AppSettings,
     show_settings: bool,
     show_tree: bool,
@@ -133,6 +186,9 @@ pub struct OperowApp {
     /// stored relative to its folder.
     project_path: Option<PathBuf>,
     import_dialog: Option<ImportDialog>,
+    open_log: Option<OpenLogDialog>,
+    /// The open offline session, if any (the simulation is not run then).
+    offline: Option<Offline>,
     new_signal: Option<NewSignalDialog>,
     /// Flow-space position of the last right-click on the canvas, where
     /// "Add ECU"/"Add CAN Bus" place the new node.
@@ -168,6 +224,9 @@ impl OperowApp {
             last_generator: None,
             demo_generator_pending: None,
             store: FrameStore::new(settings.frame_buffer_size),
+            logging: LoggingConfig::default(),
+            log_rt: LogRuntime::default(),
+            show_logging: false,
             settings,
             show_settings: false,
             show_tree: true,
@@ -186,6 +245,8 @@ impl OperowApp {
             last_error: None,
             project_path: None,
             import_dialog: None,
+            open_log: None,
+            offline: None,
             new_signal: None,
             menu_pos: None,
             screenshot_path,
@@ -386,6 +447,9 @@ impl OperowApp {
         if let Some(view) = opts.network_view {
             self.graph.set_view(view);
         }
+        if let Some(path) = opts.open_log.as_deref() {
+            self.open_log_auto(path);
+        }
         if opts.layout_demo {
             self.open_window(WindowKind::Trace, true);
             self.open_window(WindowKind::Graph, true);
@@ -424,6 +488,9 @@ impl OperowApp {
         if opts.demo_generator {
             self.demo_generator();
         }
+        if opts.demo_logging {
+            self.demo_logging();
+        }
         for t in self.traces.values_mut() {
             if opts.fixed_trace {
                 t.mode = TraceMode::Fixed;
@@ -439,6 +506,39 @@ impl OperowApp {
         if let Some(name) = opts.select.as_deref() {
             self.select_by_name(name);
         }
+    }
+
+    /// `--demo-logging`: start recording once the Body bus's DoorStatus
+    /// (0x200) byte 0 equals 0, with 0.5 s of history and 1 s after the end.
+    fn demo_logging(&mut self) {
+        let bus = self
+            .names
+            .bus_names
+            .iter()
+            .find(|(_, n)| n.as_str() == "Body")
+            .map(|(b, _)| *b)
+            .or_else(|| self.names.bus_names.keys().min().copied());
+        let Some(bus) = bus else { return };
+        self.logging = LoggingConfig {
+            enabled: true,
+            folder: Some(std::env::temp_dir().join("operow-logs")),
+            ..Default::default()
+        };
+        self.logging.trigger.start = StartTrigger::OnCondition(Condition::Signal {
+            signal: SignalRef::Raw {
+                bus,
+                id: 0x200,
+                extended: false,
+                kind: RawKind::Byte(0),
+            },
+            cmp: SigCmp {
+                op: CmpOp::Eq,
+                value: 0.0,
+            },
+        });
+        self.logging.trigger.pre_trigger_s = 0.5;
+        self.logging.trigger.post_trigger_s = 1.0;
+        self.show_logging = true;
     }
 
     /// `--demo-graph`: EngineSpeed on Y1, Throttle on Y2 and Running as a
@@ -608,6 +708,11 @@ impl OperowApp {
         self.last_graph = None;
         self.generators.clear();
         self.last_generator = None;
+        self.logging = topo
+            .workspace
+            .as_ref()
+            .and_then(workspace::logging_from_json)
+            .unwrap_or_default();
         self.sync_instances();
         if let Some(ws) = &topo.workspace {
             for (id, view) in workspace::traces_from_json(ws) {
@@ -627,6 +732,20 @@ impl OperowApp {
             }
         }
         self.reload_dbcs();
+    }
+
+    /// Project file name without `.operow.json`, for log file names.
+    fn project_name(&self) -> String {
+        self.project_path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| {
+                let n = n.strip_suffix(".json").unwrap_or(&n);
+                n.strip_suffix(".operow").unwrap_or(n).to_string()
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "operow".into())
     }
 
     fn project_dir(&self) -> Option<PathBuf> {
@@ -824,6 +943,352 @@ impl OperowApp {
         }
     }
 
+    // ---- offline replay --------------------------------------------------
+
+    /// Ask for an ASC or BLF file, then open the channel mapping dialog for it.
+    fn pick_log(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Vector logs", &["asc", "blf"])
+            .pick_file()
+        {
+            self.begin_open_log(&path);
+        }
+    }
+
+    /// Default channel mapping: channels in order onto the existing buses,
+    /// then new buses.
+    fn default_targets(&self, info: &LogInfo) -> Vec<(u8, Option<BusId>)> {
+        let buses = self.graph.to_topology().buses;
+        info.channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (*ch, buses.get(i).map(|b| b.id)))
+            .collect()
+    }
+
+    fn begin_open_log(&mut self, path: &std::path::Path) {
+        match replay::probe(path) {
+            Ok(info) => {
+                let targets = self.default_targets(&info);
+                self.open_log = Some(OpenLogDialog {
+                    path: path.to_path_buf(),
+                    info,
+                    targets,
+                });
+            }
+            Err(e) => self.log_error(format!("log {}: {e}", path.display())),
+        }
+    }
+
+    /// `--open-log`: map the channels in order and play at x1.
+    fn open_log_auto(&mut self, path: &std::path::Path) {
+        match replay::probe(path) {
+            Ok(info) => {
+                let targets = self.default_targets(&info);
+                self.start_offline(path, info, &targets);
+                if let Some(off) = &mut self.offline {
+                    off.source.playing = true;
+                }
+            }
+            Err(e) => self.log_error(format!("log {}: {e}", path.display())),
+        }
+    }
+
+    /// Open an offline session: create the buses for channels mapped to a
+    /// new one, stop the simulation and start reading `path` (paused).
+    fn start_offline(
+        &mut self,
+        path: &std::path::Path,
+        info: LogInfo,
+        targets: &[(u8, Option<BusId>)],
+    ) {
+        self.stop();
+        let mut map = HashMap::new();
+        let mut created = 0;
+        for &(ch, target) in targets {
+            let bus = match target {
+                Some(b) => b,
+                None => {
+                    let flow = self
+                        .graph
+                        .add_bus(egui::pos2(80.0, 260.0 + 80.0 * created as f32));
+                    created += 1;
+                    match self.graph.node_mut(flow) {
+                        Some(GraphNode::Bus(b)) => {
+                            b.name = format!("ch{ch}");
+                            b.id
+                        }
+                        _ => continue,
+                    }
+                }
+            };
+            map.insert(ch, bus);
+        }
+        let topo = self.graph.to_topology();
+        if created > 0 && self.graph.view() == NetworkView::BusLine {
+            self.graph.auto_arrange();
+        }
+        self.names.rebuild(&topo);
+        let rates = topo
+            .buses
+            .iter()
+            .map(|b| (b.id, (b.bitrate, b.data_bitrate)))
+            .collect();
+        self.store.clear();
+        self.bus_stats.clear();
+        self.buffer_stop_sent = false;
+        self.sim_time = info.first;
+        self.prev_stats_time = info.first;
+        let file = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |f| f.to_string_lossy().into(),
+        );
+        self.log(format!(
+            "opened log {} ({:.3} s - {:.3} s)",
+            path.display(),
+            info.first.as_secs_f64(),
+            info.last.as_secs_f64()
+        ));
+        self.offline = Some(Offline {
+            source: ReplaySource::new(path, &info, map),
+            file,
+            drag: None,
+            jump: String::new(),
+            acc: HashMap::new(),
+            rates,
+            last_stats: info.first,
+        });
+    }
+
+    /// Leave the offline session: back to simulation mode.
+    fn close_log(&mut self) {
+        if self.offline.take().is_some() {
+            self.store.clear();
+            self.bus_stats.clear();
+            self.sim_time = Timestamp::ZERO;
+            self.prev_stats_time = Timestamp::ZERO;
+            self.log("closed offline log");
+        }
+    }
+
+    /// Clear everything shown and restart at `time` (a seek).
+    fn offline_seek(&mut self, time: Timestamp) {
+        let Some(off) = &mut self.offline else {
+            return;
+        };
+        off.source.seek(time);
+        off.acc.clear();
+        off.last_stats = off.source.position();
+        let pos = off.source.position();
+        self.store.clear();
+        self.bus_stats.clear();
+        self.prev_stats_time = pos;
+        self.sim_time = pos;
+    }
+
+    /// Feed the due frames of the offline source into the store and keep
+    /// the per-bus statistics.
+    fn update_offline(&mut self, ctx: &egui::Context) {
+        let Some(off) = &mut self.offline else {
+            return;
+        };
+        let adv = off.source.tick(std::time::Instant::now());
+        let error = off.source.error.take();
+        for ev in &adv.events {
+            if let Some(&(nominal, data)) = off.rates.get(&ev.bus) {
+                let s = off.acc.entry(ev.bus).or_default();
+                s.frames += 1;
+                s.busy_ns += operow_engine::frame_duration_ns_any(&ev.frame, nominal, data);
+            }
+        }
+        let pos = off.source.position();
+        let playing = off.source.playing;
+        let stats_due = pos.0.saturating_sub(off.last_stats.0) >= OFFLINE_STATS_NS;
+        let stats = stats_due.then(|| {
+            off.last_stats = pos;
+            off.acc.iter().map(|(b, s)| (*b, *s)).collect::<Vec<_>>()
+        });
+        self.store.push_batch(&adv.events);
+        if adv.restarted {
+            self.store.clear();
+            self.bus_stats.clear();
+            self.prev_stats_time = pos;
+            if let Some(off) = &mut self.offline {
+                off.acc.clear();
+                off.last_stats = pos;
+            }
+        } else if let Some(buses) = stats {
+            self.handle_event(EngineEvent::Stats { time: pos, buses });
+        }
+        self.sim_time = pos;
+        if let Some(e) = error {
+            self.log_error(format!("log: {e}"));
+        }
+        if playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                self.settings.ui_refresh_ms as u64,
+            ));
+        }
+    }
+
+    /// Play/pause, speed, seek, jump, loop and close for the open log.
+    fn replay_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(off) = &mut self.offline else {
+            return;
+        };
+        let mut seek: Option<Timestamp> = None;
+        let mut close = false;
+        let src = &mut off.source;
+        let finished = src.position() >= src.last && !src.looped;
+        let (first, last) = (src.first.as_secs_f64(), src.last.as_secs_f64());
+        ui.horizontal(|ui| {
+            let (icon, tip) = if src.playing {
+                (icons::pause(), "Pause")
+            } else {
+                (icons::play(), "Play")
+            };
+            if icons::icon_button(ui, icon, tip).clicked() {
+                if src.playing {
+                    src.playing = false;
+                } else {
+                    if finished {
+                        seek = Some(src.first);
+                    }
+                    src.playing = true;
+                }
+            }
+            let current = REPLAY_SPEEDS
+                .iter()
+                .find(|(s, _)| *s == src.speed)
+                .map_or("\u{d7}1", |(_, l)| l);
+            ui.label("Speed:");
+            egui::ComboBox::from_id_salt("replay_speed")
+                .width(70.0)
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (s, label) in REPLAY_SPEEDS {
+                        ui.selectable_value(&mut src.speed, s, label);
+                    }
+                });
+            ui.separator();
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close log").clicked() {
+                    close = true;
+                }
+                ui.checkbox(&mut src.looped, "Loop");
+                let go = ui.button("Go").on_hover_text("Jump to the time (seconds)");
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut off.jump)
+                        .hint_text("jump to s")
+                        .desired_width(70.0),
+                );
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if go.clicked() || enter {
+                    let text = off.jump.trim().trim_end_matches('s').trim();
+                    if let Ok(t) = text.parse::<f64>()
+                        && t.is_finite()
+                    {
+                        seek = Some(Timestamp((t.max(0.0) * 1e9) as u64));
+                    }
+                }
+                ui.separator();
+                let shown = off.drag.unwrap_or_else(|| src.position().as_secs_f64());
+                ui.monospace(format!("{shown:8.3} s / {last:.3} s"));
+                // The slider takes what is left.
+                ui.spacing_mut().slider_width = (ui.available_width() - 24.0).max(60.0);
+                let mut value = shown;
+                let resp = ui.add_enabled(
+                    last > first,
+                    egui::Slider::new(&mut value, first..=last.max(first + 1e-9))
+                        .show_value(false)
+                        .trailing_fill(true),
+                );
+                if resp.dragged() {
+                    off.drag = Some(value);
+                }
+                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                    off.drag = None;
+                    seek = Some(Timestamp((value * 1e9) as u64));
+                }
+            });
+        });
+        if let Some(t) = seek {
+            self.offline_seek(t);
+        }
+        if close {
+            self.close_log();
+        }
+    }
+
+    fn open_log_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dlg) = &mut self.open_log else {
+            return;
+        };
+        let buses = self.graph.to_topology().buses;
+        let mut action = None;
+        egui::Window::new("Open log")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(dlg.path.display().to_string()).monospace());
+                ui.label(format!(
+                    "{:.3} s - {:.3} s, {} channel(s)",
+                    dlg.info.first.as_secs_f64(),
+                    dlg.info.last.as_secs_f64(),
+                    dlg.info.channels.len()
+                ));
+                ui.add_space(6.0);
+                egui::Grid::new("open_log_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        for (ch, target) in &mut dlg.targets {
+                            ui.label(format!("Channel {ch}:"));
+                            let text = match target {
+                                Some(id) => buses
+                                    .iter()
+                                    .find(|b| b.id == *id)
+                                    .map_or("?".to_string(), |b| b.name.clone()),
+                                None => format!("New bus ch{ch}"),
+                            };
+                            egui::ComboBox::from_id_salt(("open_log_ch", *ch))
+                                .selected_text(text)
+                                .show_ui(ui, |ui| {
+                                    for b in &buses {
+                                        ui.selectable_value(target, Some(b.id), &b.name);
+                                    }
+                                    ui.selectable_value(
+                                        target,
+                                        None,
+                                        format!("New bus ch{ch} (500k)"),
+                                    );
+                                });
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+        match action {
+            Some(true) => {
+                if let Some(d) = self.open_log.take() {
+                    self.start_offline(&d.path, d.info, &d.targets);
+                }
+            }
+            Some(false) => self.open_log = None,
+            None => {}
+        }
+    }
+
     fn select_by_name(&mut self, name: &str) {
         let id = self
             .graph
@@ -845,7 +1310,23 @@ impl OperowApp {
     }
 
     fn start(&mut self) {
-        let topo = self.graph.to_topology();
+        if self.offline.is_some() {
+            self.log("close the offline log to run the simulation");
+            return;
+        }
+        let mut topo = self.graph.to_topology();
+        // Replay nodes read their log from the engine thread; hand it
+        // paths that do not depend on the working directory.
+        let dir = self.project_dir();
+        for n in &mut topo.nodes {
+            if let operow_core::NodeKind::Replay { path, .. } = &mut n.kind
+                && !path.trim().is_empty()
+            {
+                *path = dbcs::resolve_path(dir.as_deref(), path)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         if let Err(e) = topo.validate() {
             let msg = format!("invalid topology: {e}");
             self.log(format!("error: {msg}"));
@@ -881,11 +1362,13 @@ impl OperowApp {
 
     fn new_topology(&mut self) {
         self.stop();
+        self.offline = None;
         self.graph = Graph::new();
         self.graph.add_bus(egui::pos2(80.0, 260.0));
         self.names.rebuild(&self.graph.to_topology());
         self.names.dbcs = Default::default();
         self.project_path = None;
+        self.logging = LoggingConfig::default();
         self.graphs.clear();
         self.last_graph = None;
         self.generators.clear();
@@ -903,6 +1386,7 @@ impl OperowApp {
                     Ok(topo) => match topo.validate() {
                         Ok(()) => {
                             self.stop();
+                            self.offline = None;
                             self.install_topology(&topo, &path);
                             self.log(format!("loaded {}", path.display()));
                         }
@@ -938,12 +1422,15 @@ impl OperowApp {
                 .iter()
                 .map(|(id, g)| (*id, g.view()))
                 .collect();
-            topo.workspace = workspace::layout_to_json_with(
-                &self.dock,
-                views,
-                graphs,
-                generators,
-                Some(self.graph.network_layout()),
+            topo.workspace = workspace::with_logging(
+                workspace::layout_to_json_with(
+                    &self.dock,
+                    views,
+                    graphs,
+                    generators,
+                    Some(self.graph.network_layout()),
+                ),
+                &self.logging,
             );
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
@@ -1070,6 +1557,72 @@ impl OperowApp {
         }
     }
 
+    /// Feed the logging task: pressed keys, new frames, measurement state.
+    fn run_logging(&mut self, ctx: &egui::Context) {
+        let keys: Vec<char> = if ctx.wants_keyboard_input() {
+            Vec::new()
+        } else {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => t.chars().next(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        };
+        let mut buses: Vec<BusId> = self.names.bus_names.keys().copied().collect();
+        buses.sort();
+        let project = self.project_name();
+        let dir = self.project_dir();
+        let lctx = LogContext {
+            store: &self.store,
+            buses: &buses,
+            project: &project,
+            project_dir: dir.as_deref(),
+            dbcs: &self.names.dbcs,
+            users: &self.graph.user_signals,
+        };
+        let running = self.run_state != RunState::Stopped;
+        let msgs = self.log_rt.update(&self.logging, running, &keys, &lctx);
+        for m in msgs {
+            match m.strip_prefix("error: ") {
+                Some(e) => self.log_error(e.to_string()),
+                None => self.log(m),
+            }
+        }
+    }
+
+    fn logging_window_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_logging {
+            return;
+        }
+        let mut buses: Vec<(BusId, String)> = self
+            .graph
+            .to_topology()
+            .buses
+            .iter()
+            .map(|b| (b.id, b.name.clone()))
+            .collect();
+        buses.sort_by_key(|(id, _)| *id);
+        let project = self.project_name();
+        let dir = self.project_dir();
+        let input = LoggingInput {
+            buses: &buses,
+            dbcs: &self.names.dbcs,
+            users: &self.graph.user_signals,
+            names: &self.names,
+            status: self.log_rt.status(),
+            files: &self.log_rt.files,
+            project: &project,
+            project_dir: dir.as_deref(),
+        };
+        let mut open = true;
+        logging_window::show(ctx, &mut open, &mut self.logging, &input);
+        self.show_logging = open;
+    }
+
     /// Sender names, demo start, key presses, auto-change and engine sync
     /// of every Generator window.
     fn update_generators(&mut self, ctx: &egui::Context) {
@@ -1104,6 +1657,7 @@ impl OperowApp {
             let idle = self.run_state == RunState::Stopped;
             let running = self.run_state == RunState::Running;
             let paused = self.run_state == RunState::Paused;
+            let offline = self.offline.is_some();
 
             if ui
                 .selectable_label(self.show_tree, "\u{2630}")
@@ -1134,6 +1688,14 @@ impl OperowApp {
                     .clicked()
                 {
                     self.pick_dbc();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(idle, egui::Button::new("Open log..."))
+                    .on_hover_text("Analyze an ASC log offline, without simulating")
+                    .clicked()
+                {
+                    self.pick_log();
                     ui.close();
                 }
             });
@@ -1184,6 +1746,13 @@ impl OperowApp {
                     ui.close();
                 }
                 if ui
+                    .add_enabled(idle, egui::Button::new("Add Replay node"))
+                    .clicked()
+                {
+                    self.graph.add_replay(egui::pos2(40.0, 160.0));
+                    ui.close();
+                }
+                if ui
                     .add_enabled(idle, egui::Button::new("Add CAN Bus"))
                     .clicked()
                 {
@@ -1198,6 +1767,10 @@ impl OperowApp {
                         ui.close();
                     }
                 }
+                if ui.button("Logging...").clicked() {
+                    self.show_logging = true;
+                    ui.close();
+                }
                 ui.separator();
                 if ui.checkbox(&mut self.show_tree, "Project tree").clicked() {
                     ui.close();
@@ -1209,7 +1782,7 @@ impl OperowApp {
             });
             ui.menu_button("Simulation", |ui| {
                 if ui
-                    .add_enabled(!running && !paused, egui::Button::new("Start"))
+                    .add_enabled(!running && !paused && !offline, egui::Button::new("Start"))
                     .clicked()
                 {
                     self.start();
@@ -1247,7 +1820,17 @@ impl OperowApp {
             });
             ui.separator();
 
-            if icons::icon_button_enabled(ui, !running && !paused, icons::play(), "Start").clicked()
+            if icons::icon_button_enabled(
+                ui,
+                !running && !paused && !offline,
+                icons::play(),
+                if offline {
+                    "Close the offline log to run the simulation"
+                } else {
+                    "Start"
+                },
+            )
+            .clicked()
             {
                 self.start();
             }
@@ -1299,6 +1882,9 @@ impl OperowApp {
             ui.checkbox(&mut self.animate_traffic, "Animate");
 
             ui.separator();
+            self.log_button(ui);
+
+            ui.separator();
             if ui.button("+ Trace").clicked() {
                 self.open_window(WindowKind::Trace, true);
             }
@@ -1335,6 +1921,37 @@ impl OperowApp {
         });
     }
 
+    /// The "Log" toggle: a dot that is red while recording and amber while
+    /// armed. Right-click or long-press opens the Logging window.
+    fn log_button(&mut self, ui: &mut egui::Ui) {
+        let state = self.log_rt.status().state;
+        let dot = if self.logging.enabled && state == LogState::Idle {
+            egui::Color32::from_rgb(0xa0, 0x50, 0x50)
+        } else {
+            logging_window::state_color(state)
+        };
+        let mut button = egui::Button::new("       Log");
+        if self.logging.enabled {
+            button = button.fill(if self.theme == AppTheme::Dark {
+                egui::Color32::from_rgb(0x4a, 0x2a, 0x2a)
+            } else {
+                egui::Color32::from_rgb(0xf4, 0xd4, 0xd4)
+            });
+        }
+        let resp = ui.add(button).on_hover_text(
+            "Log bus traffic to an ASC file while the measurement runs\n\
+             Right-click or long-press for the logging settings",
+        );
+        let c = egui::pos2(resp.rect.left() + 13.0, resp.rect.center().y);
+        ui.painter().circle_filled(c, 5.0, dot);
+        if resp.clicked() {
+            self.logging.enabled = !self.logging.enabled;
+        }
+        if resp.secondary_clicked() || resp.long_touched() {
+            self.show_logging = true;
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (color, label) = match self.run_state {
@@ -1342,12 +1959,50 @@ impl OperowApp {
                 RunState::Running => (egui::Color32::from_rgb(0x1a, 0x9c, 0x3a), "Running"),
                 RunState::Paused => (egui::Color32::from_rgb(0xd0, 0x90, 0x1a), "Paused"),
             };
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 5.0, color);
-            ui.label(label);
+            if let Some(off) = &self.offline {
+                let src = &off.source;
+                let amber = egui::Color32::from_rgb(0xd0, 0x90, 0x1a);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, amber);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "OFFLINE: {} \u{b7} {:.3} s / {:.3} s",
+                        off.file,
+                        src.position().as_secs_f64(),
+                        src.last.as_secs_f64()
+                    ))
+                    .strong(),
+                );
+            } else {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, color);
+                ui.label(label);
+                ui.separator();
+                ui.label(format!("t = {:.3} s", self.sim_time.as_secs_f64()));
+            }
             ui.separator();
-            ui.label(format!("t = {:.3} s", self.sim_time.as_secs_f64()));
-            ui.separator();
+            let log = self.log_rt.status();
+            if log.state != LogState::Idle {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    rect.center(),
+                    5.0,
+                    logging_window::state_color(log.state),
+                );
+                if log.state == LogState::Armed {
+                    ui.label("Log armed");
+                } else {
+                    ui.label(format!(
+                        "REC {} \u{b7} {}",
+                        logging_window::format_elapsed(log.elapsed_s),
+                        logging_window::format_size(log.bytes)
+                    ));
+                }
+                ui.separator();
+            }
             let mut buses: Vec<(String, f64)> = self
                 .bus_stats
                 .iter()
@@ -1547,7 +2202,9 @@ impl eframe::App for OperowApp {
             self.screenshot_start = Some(std::time::Instant::now());
         }
 
+        self.update_offline(ctx);
         self.sync_instances();
+        self.run_logging(ctx);
         let now = std::time::Instant::now();
         for t in self.traces.values_mut() {
             t.update(&self.store, &self.names, now);
@@ -1571,6 +2228,12 @@ impl eframe::App for OperowApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
         });
+
+        if self.offline.is_some() {
+            egui::TopBottomPanel::top("replay_bar").show(ctx, |ui| {
+                self.replay_bar(ui);
+            });
+        }
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             self.status_bar(ui);
@@ -1617,6 +2280,11 @@ impl eframe::App for OperowApp {
                     run_state: self.run_state,
                     theme: self.theme,
                     menu_pos: &mut self.menu_pos,
+                    project_dir: self
+                        .project_path
+                        .as_deref()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf()),
                     cmds: Vec::new(),
                     trace_actions: Vec::new(),
                 };
@@ -1636,7 +2304,9 @@ impl eframe::App for OperowApp {
             });
 
         self.settings_ui(ctx);
+        self.logging_window_ui(ctx);
         self.import_dialog_ui(ctx);
+        self.open_log_dialog_ui(ctx);
         self.new_signal_dialog_ui(ctx);
         self.take_screenshot_if_needed(ctx);
 

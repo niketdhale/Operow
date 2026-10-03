@@ -219,6 +219,60 @@ impl Graph {
         id
     }
 
+    /// Add a Replay node (no log file and no channel mapping yet).
+    pub fn add_replay(&mut self, pos: Pos2) -> FlowId {
+        let name = format!("Replay {}", self.next_node_id);
+        let id = self.insert_ecu(pos, &name);
+        if let Some(GraphNode::Ecu(e)) = self.node_mut(id) {
+            e.kind = NodeKind::new_replay();
+        }
+        self.editor.commit(&self.state);
+        id
+    }
+
+    /// Make the wires of Replay node `id` match its channel mapping: one
+    /// wire to every mapped bus, none to other buses.
+    pub fn sync_replay_links(&mut self, id: FlowId) {
+        let Some(GraphNode::Ecu(e)) = self.node(id) else {
+            return;
+        };
+        let NodeKind::Replay { channel_map, .. } = &e.kind else {
+            return;
+        };
+        let wanted: HashSet<BusId> = channel_map.iter().map(|(_, b)| *b).collect();
+        let bus_flow = |g: &Graph, bus: BusId| {
+            g.state
+                .nodes
+                .iter()
+                .find(|n| matches!(&n.data, GraphNode::Bus(b) if b.id == bus))
+                .map(|n| n.id)
+        };
+        let mut have = HashSet::new();
+        let mut drop_edges = Vec::new();
+        for edge in &self.state.edges {
+            if edge.source != id {
+                continue;
+            }
+            match self.node(edge.target) {
+                Some(GraphNode::Bus(b)) if wanted.contains(&b.id) && have.insert(b.id) => {}
+                _ => drop_edges.push(edge.id),
+            }
+        }
+        let mut changed = !drop_edges.is_empty();
+        for edge in drop_edges {
+            self.state.remove_edge(edge);
+        }
+        for bus in wanted.difference(&have) {
+            if let Some(target) = bus_flow(self, *bus) {
+                self.state.connect(id, target, ());
+                changed = true;
+            }
+        }
+        if changed {
+            self.editor.commit(&self.state);
+        }
+    }
+
     pub fn add_bus(&mut self, pos: Pos2) -> FlowId {
         let id = BusId(self.next_bus_id);
         self.next_bus_id += 1;
@@ -898,13 +952,21 @@ fn remap_buses(cfg: &mut EcuConfig, remap: &HashMap<BusId, BusId>) {
     for m in &mut cfg.tx {
         m.bus = m.bus.map(map);
     }
-    if let NodeKind::Gateway { routes } = &mut cfg.kind {
-        for r in routes {
-            r.from_bus = map(r.from_bus);
-            for t in &mut r.to_buses {
-                *t = map(*t);
+    match &mut cfg.kind {
+        NodeKind::Gateway { routes } => {
+            for r in routes {
+                r.from_bus = map(r.from_bus);
+                for t in &mut r.to_buses {
+                    *t = map(*t);
+                }
             }
         }
+        NodeKind::Replay { channel_map, .. } => {
+            for (_, b) in channel_map {
+                *b = map(*b);
+            }
+        }
+        NodeKind::Ecu => {}
     }
 }
 
@@ -916,6 +978,9 @@ fn stale_refs(ecu: &EcuConfig, bus: BusId) -> usize {
             .iter()
             .filter(|r| r.from_bus == bus || r.to_buses.contains(&bus))
             .count(),
+        NodeKind::Replay { channel_map, .. } => {
+            channel_map.iter().filter(|(_, b)| *b == bus).count()
+        }
         NodeKind::Ecu => 0,
     };
     msgs + routes
@@ -997,6 +1062,9 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
             GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
                 (icons::gateway(), node.data.name().to_string())
             }
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Replay { .. }) => {
+                (icons::replay(), node.data.name().to_string())
+            }
             GraphNode::Ecu(_) => (icons::ecu(), node.data.name().to_string()),
             GraphNode::Bus(b) if b.fd_enabled => (
                 icons::bus(),
@@ -1069,6 +1137,9 @@ impl GraphViewer {
             GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
                 self.theme.gateway_color()
             }
+            GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Replay { .. }) => {
+                self.theme.replay_color()
+            }
             GraphNode::Ecu(_) => self.theme.bus_color(1),
             GraphNode::Bus(_) => self.theme.bus_color(0),
         }
@@ -1078,8 +1149,19 @@ impl GraphViewer {
 /// Node subtitle, e.g. `3 route(s) · 2 msg(s)`; `None` when there is nothing to show.
 pub fn subtitle(e: &EcuConfig) -> Option<String> {
     let mut parts = Vec::new();
-    if let NodeKind::Gateway { routes } = &e.kind {
-        parts.push(format!("{} route(s)", routes.len()));
+    match &e.kind {
+        NodeKind::Gateway { routes } => parts.push(format!("{} route(s)", routes.len())),
+        NodeKind::Replay {
+            path, channel_map, ..
+        } => {
+            let file = std::path::Path::new(path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .filter(|f| !f.is_empty());
+            parts.push(file.unwrap_or_else(|| "no log file".into()));
+            parts.push(format!("{} ch", channel_map.len()));
+        }
+        NodeKind::Ecu => {}
     }
     if !e.tx.is_empty() {
         parts.push(format!("{} msg(s)", e.tx.len()));
@@ -1295,6 +1377,45 @@ mod tests {
             ..b
         };
         assert_eq!(bus_bar_label(&fd, None), "CAN1 \u{b7} FD 500k/2M \u{b7} 0%");
+    }
+
+    #[test]
+    fn replay_node_links_follow_its_channel_mapping() {
+        let mut g = Graph::new();
+        let a = g.add_bus(Pos2::ZERO);
+        let b = g.add_bus(Pos2::new(0.0, 100.0));
+        let r = g.add_replay(Pos2::new(100.0, 0.0));
+        let bus_id = |g: &Graph, f| match g.node(f) {
+            Some(GraphNode::Bus(b)) => b.id,
+            _ => unreachable!(),
+        };
+        let (ida, idb) = (bus_id(&g, a), bus_id(&g, b));
+        let set = |g: &mut Graph, map: Vec<(u8, BusId)>| {
+            if let Some(GraphNode::Ecu(e)) = g.node_mut(r)
+                && let NodeKind::Replay { channel_map, .. } = &mut e.kind
+            {
+                *channel_map = map;
+            }
+            g.sync_replay_links(r);
+        };
+        set(&mut g, vec![(1, ida), (2, idb)]);
+        let linked = |g: &Graph| -> Vec<BusId> {
+            let mut v: Vec<_> = g.links().iter().map(|l| l.bus).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(linked(&g), [ida, idb]);
+        // Two channels on one bus make one wire; dropping one removes it.
+        set(&mut g, vec![(1, ida), (2, ida)]);
+        assert_eq!(linked(&g), [ida]);
+        set(&mut g, vec![]);
+        assert!(linked(&g).is_empty());
+        assert_eq!(g.to_topology().validate(), Ok(()));
+        let sub = subtitle(match g.node(r) {
+            Some(GraphNode::Ecu(e)) => e,
+            _ => unreachable!(),
+        });
+        assert_eq!(sub.as_deref(), Some("no log file \u{b7} 0 ch"));
     }
 
     #[test]

@@ -37,6 +37,14 @@ impl AppTheme {
         table[index % table.len()]
     }
 
+    /// Accent for Replay nodes.
+    pub fn replay_color(self) -> Color32 {
+        match self {
+            AppTheme::Light => Color32::from_rgb(0x6a, 0x3f, 0xc8),
+            AppTheme::Dark => Color32::from_rgb(0xb4, 0x9a, 0xff),
+        }
+    }
+
     /// Accent for gateway nodes.
     pub fn gateway_color(self) -> Color32 {
         match self {

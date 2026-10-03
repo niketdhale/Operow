@@ -369,3 +369,62 @@ fn user_signals_round_trip_and_default_empty() {
     });
     assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
 }
+
+fn replay_topology(map: Vec<(u8, BusId)>) -> Topology {
+    Topology {
+        nodes: vec![EcuConfig {
+            id: NodeId(1),
+            name: "Replay".into(),
+            tx: vec![],
+            kind: NodeKind::Replay {
+                path: "log.asc".into(),
+                channel_map: map,
+                looped: true,
+                time_offset_ms: -5,
+                id_filter: Some("100-1FF, !150".into()),
+            },
+            pos: (0.0, 0.0),
+            script: None,
+        }],
+        buses: vec![CanBusConfig {
+            id: BusId(1),
+            name: "A".into(),
+            bitrate: 500_000,
+            fd_enabled: false,
+            data_bitrate: 2_000_000,
+        }],
+        links: vec![Link {
+            node: NodeId(1),
+            bus: BusId(1),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn replay_node_round_trips_and_validates() {
+    let topo = replay_topology(vec![(1, BusId(1))]);
+    let back = Topology::from_json(&topo.to_json()).unwrap();
+    assert_eq!(back, topo);
+    assert!(topo.to_json().contains("\"type\": \"Replay\""));
+    assert_eq!(topo.validate(), Ok(()));
+}
+
+#[test]
+fn replay_node_fields_default_when_missing() {
+    let json = r#"{"nodes":[{"id":1,"name":"R","tx":[],"kind":{"type":"Replay"}}]}"#;
+    let topo = Topology::from_json(json).unwrap();
+    assert_eq!(topo.nodes[0].kind, NodeKind::new_replay());
+}
+
+#[test]
+fn replay_node_must_be_linked_to_mapped_bus() {
+    let topo = replay_topology(vec![(1, BusId(1)), (2, BusId(2))]);
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::ReplayBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(2)
+        })
+    );
+}

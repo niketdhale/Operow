@@ -2,6 +2,8 @@
 //! ECU or CAN bus.
 
 use egui_flow::NodeId as FlowId;
+use std::path::Path;
+
 use operow_core::{BusId, CanFrame, IdFilter, NodeId, NodeKind, RouteRule, SendType, TxMessage};
 use operow_engine::{Command, EcuCommand};
 
@@ -26,6 +28,11 @@ pub struct Inspector {
     was_running: bool,
     script_check: crate::script_editor::ScriptCheck,
     script_window: bool,
+    /// Channels found in each Replay node's log: the resolved path they
+    /// were read from, and the channels or the read error.
+    project_dir: Option<std::path::PathBuf>,
+    replay_channels:
+        std::collections::HashMap<FlowId, (std::path::PathBuf, Result<Vec<u8>, String>)>,
 }
 
 /// Send-type discriminant without its parameters, for the combo box.
@@ -152,6 +159,7 @@ impl Inspector {
         graph: &mut Graph,
         running: bool,
         dbcs: &DbcStore,
+        project_dir: Option<&Path>,
     ) -> Vec<Command> {
         let mut cmds = Vec::new();
         if running != self.was_running {
@@ -184,6 +192,7 @@ impl Inspector {
 
         ui.add_space(4.0);
         egui::ScrollArea::both().show(ui, |ui| {
+            self.project_dir = project_dir.map(Path::to_path_buf);
             self.node_ui(ui, graph, sel, running, dbcs, &mut cmds);
         });
         cmds
@@ -199,6 +208,16 @@ impl Inspector {
         cmds: &mut Vec<Command>,
     ) {
         let linked = linked_buses(graph, sel);
+        let all_buses: Vec<(BusId, String)> = graph
+            .state
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                GraphNode::Bus(b) => Some((b.id, b.name.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut resync = false;
         if matches!(graph.node(sel), Some(GraphNode::Ecu(e)) if matches!(e.kind, NodeKind::Gateway { .. }))
         {
             ui.strong("Gateway");
@@ -250,11 +269,21 @@ impl Inspector {
                     ui.horizontal(|ui| {
                         ui.label("Node type:");
                         let is_gw = matches!(ecu.kind, NodeKind::Gateway { .. });
+                        let is_replay = matches!(ecu.kind, NodeKind::Replay { .. });
+                        let is_ecu = !is_gw && !is_replay;
                         egui::ComboBox::from_id_salt(("node_type", sel))
-                            .selected_text(if is_gw { "Gateway" } else { "ECU" })
+                            .selected_text(if is_gw {
+                                "Gateway"
+                            } else if is_replay {
+                                "Replay"
+                            } else {
+                                "ECU"
+                            })
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(!is_gw, "ECU (drops routes)").clicked()
-                                    && is_gw
+                                if ui
+                                    .selectable_label(is_ecu, "ECU (drops routes and replay)")
+                                    .clicked()
+                                    && !is_ecu
                                 {
                                     ecu.kind = NodeKind::Ecu;
                                     self.route_buf.clear();
@@ -262,8 +291,24 @@ impl Inspector {
                                 if ui.selectable_label(is_gw, "Gateway").clicked() && !is_gw {
                                     ecu.kind = NodeKind::Gateway { routes: vec![] };
                                 }
+                                if ui.selectable_label(is_replay, "Replay").clicked() && !is_replay
+                                {
+                                    ecu.kind = NodeKind::new_replay();
+                                }
                             });
                     });
+                    if matches!(ecu.kind, NodeKind::Replay { .. }) {
+                        ui.separator();
+                        resync |= Self::replay_ui(
+                            ui,
+                            &mut self.replay_channels,
+                            sel,
+                            &mut ecu.kind,
+                            &all_buses,
+                            self.project_dir.as_deref(),
+                        );
+                        return;
+                    }
                     if let NodeKind::Gateway { routes } = &mut ecu.kind {
                         ui.separator();
                         Self::routes_ui(ui, &mut self.route_buf, sel, routes, &linked);
@@ -411,6 +456,9 @@ impl Inspector {
             }
         }
 
+        if resync {
+            graph.sync_replay_links(sel);
+        }
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), err);
         }
@@ -418,6 +466,144 @@ impl Inspector {
 }
 
 impl Inspector {
+    /// Settings of a Replay node: log file, channel -> bus table, loop,
+    /// offset and id filter. Returns whether the channel mapping changed
+    /// (the node's wires then have to follow).
+    fn replay_ui(
+        ui: &mut egui::Ui,
+        cache: &mut std::collections::HashMap<
+            FlowId,
+            (std::path::PathBuf, Result<Vec<u8>, String>),
+        >,
+        sel: FlowId,
+        kind: &mut NodeKind,
+        buses: &[(BusId, String)],
+        project_dir: Option<&Path>,
+    ) -> bool {
+        let NodeKind::Replay {
+            path,
+            channel_map,
+            looped,
+            time_offset_ms,
+            id_filter,
+        } = kind
+        else {
+            return false;
+        };
+        let mut remap = false;
+        ui.strong("Replay");
+        ui.horizontal(|ui| {
+            ui.label("Log file:");
+            ui.add(
+                egui::TextEdit::singleline(path)
+                    .hint_text("*.asc;*.blf")
+                    .desired_width(260.0),
+            );
+            if ui.button("Browse...").clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .add_filter("Vector logs", &["asc", "blf"])
+                    .pick_file()
+            {
+                let abs = file.canonicalize().unwrap_or(file);
+                *path = dbcs::stored_path(&abs, project_dir);
+            }
+        });
+
+        // Channels of the file, read again when the path changes.
+        let resolved = dbcs::resolve_path(project_dir, path);
+        let stale = cache.get(&sel).is_none_or(|(p, _)| *p != resolved);
+        let rescan = !path.trim().is_empty()
+            && ui
+                .small_button("Rescan file")
+                .on_hover_text("Read the channels of the log again")
+                .clicked();
+        if stale || rescan {
+            let found = if path.trim().is_empty() {
+                Ok(Vec::new())
+            } else {
+                crate::replay::probe_channels(&resolved)
+            };
+            cache.insert(sel, (resolved, found));
+        }
+        let detected = match cache.get(&sel).map(|(_, r)| r) {
+            Some(Ok(c)) => c.clone(),
+            Some(Err(e)) => {
+                ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), e);
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let mut channels = detected;
+        for (c, _) in channel_map.iter() {
+            if !channels.contains(c) {
+                channels.push(*c);
+            }
+        }
+        channels.sort_unstable();
+
+        ui.add_space(4.0);
+        ui.label("Channel mapping:");
+        if channels.is_empty() {
+            ui.weak("Pick a log file to map its channels to buses.");
+        } else {
+            egui::Grid::new(("replay_map", sel))
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    for ch in channels {
+                        ui.label(format!("Channel {ch}"));
+                        let current = channel_map.iter().find(|(c, _)| *c == ch).map(|(_, b)| *b);
+                        let mut choice = current;
+                        let text = match current {
+                            None => "(not replayed)".to_string(),
+                            Some(b) => buses
+                                .iter()
+                                .find(|(id, _)| *id == b)
+                                .map_or("\u{26a0} missing bus".to_string(), |(_, n)| n.clone()),
+                        };
+                        egui::ComboBox::from_id_salt(("replay_ch", sel, ch))
+                            .selected_text(text)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut choice, None, "(not replayed)");
+                                for (id, name) in buses {
+                                    ui.selectable_value(&mut choice, Some(*id), name);
+                                }
+                            });
+                        if choice != current {
+                            channel_map.retain(|(c, _)| *c != ch);
+                            if let Some(b) = choice {
+                                channel_map.push((ch, b));
+                            }
+                            channel_map.sort_unstable_by_key(|(c, _)| *c);
+                            remap = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+        ui.add_space(4.0);
+        ui.checkbox(looped, "Loop")
+            .on_hover_text("Start over after the last record");
+        ui.horizontal(|ui| {
+            ui.label("Time offset (ms):");
+            ui.add(egui::DragValue::new(time_offset_ms).speed(10.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("ID filter:");
+            let mut text = id_filter.clone().unwrap_or_default();
+            ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("100-1FF, 3A0, !7DF")
+                    .desired_width(180.0),
+            );
+            *id_filter = (!text.trim().is_empty()).then_some(text);
+        });
+        if let Some(Err(e)) = id_filter.as_deref().map(operow_core::IdExpr::parse) {
+            ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), e);
+        }
+        remap
+    }
+
     /// Collapsible Rhai script section for ECU-like nodes.
     fn script_ui(
         &mut self,

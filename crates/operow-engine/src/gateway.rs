@@ -21,7 +21,7 @@ impl GatewayEcu {
     pub fn new(config: &EcuConfig) -> Self {
         let routes = match &config.kind {
             NodeKind::Gateway { routes } => routes.clone(),
-            NodeKind::Ecu => Vec::new(),
+            NodeKind::Ecu | NodeKind::Replay { .. } => Vec::new(),
         };
         GatewayEcu {
             own: PeriodicEcu::new(config),

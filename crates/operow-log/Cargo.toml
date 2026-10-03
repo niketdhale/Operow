@@ -1,12 +1,13 @@
 [package]
-name = "operow-engine"
+name = "operow-log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2 = "1.1.10"
 operow-core = { workspace = true }
-operow-log = { path = "../operow-log" }
-crossbeam-channel = { workspace = true }
-rhai = { version = "1.26.1", features = ["sync"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+operow-engine = { path = "../operow-engine" }

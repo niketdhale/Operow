@@ -65,6 +65,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                                 let flow = flow_of_ecu(node.id);
                                 let icon = match node.kind {
                                     NodeKind::Gateway { .. } => icons::gateway(),
+                                    NodeKind::Replay { .. } => icons::replay(),
                                     NodeKind::Ecu => icons::ecu(),
                                 };
                                 ui.horizontal(|ui| {

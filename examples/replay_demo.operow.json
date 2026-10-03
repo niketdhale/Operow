@@ -1,0 +1,120 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "name": "Replay",
+      "tx": [],
+      "kind": {
+        "type": "Replay",
+        "path": "sample_log.asc",
+        "channel_map": [
+          [
+            1,
+            1
+          ]
+        ],
+        "looped": true,
+        "time_offset_ms": 0,
+        "id_filter": null
+      },
+      "pos": [
+        100.0,
+        200.0
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Body",
+      "tx": [
+        {
+          "name": "DoorStatus",
+          "frame": {
+            "id": 512,
+            "extended": false,
+            "dlc": 2,
+            "data": [
+              0,
+              0
+            ]
+          },
+          "period_ms": 100,
+          "enabled": true
+        }
+      ],
+      "pos": [
+        500.0,
+        200.0
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Gateway",
+      "tx": [],
+      "kind": {
+        "type": "Gateway",
+        "routes": [
+          {
+            "from_bus": 1,
+            "to_buses": [
+              2
+            ],
+            "filter": {
+              "Range": {
+                "lo": 256,
+                "hi": 511
+              }
+            }
+          },
+          {
+            "from_bus": 2,
+            "to_buses": [
+              1
+            ],
+            "filter": {
+              "Exact": {
+                "id": 512,
+                "extended": false
+              }
+            },
+            "remap_id": 768,
+            "delay_us": 200
+          }
+        ]
+      },
+      "pos": [
+        300.0,
+        100.0
+      ]
+    }
+  ],
+  "buses": [
+    {
+      "id": 1,
+      "name": "Powertrain",
+      "bitrate": 500000
+    },
+    {
+      "id": 2,
+      "name": "Body",
+      "bitrate": 250000
+    }
+  ],
+  "links": [
+    {
+      "node": 1,
+      "bus": 1
+    },
+    {
+      "node": 2,
+      "bus": 2
+    },
+    {
+      "node": 3,
+      "bus": 1
+    },
+    {
+      "node": 3,
+      "bus": 2
+    }
+  ]
+}

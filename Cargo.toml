@@ -5,6 +5,7 @@ members = [
     "crates/operow-engine",
     "crates/operow-app",
     "crates/operow-dbc",
+    "crates/operow-log",
 ]
 
 [workspace.package]
