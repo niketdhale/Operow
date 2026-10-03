@@ -15,6 +15,7 @@ mod logging;
 mod logging_window;
 mod network_view;
 mod project_tree;
+mod replay;
 mod script_editor;
 mod settings;
 mod signal_dialog;
@@ -49,6 +50,7 @@ fn main() -> eframe::Result<()> {
             "--open-new-signal" => opts.open_new_signal = true,
             "--demo-graph" => opts.demo_graph = true,
             "--demo-generator" => opts.demo_generator = true,
+            "--open-log" => opts.open_log = args.next().map(PathBuf::from),
             "--demo-logging" => opts.demo_logging = true,
             "--network-view" => {
                 opts.network_view = args

@@ -41,6 +41,10 @@ pub fn gateway() -> ImageSource<'static> {
     include_image!("../assets/icons/gateway.svg")
 }
 
+pub fn replay() -> ImageSource<'static> {
+    include_image!("../assets/icons/replay.svg")
+}
+
 pub fn bus() -> ImageSource<'static> {
     include_image!("../assets/icons/bus.svg")
 }

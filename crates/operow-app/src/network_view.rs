@@ -401,10 +401,17 @@ pub struct EdgeLook {
 }
 
 /// A node that sends nothing and forwards nothing: no enabled message, no
-/// script and, for a gateway, no routes (typically a DBC-only node).
+/// script and, for a gateway, no routes (typically a DBC-only node); a
+/// Replay node is inactive until it has a file and a channel mapping.
 pub fn is_inactive(ecu: &EcuConfig) -> bool {
-    let routes = matches!(&ecu.kind, NodeKind::Gateway { routes } if !routes.is_empty());
-    !routes && ecu.script.is_none() && !ecu.tx.iter().any(|m| m.enabled)
+    let active_kind = match &ecu.kind {
+        NodeKind::Gateway { routes } => !routes.is_empty(),
+        NodeKind::Replay {
+            path, channel_map, ..
+        } => !path.trim().is_empty() && !channel_map.is_empty(),
+        NodeKind::Ecu => false,
+    };
+    !active_kind && ecu.script.is_none() && !ecu.tx.iter().any(|m| m.enabled)
 }
 
 /// Short text for a route's id filter: `100-1FF`, `1A0`, `100/7F0`, `all`.

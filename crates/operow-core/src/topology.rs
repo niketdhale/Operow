@@ -89,6 +89,37 @@ pub enum NodeKind {
     Ecu,
     /// Forwards frames between the buses it is linked to.
     Gateway { routes: Vec<RouteRule> },
+    /// Injects the frames of an ASC log onto the buses it is mapped to.
+    Replay {
+        /// Log file; relative paths resolve against the project folder.
+        #[serde(default)]
+        path: String,
+        /// ASC channel -> bus. Records of other channels are skipped.
+        #[serde(default)]
+        channel_map: Vec<(u8, BusId)>,
+        /// Start over after the last record.
+        #[serde(default)]
+        looped: bool,
+        /// Shift every record in time (milliseconds, may be negative).
+        #[serde(default)]
+        time_offset_ms: i64,
+        /// Only replay these ids, e.g. `100-1FF, 3A0, !7DF`.
+        #[serde(default)]
+        id_filter: Option<String>,
+    },
+}
+
+impl NodeKind {
+    /// A Replay node with no file and no channel mapping yet.
+    pub fn new_replay() -> Self {
+        NodeKind::Replay {
+            path: String::new(),
+            channel_map: Vec::new(),
+            looped: false,
+            time_offset_ms: 0,
+            id_filter: None,
+        }
+    }
 }
 
 /// Static configuration of a simulated ECU.
@@ -224,6 +255,8 @@ pub enum TopologyError {
     RouteBusNotLinked { node: NodeId, bus: BusId },
     #[error("gateway {node:?} routes bus {bus:?} back onto itself")]
     RouteToSameBus { node: NodeId, bus: BusId },
+    #[error("replay node {node:?} maps a channel to bus {bus:?} which it is not linked to")]
+    ReplayBusNotLinked { node: NodeId, bus: BusId },
 }
 
 /// Errors returned by [`Topology::from_json`].
@@ -277,6 +310,13 @@ impl Topology {
             for bus in node.tx.iter().filter_map(|m| m.bus) {
                 if !linked(bus) {
                     return Err(TopologyError::TxBusNotLinked { node: node.id, bus });
+                }
+            }
+            if let NodeKind::Replay { channel_map, .. } = &node.kind {
+                for &(_, bus) in channel_map {
+                    if !linked(bus) {
+                        return Err(TopologyError::ReplayBusNotLinked { node: node.id, bus });
+                    }
                 }
             }
             if let NodeKind::Gateway { routes } = &node.kind {

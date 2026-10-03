@@ -1378,6 +1378,9 @@ impl NameLookup {
     }
 
     pub fn node_name(&self, id: NodeId) -> String {
+        if let Some(ch) = crate::replay::log_channel(id) {
+            return format!("Log ch{ch}");
+        }
         self.generator_names
             .get(&id)
             .or_else(|| self.node_names.get(&id))

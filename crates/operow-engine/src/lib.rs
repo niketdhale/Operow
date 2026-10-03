@@ -2,6 +2,7 @@
 
 mod ecu;
 mod gateway;
+mod replay;
 mod runner;
 mod script;
 mod sim;
@@ -9,6 +10,7 @@ mod timing;
 
 pub use ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 pub use gateway::GatewayEcu;
+pub use replay::{LARGE_LOG_RECORDS, ReplayEcu};
 pub use runner::{Command, Engine, EngineEvent, EngineHandle, RunState};
 pub use script::{ScriptEcu, check_script};
 pub use sim::{BusStats, GENERATOR_NODE_BASE, GeneratorId, MAX_HOPS, SimError, Simulation};

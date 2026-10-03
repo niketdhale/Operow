@@ -8,6 +8,7 @@ use operow_core::{
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 use crate::gateway::GatewayEcu;
+use crate::replay::ReplayEcu;
 use crate::script::ScriptEcu;
 use crate::timing::frame_duration_ns_any;
 
@@ -43,6 +44,8 @@ pub enum SimError {
     Topology(#[from] TopologyError),
     #[error("script of node {node:?} failed to compile: {msg}")]
     Script { node: NodeId, msg: String },
+    #[error("replay node {node:?}: {msg}")]
+    Replay { node: String, msg: String },
 }
 
 /// Per-bus utilization counters.
@@ -155,7 +158,7 @@ pub struct Simulation {
 
 impl Simulation {
     /// Build a simulation from a validated topology. Every node gets a
-    /// default [`PeriodicEcu`] (or a [`GatewayEcu`] for gateways); use [`Simulation::set_ecu`] to override a
+    /// default [`PeriodicEcu`] (a [`GatewayEcu`] for gateways, a [`ReplayEcu`] for replay nodes); use [`Simulation::set_ecu`] to override a
     /// node's behavior before the first call to `run_until`.
     pub fn new(topology: &Topology) -> Result<Self, SimError> {
         topology.validate()?;
@@ -184,6 +187,12 @@ impl Simulation {
             let mut ecu: Box<dyn Ecu> = match node.kind {
                 NodeKind::Ecu => Box::new(PeriodicEcu::new(node)),
                 NodeKind::Gateway { .. } => Box::new(GatewayEcu::new(node)),
+                NodeKind::Replay { .. } => {
+                    Box::new(ReplayEcu::new(node).map_err(|msg| SimError::Replay {
+                        node: node.name.clone(),
+                        msg,
+                    })?)
+                }
             };
             if let Some(source) = &node.script {
                 ecu = Box::new(
