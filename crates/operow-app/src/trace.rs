@@ -705,7 +705,7 @@ impl Trace {
             }
             ui.separator();
 
-            ui.menu_button("Columns \u{23F7}", |ui| {
+            columns_menu(ui, |ui| {
                 for col in Col::ALL {
                     let mut shown = !self.hidden.contains(&col);
                     let text = if col.fixed_only() {
@@ -1060,28 +1060,30 @@ impl Trace {
     }
 }
 
+/// A "Columns" menu button with a painted chevron (a font glyph can render
+/// as an empty box).
+fn columns_menu(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    let chevron = egui::Id::new("columns_chevron");
+    let r = egui::Button::new((
+        "Columns",
+        egui::Atom::custom(chevron, egui::vec2(10.0, 10.0)),
+    ))
+    .atom_ui(ui);
+    if let Some(rect) = r.rect(chevron) {
+        egui_flow::Icon::ChevronDown.paint(ui.painter(), rect, ui.visuals().text_color());
+    }
+    egui::Popup::menu(&r.response).show(content);
+}
+
 /// The expand/collapse triangle in front of a decodable message name.
 fn arrow(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-    let c = rect.center();
-    let pts = if open {
-        vec![
-            c + egui::vec2(-4.0, -2.0),
-            c + egui::vec2(4.0, -2.0),
-            c + egui::vec2(0.0, 3.0),
-        ]
+    let icon = if open {
+        egui_flow::Icon::TriangleDown
     } else {
-        vec![
-            c + egui::vec2(-2.0, -4.0),
-            c + egui::vec2(-2.0, 4.0),
-            c + egui::vec2(3.0, 0.0),
-        ]
+        egui_flow::Icon::TriangleRight
     };
-    ui.painter().add(egui::Shape::convex_polygon(
-        pts,
-        ui.visuals().text_color(),
-        egui::Stroke::NONE,
-    ));
+    icon.paint(ui.painter(), rect, ui.visuals().text_color());
     resp.on_hover_text("Show decoded signals")
 }
 

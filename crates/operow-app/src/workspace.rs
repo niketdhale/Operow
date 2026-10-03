@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::generator_window::GeneratorView;
 use crate::graph_window::GraphView;
+use crate::network_view::NetworkLayout;
 use crate::trace::TraceView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -220,20 +221,25 @@ struct SavedLayout {
     /// Per-window settings of the Generator windows (rows, modes, ...).
     #[serde(default)]
     generators: Vec<(WindowId, GeneratorView)>,
+    /// The Network window's view and per-view positions. Projects saved
+    /// before it existed have none and open in the default bus-line view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<NetworkLayout>,
 }
 
 #[cfg(test)]
 pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
-    layout_to_json_with(dock, Vec::new(), Vec::new(), Vec::new())
+    layout_to_json_with(dock, Vec::new(), Vec::new(), Vec::new(), None)
 }
 
 /// Like [`layout_to_json`], also saving the settings of Trace, Graph and
-/// Generator windows.
+/// Generator windows and the Network window's view and positions.
 pub fn layout_to_json_with(
     dock: &Dock,
     mut traces: Vec<(WindowId, TraceView)>,
     mut graphs: Vec<(WindowId, GraphView)>,
     mut generators: Vec<(WindowId, GeneratorView)>,
+    network: Option<NetworkLayout>,
 ) -> Option<serde_json::Value> {
     traces.sort_by_key(|(id, _)| (id.kind, id.n));
     graphs.sort_by_key(|(id, _)| (id.kind, id.n));
@@ -253,8 +259,16 @@ pub fn layout_to_json_with(
         traces,
         graphs,
         generators,
+        network,
     })
     .ok()
+}
+
+/// Saved Network view and positions; `None` when absent or invalid.
+pub fn network_from_json(value: &serde_json::Value) -> Option<NetworkLayout> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .ok()
+        .and_then(|s| s.network)
 }
 
 /// Saved Trace window settings; empty when absent or invalid.
@@ -376,7 +390,8 @@ mod tests {
         };
         view.filters.id.enabled = true;
         view.filters.id.text = "100-2FF".into();
-        let json = layout_to_json_with(&dock, vec![(id, view)], Vec::new(), Vec::new()).unwrap();
+        let json =
+            layout_to_json_with(&dock, vec![(id, view)], Vec::new(), Vec::new(), None).unwrap();
         let back = traces_from_json(&json);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, id);
@@ -428,7 +443,13 @@ mod tests {
             layout: GraphLayout::Stacked,
         };
         let topo = Topology {
-            workspace: layout_to_json_with(&dock, Vec::new(), vec![(id, view.clone())], Vec::new()),
+            workspace: layout_to_json_with(
+                &dock,
+                Vec::new(),
+                vec![(id, view.clone())],
+                Vec::new(),
+                None,
+            ),
             ..Default::default()
         };
         let back = Topology::from_json(&topo.to_json()).unwrap();
@@ -477,7 +498,13 @@ mod tests {
             ],
         };
         let topo = Topology {
-            workspace: layout_to_json_with(&dock, Vec::new(), Vec::new(), vec![(id, view.clone())]),
+            workspace: layout_to_json_with(
+                &dock,
+                Vec::new(),
+                Vec::new(),
+                vec![(id, view.clone())],
+                None,
+            ),
             ..Default::default()
         };
         let back = Topology::from_json(&topo.to_json()).unwrap();
@@ -488,6 +515,91 @@ mod tests {
         let old = layout_to_json(&dock).unwrap();
         assert!(generators_from_json(&old).is_empty());
         assert!(generators_from_json(&serde_json::json!("x")).is_empty());
+    }
+
+    #[test]
+    fn network_view_and_positions_persist_per_mode() {
+        use crate::network_view::{NetworkLayout, NetworkView, NodeKey, Place};
+        let dock = default_layout();
+        let layout = NetworkLayout {
+            mode: NetworkView::FreeForm,
+            free: vec![(
+                NodeKey::Ecu(1),
+                Place {
+                    x: 1.0,
+                    y: 2.0,
+                    w: None,
+                    h: None,
+                },
+            )],
+            line: vec![
+                (
+                    NodeKey::Ecu(1),
+                    Place {
+                        x: 40.0,
+                        y: 0.0,
+                        w: None,
+                        h: None,
+                    },
+                ),
+                (
+                    NodeKey::Bus(1),
+                    Place {
+                        x: 0.0,
+                        y: 120.0,
+                        w: Some(700.0),
+                        h: Some(28.0),
+                    },
+                ),
+            ],
+        };
+        let topo = Topology {
+            workspace: layout_to_json_with(&dock, vec![], vec![], vec![], Some(layout.clone())),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let ws = back.workspace.as_ref().unwrap();
+        assert_eq!(network_from_json(ws), Some(layout));
+        assert!(layout_from_json(ws).is_some());
+        // Projects saved without the setting have none, so they open in the
+        // default bus-line view.
+        let old = layout_to_json(&dock).unwrap();
+        assert_eq!(network_from_json(&old), None);
+        assert_eq!(NetworkLayout::default().mode, NetworkView::BusLine);
+        let partial: NetworkLayout = serde_json::from_str("{}").unwrap();
+        assert_eq!(partial.mode, NetworkView::BusLine);
+    }
+
+    #[test]
+    fn graph_layout_round_trips_through_the_workspace() {
+        use crate::graph::Graph;
+        use crate::network_view::NetworkView;
+        let mut g = Graph::default_demo();
+        g.state.nodes[0].position = egui::pos2(11.0, 22.0);
+        g.set_view(NetworkView::FreeForm);
+        g.state.nodes[1].position = egui::pos2(5.0, 6.0);
+        let json = layout_to_json_with(
+            &default_layout(),
+            vec![],
+            vec![],
+            vec![],
+            Some(g.network_layout()),
+        );
+        let layout = network_from_json(json.as_ref().unwrap()).unwrap();
+        let mut g2 = Graph::from_topology(&g.to_topology());
+        g2.apply_layout(&layout);
+        assert_eq!(g2.view(), NetworkView::FreeForm);
+        let at = |g: &Graph, name: &str| {
+            g.state
+                .nodes
+                .iter()
+                .find(|n| n.data.name() == name)
+                .unwrap()
+                .position
+        };
+        assert_eq!(at(&g2, "Engine"), egui::pos2(5.0, 6.0));
+        g2.set_view(NetworkView::BusLine);
+        assert_eq!(at(&g2, "CAN1"), egui::pos2(11.0, 22.0));
     }
 
     #[test]

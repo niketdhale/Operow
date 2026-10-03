@@ -11,6 +11,7 @@ mod graph;
 mod graph_window;
 mod icons;
 mod inspector;
+mod network_view;
 mod project_tree;
 mod script_editor;
 mod settings;
@@ -46,6 +47,11 @@ fn main() -> eframe::Result<()> {
             "--open-new-signal" => opts.open_new_signal = true,
             "--demo-graph" => opts.demo_graph = true,
             "--demo-generator" => opts.demo_generator = true,
+            "--network-view" => {
+                opts.network_view = args
+                    .next()
+                    .and_then(|v| network_view::NetworkView::parse(&v))
+            }
             _ => {}
         }
     }

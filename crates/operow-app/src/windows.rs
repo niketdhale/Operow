@@ -13,6 +13,7 @@ use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::graph_window::GraphWindow;
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::network_view::NetworkView;
 use crate::store::FrameStore;
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceAction};
@@ -36,8 +37,6 @@ pub struct WindowViewer<'a> {
     pub menu_pos: &'a mut Option<egui::Pos2>,
     /// Engine commands issued by windows this frame.
     pub cmds: Vec<Command>,
-    /// A node was deleted, so loaded databases need pruning.
-    pub graph_changed: bool,
     /// Requests from trace windows (graph wiring, generator, log lines).
     pub trace_actions: Vec<TraceAction>,
 }
@@ -66,21 +65,58 @@ impl WindowViewer<'_> {
                     self.graph.add_bus(egui::pos2(40.0, 200.0));
                 }
             });
+            ui.separator();
+            ui.label("View:");
+            let mut view = self.graph.view();
+            for v in NetworkView::ALL {
+                ui.selectable_value(&mut view, v, v.label());
+            }
+            if view != self.graph.view() {
+                self.graph.set_view(view);
+            }
+            let bus_line = view == NetworkView::BusLine;
+            if ui
+                .add_enabled(bus_line, egui::Button::new("Auto-arrange"))
+                .on_hover_text("Stack the buses, put ECUs above their bus and gateways between")
+                .on_disabled_hover_text("Available in the bus-line view")
+                .clicked()
+            {
+                self.graph.auto_arrange();
+            }
             if running {
                 ui.weak("Editing is disabled while the measurement is running.");
             }
         });
         ui.separator();
 
+        let view = self.graph.view();
+        let (plan, _) = self.graph.prepare(self.theme);
+        let loads = self
+            .bus_stats
+            .iter()
+            .map(|(b, s)| (*b, s.load_pct))
+            .collect();
         let opts = FlowOptions {
             nodes_connectable: !running,
             delete_key: !running,
+            edges_reconnectable: !running,
+            keyboard_shortcuts: !running,
+            alignment_guides: true,
+            keyboard_nudge: true,
+            highlight_connected: true,
+            connection_radius: if view == NetworkView::BusLine {
+                36.0
+            } else {
+                20.0
+            },
             ..Default::default()
         };
-        let mut viewer = GraphViewer { theme: self.theme };
+        let mut viewer = GraphViewer::new(self.theme, self.graph, plan, loads);
         let out = Flow::new("graph")
             .options(opts)
             .show(ui, &mut self.graph.state, &mut viewer);
+        self.status_log
+            .extend(self.graph.process_events(&out.events));
 
         if running {
             return;
@@ -123,7 +159,6 @@ impl WindowViewer<'_> {
         }
         if let Some(id) = delete {
             self.graph.remove(id);
-            self.graph_changed = true;
         }
     }
 

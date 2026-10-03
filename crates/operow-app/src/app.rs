@@ -5,14 +5,15 @@ use operow_core::{BusId, DbcRef, Timestamp, Topology};
 use operow_dbc::{BusTarget, Database};
 use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, GeneratorId, RunState};
 
-use egui_flow::PulseStyle;
+use egui_flow::{EdgeId, PulseShape, PulseStyle};
 
 use crate::dbcs;
 use crate::generator_window::{AutoChange, DbcRow, GenRow, GeneratorWindow, SendMode, SigEdit};
-use crate::graph::{Graph, PulseDir, PulseSpec, pulses_for_events};
+use crate::graph::{Graph, PulseDir, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::network_view::NetworkView;
 use crate::project_tree;
 use crate::settings::{self, AppSettings, WhenFull};
 use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
@@ -24,8 +25,12 @@ use crate::windows::WindowViewer;
 use crate::workspace::{self, Dock, LayoutPreset, WindowId, WindowKind};
 
 const MAX_EVENTS_PER_FRAME: usize = 256;
-/// Minimum gap between pulses of one style on one wire.
+/// Light cap on pulses per wire and direction (20 per second), so
+/// high-rate traffic does not saturate a wire. Beyond it, `egui-flow`'s own
+/// per-edge limit replaces the oldest pulse.
 const PULSE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Seconds one pulse takes along one wire; legs of a frame follow each other.
+const PULSE_LEG_S: f32 = 0.45;
 
 /// Per-bus live stats shown in the Statistics window and status bar.
 #[derive(Default, Clone, Copy)]
@@ -66,6 +71,8 @@ pub struct StartupOptions {
     /// `--demo-generator`: open Generator 1 with four rows next to a Trace
     /// and start its cyclic rows once the measurement runs.
     pub demo_generator: bool,
+    /// `--network-view freeform|busline`: the Network window layout.
+    pub network_view: Option<NetworkView>,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -118,8 +125,8 @@ pub struct OperowApp {
     theme: AppTheme,
     /// Show pulses on the wires for live traffic.
     animate_traffic: bool,
-    /// When each pulse kind last fired on a wire, for throttling.
-    pulse_last: std::collections::HashMap<PulseSpec, std::time::Instant>,
+    /// When a pulse last started on each wire and direction, for the rate cap.
+    pulse_last: std::collections::HashMap<(EdgeId, PulseDir), std::time::Instant>,
     status_log: Vec<String>,
     last_error: Option<String>,
     /// File the current topology was opened from / saved to; DBC paths are
@@ -376,6 +383,9 @@ impl OperowApp {
                 Err(e) => self.log_error(format!("DBC {}: {e}", path.display())),
             }
         }
+        if let Some(view) = opts.network_view {
+            self.graph.set_view(view);
+        }
         if opts.layout_demo {
             self.open_window(WindowKind::Trace, true);
             self.open_window(WindowKind::Graph, true);
@@ -571,6 +581,15 @@ impl OperowApp {
     /// databases it references.
     fn install_topology(&mut self, topo: &Topology, path: &std::path::Path) {
         self.graph = Graph::from_topology(topo);
+        // Projects saved before the Network views existed have no layout
+        // and open in the default bus-line view.
+        if let Some(layout) = topo
+            .workspace
+            .as_ref()
+            .and_then(workspace::network_from_json)
+        {
+            self.graph.apply_layout(&layout);
+        }
         self.names.rebuild(topo);
         self.project_path = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         // Restore the saved window layout; fall back to the default.
@@ -919,7 +938,13 @@ impl OperowApp {
                 .iter()
                 .map(|(id, g)| (*id, g.view()))
                 .collect();
-            topo.workspace = workspace::layout_to_json_with(&self.dock, views, graphs, generators);
+            topo.workspace = workspace::layout_to_json_with(
+                &self.dock,
+                views,
+                graphs,
+                generators,
+                Some(self.graph.network_layout()),
+            );
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
                 self.last_error = Some(format!("write error: {e}"));
@@ -944,39 +969,58 @@ impl OperowApp {
     }
 
     /// Animate each frame along its real route: the sender's wire onto the
-    /// bus. Forwarded frames use the gateway accent. At most one pulse per
-    /// wire and style per `PULSE_MIN_INTERVAL`.
+    /// bus, then the bus's wire to every receiver one leg later. A frame a
+    /// gateway forwards is its own event and chains on after that. Pulses
+    /// are blue for originated frames, gateway-coloured when forwarded and
+    /// pink diamonds for Generator windows; hovering one shows
+    /// `0x<id> <message>`.
     fn animate_frames(&mut self, frames: &[operow_core::BusEvent]) {
-        let links = self.graph.to_topology().links;
+        let links = self.graph.links();
+        let wires = self.graph.wire_map();
         let now = std::time::Instant::now();
         self.pulse_last
             .retain(|_, t| now.duration_since(*t) < PULSE_MIN_INTERVAL * 20);
         for spec in pulses_for_events(frames, &links) {
-            // egui-flow pulses only run source->target (ECU to bus), so the
-            // bus-to-receiver legs cannot be drawn.
-            if spec.dir != PulseDir::ToBus {
+            // A Generator window's virtual sender has no wire.
+            let Some(&edge) = wires.get(&(spec.node, spec.bus)) else {
                 continue;
-            }
+            };
+            let key = (edge, spec.dir);
             if self
                 .pulse_last
-                .get(&spec)
+                .get(&key)
                 .is_some_and(|t| now.duration_since(*t) < PULSE_MIN_INTERVAL)
             {
                 continue;
             }
-            self.pulse_last.insert(spec, now);
-            let color = if spec.kind.forwarded {
-                self.theme.gateway_color()
+            self.pulse_last.insert(key, now);
+            let (color, shape, radius) = if spec.kind.generator {
+                (self.theme.generator_color(), PulseShape::Diamond, 5.0)
+            } else if spec.kind.forwarded {
+                (self.theme.gateway_color(), PulseShape::Circle, 4.0)
             } else {
-                self.theme.bus_color(if spec.kind.fd { 2 } else { 0 })
+                let c = self.theme.bus_color(if spec.kind.fd { 2 } else { 0 });
+                (c, PulseShape::Circle, 4.0)
             };
-            self.graph.pulse_link(
-                spec.node,
-                spec.bus,
+            let name = self
+                .names
+                .msg_name(spec.bus, spec.origin, spec.id, spec.extended);
+            let label = if name.is_empty() {
+                format!("0x{:X}", spec.id)
+            } else {
+                format!("0x{:X} {name}", spec.id)
+            };
+            self.graph.pulse_wire(
+                edge,
+                spec.dir,
                 PulseStyle {
                     color: Some(color),
-                    radius: 4.0,
-                    duration: 0.6,
+                    radius,
+                    duration: PULSE_LEG_S,
+                    delay: PULSE_LEG_S * f32::from(spec.legs),
+                    label: Some(label),
+                    shape,
+                    ..Default::default()
                 },
             );
         }
@@ -1094,6 +1138,40 @@ impl OperowApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let item =
+                    |text: &str, shortcut: &str| egui::Button::new(text).shortcut_text(shortcut);
+                if ui
+                    .add_enabled(idle && self.graph.can_undo(), item("Undo", "Ctrl+Z"))
+                    .clicked()
+                {
+                    self.graph.undo();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(idle && self.graph.can_redo(), item("Redo", "Ctrl+Y"))
+                    .clicked()
+                {
+                    self.graph.redo();
+                    ui.close();
+                }
+                ui.separator();
+                let selected = idle && self.graph.has_selection();
+                if ui.add_enabled(selected, item("Copy", "Ctrl+C")).clicked() {
+                    self.graph.copy();
+                    ui.close();
+                }
+                if ui.add_enabled(idle, item("Paste", "Ctrl+V")).clicked() {
+                    self.graph.paste();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(selected, item("Duplicate", "Ctrl+D"))
+                    .clicked()
+                {
+                    self.graph.duplicate();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.add_enabled(idle, egui::Button::new("Add ECU")).clicked() {
                     self.graph.add_ecu(egui::pos2(40.0, 40.0), "NewEcu");
                     ui.close();
@@ -1540,7 +1618,6 @@ impl eframe::App for OperowApp {
                     theme: self.theme,
                     menu_pos: &mut self.menu_pos,
                     cmds: Vec::new(),
-                    graph_changed: false,
                     trace_actions: Vec::new(),
                 };
                 let style = egui_dock::Style::from_egui(ui.style().as_ref());
@@ -1549,15 +1626,13 @@ impl eframe::App for OperowApp {
                     .show_add_buttons(false)
                     .show_close_buttons(true)
                     .show_inside(ui, &mut viewer);
-                let (cmds, changed, actions) =
-                    (viewer.cmds, viewer.graph_changed, viewer.trace_actions);
+                let (cmds, actions) = (viewer.cmds, viewer.trace_actions);
                 self.handle_trace_actions(actions);
                 for cmd in cmds {
                     let _ = self.engine.cmd.send(cmd);
                 }
-                if changed {
-                    self.sync_dbcs();
-                }
+                // Buses can disappear through undo, cut or the Delete key.
+                self.sync_dbcs();
             });
 
         self.settings_ui(ctx);

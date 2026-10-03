@@ -46,6 +46,16 @@ impl AppTheme {
     }
 }
 
+impl AppTheme {
+    /// Colour of pulses for frames sent by a Generator window.
+    pub fn generator_color(self) -> Color32 {
+        match self {
+            AppTheme::Light => Color32::from_rgb(0xc0, 0x1a, 0x7a),
+            AppTheme::Dark => Color32::from_rgb(0xff, 0x6e, 0xc7),
+        }
+    }
+}
+
 fn light_visuals() -> Visuals {
     let mut v = Visuals::light();
     v.panel_fill = Color32::from_rgb(0xf3, 0xf4, 0xf6);

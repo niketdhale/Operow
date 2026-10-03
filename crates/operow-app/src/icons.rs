@@ -108,3 +108,15 @@ pub fn icon_text_button(
 pub fn icon_image(ui: &egui::Ui, icon: ImageSource<'static>) -> egui::Image<'static> {
     tinted(ui, icon)
 }
+
+/// Disclosure triangle for `CollapsingHeader::icon`: down when open, right
+/// when closed, drawn with `egui-flow`'s painter icons (no font glyph).
+pub fn disclosure(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
+    let icon = if openness > 0.5 {
+        egui_flow::Icon::TriangleDown
+    } else {
+        egui_flow::Icon::TriangleRight
+    };
+    let color = ui.style().interact(response).fg_stroke.color;
+    icon.paint(ui.painter(), response.rect.expand(2.0), color);
+}

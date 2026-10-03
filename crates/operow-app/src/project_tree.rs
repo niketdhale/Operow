@@ -44,6 +44,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             CollapsingHeader::new(RichText::new("Networks").strong())
+                .icon(crate::icons::disclosure)
                 .default_open(true)
                 .show(ui, |ui| {
                     for bus in &topo.buses {
@@ -86,6 +87,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                         .collect();
                     if !unlinked.is_empty() {
                         CollapsingHeader::new("Unconnected")
+                            .icon(crate::icons::disclosure)
                             .default_open(true)
                             .show(ui, |ui| {
                                 for node in unlinked {
@@ -100,6 +102,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                 });
 
             CollapsingHeader::new(RichText::new("Databases").strong())
+                .icon(crate::icons::disclosure)
                 .default_open(true)
                 .show(ui, |ui| {
                     if topo.databases.is_empty() {
@@ -116,6 +119,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                             .find(|b| b.id == d.bus)
                             .map_or("?", |b| b.name.as_str());
                         CollapsingHeader::new(format!("{file}  \u{2192} {bus}"))
+                            .icon(crate::icons::disclosure)
                             .id_salt(("tree_db", i))
                             .show(ui, |ui| {
                                 let Some(db) = dbcs.by_bus.get(&d.bus) else {
@@ -124,6 +128,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                                 };
                                 for m in &db.messages {
                                     CollapsingHeader::new(format!("0x{:X}  {}", m.id, m.name))
+                                        .icon(crate::icons::disclosure)
                                         .id_salt(("tree_msg", i, m.id, m.extended))
                                         .show(ui, |ui| {
                                             for s in &m.signals {
@@ -163,6 +168,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                 });
 
             CollapsingHeader::new(RichText::new("User signals").strong())
+                .icon(crate::icons::disclosure)
                 .default_open(true)
                 .show(ui, |ui| {
                     if graph.user_signals.is_empty() {
@@ -194,6 +200,7 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                 });
 
             CollapsingHeader::new(RichText::new("Scripts").strong())
+                .icon(crate::icons::disclosure)
                 .default_open(true)
                 .show(ui, |ui| {
                     let mut any = false;

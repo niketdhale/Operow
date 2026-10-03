@@ -750,7 +750,10 @@ impl GraphWindow {
                                 .on_hover_text(&name);
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("\u{d7}").on_hover_text("Remove").clicked() {
+                            if egui_flow::icon_button(ui, egui_flow::Icon::Close, 9.0)
+                                .on_hover_text("Remove")
+                                .clicked()
+                            {
                                 *remove = Some(i);
                             }
                         });
@@ -1123,11 +1126,13 @@ fn picker_ui(
             for (bus, bus_name) in buses {
                 let bus = *bus;
                 CollapsingHeader::new(bus_name)
+                    .icon(crate::icons::disclosure)
                     .id_salt(("gpick_bus", bus))
                     .show(ui, |ui| {
                         if let Some(db) = names.dbcs.by_bus.get(&bus) {
                             for m in &db.messages {
                                 CollapsingHeader::new(format!("0x{:X}  {}", m.id, m.name))
+                                    .icon(crate::icons::disclosure)
                                     .id_salt(("gpick_msg", bus, m.id, m.extended))
                                     .show(ui, |ui| {
                                         for s in &m.signals {
@@ -1155,6 +1160,7 @@ fn picker_ui(
                             }
                         }
                         CollapsingHeader::new("Raw frames")
+                            .icon(crate::icons::disclosure)
                             .id_salt(("gpick_raw", bus))
                             .show(ui, |ui| {
                                 let ids = raw_frames(store, names, bus);
@@ -1166,6 +1172,7 @@ fn picker_ui(
                                         "0x{id:X}{}",
                                         if extended { "x" } else { "" }
                                     ))
+                                    .icon(crate::icons::disclosure)
                                     .id_salt(("gpick_rawid", bus, id, extended))
                                     .show(ui, |ui| {
                                         let mut kinds: Vec<(String, RawKind)> = (0..len.max(1))
@@ -1192,6 +1199,7 @@ fn picker_ui(
                     });
             }
             CollapsingHeader::new("User signals")
+                .icon(crate::icons::disclosure)
                 .default_open(true)
                 .show(ui, |ui| {
                     if users.is_empty() {

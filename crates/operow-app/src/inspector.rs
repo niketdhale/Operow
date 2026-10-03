@@ -390,6 +390,7 @@ impl Inspector {
                 for (i, msg) in ecu.tx.iter_mut().enumerate() {
                     let header = msg_summary(msg, &linked);
                     egui::CollapsingHeader::new(format!("{} \u{2013} {header}", msg.name))
+                        .icon(crate::icons::disclosure)
                         .id_salt(("tx_msg", sel, i))
                         .default_open(true)
                         .show(ui, |ui| {
