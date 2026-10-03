@@ -69,14 +69,13 @@ pub fn user_signal_def(u: &UserSignalDef) -> SignalDef {
 impl SignalRef {
     /// The value of this signal in `ev`, or `None` when `ev` is not a frame
     /// that carries it. `Rate` and `DeltaT` need `sample_with_prev`.
-    #[allow(dead_code)] // sampled by graph windows in step 4
+    #[cfg(test)]
     pub fn sample(&self, ev: &BusEvent, dbcs: &DbcStore, users: &[UserSignalDef]) -> Option<f64> {
         self.sample_with_prev(ev, None, dbcs, users)
     }
 
     /// Like [`SignalRef::sample`], with the previous event of the same
     /// bus/ID/format for the timing kinds.
-    #[allow(dead_code)] // sampled by graph windows in step 4
     pub fn sample_with_prev(
         &self,
         ev: &BusEvent,
@@ -144,6 +143,37 @@ impl SignalRef {
         }
     }
 
+    /// Where the signal comes from, as shown in graph signal lists.
+    pub fn source(&self) -> &'static str {
+        match self {
+            SignalRef::Dbc { .. } => "DBC",
+            SignalRef::User(_) => "User",
+            SignalRef::Raw { .. } => "Raw",
+        }
+    }
+
+    /// The decoder definition for DBC and user signals (`None` for raw
+    /// kinds and unknown signals).
+    pub fn signal_def(&self, dbcs: &DbcStore, users: &[UserSignalDef]) -> Option<SignalDef> {
+        match self {
+            SignalRef::Dbc {
+                bus,
+                msg_id,
+                extended,
+                signal_name,
+            } => dbcs
+                .by_bus
+                .get(bus)?
+                .message(*msg_id, *extended)?
+                .signals
+                .iter()
+                .find(|s| s.name == *signal_name)
+                .cloned(),
+            SignalRef::User(id) => users.iter().find(|u| u.id == *id).map(user_signal_def),
+            SignalRef::Raw { .. } => None,
+        }
+    }
+
     /// Human-readable name, e.g. `CAN1 · EngineSpeed` or `Powertrain 0x100 Byte 2`.
     pub fn label(&self, names: &NameLookup, users: &[UserSignalDef]) -> String {
         match self {
@@ -175,7 +205,6 @@ impl SignalRef {
         }
     }
 
-    #[allow(dead_code)] // shown on graph axes in step 4
     pub fn unit(&self, dbcs: &DbcStore, users: &[UserSignalDef]) -> String {
         match self {
             SignalRef::Dbc {

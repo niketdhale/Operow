@@ -9,6 +9,7 @@ use operow_engine::{Command, RunState};
 
 use crate::app::LiveBusStats;
 use crate::graph::{Graph, GraphNode, GraphViewer};
+use crate::graph_window::GraphWindow;
 use crate::icons;
 use crate::inspector::Inspector;
 use crate::store::FrameStore;
@@ -23,6 +24,7 @@ pub struct WindowViewer<'a> {
     pub graph: &'a mut Graph,
     pub inspector: &'a mut Inspector,
     pub traces: &'a mut HashMap<WindowId, Trace>,
+    pub graphs: &'a mut HashMap<WindowId, GraphWindow>,
     pub store: &'a FrameStore,
     pub names: &'a NameLookup,
     pub status_log: &'a mut Vec<String>,
@@ -218,21 +220,34 @@ impl TabViewer for WindowViewer<'_> {
     type Tab = WindowId;
 
     fn title(&mut self, tab: &mut WindowId) -> egui::WidgetText {
-        match self.traces.get(tab).and_then(|t| t.title.as_deref()) {
-            Some(t) if tab.kind == WindowKind::Trace => {
-                format!("{} \u{b7} {t}", tab.title()).into()
-            }
-            _ => tab.title().into(),
+        let title = match tab.kind {
+            WindowKind::Trace => self.traces.get(tab).and_then(|t| t.title.as_deref()),
+            WindowKind::Graph => self.graphs.get(tab).and_then(|g| g.title.as_deref()),
+            _ => None,
+        };
+        match title {
+            Some(t) => format!("{} \u{b7} {t}", tab.title()).into(),
+            None => tab.title().into(),
         }
     }
 
     fn on_tab_button(&mut self, tab: &mut WindowId, response: &egui::Response) {
-        // Double-click a Trace tab to rename it.
-        if tab.kind == WindowKind::Trace
-            && response.double_clicked()
-            && let Some(trace) = self.traces.get_mut(tab)
-        {
-            trace.begin_rename();
+        // Double-click a Trace or Graph tab to rename it.
+        if !response.double_clicked() {
+            return;
+        }
+        match tab.kind {
+            WindowKind::Trace => {
+                if let Some(trace) = self.traces.get_mut(tab) {
+                    trace.begin_rename();
+                }
+            }
+            WindowKind::Graph => {
+                if let Some(g) = self.graphs.get_mut(tab) {
+                    g.begin_rename();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -260,7 +275,12 @@ impl TabViewer for WindowViewer<'_> {
             }
             WindowKind::Log => self.log_ui(ui),
             WindowKind::Statistics => self.statistics_ui(ui),
-            WindowKind::Graph | WindowKind::Generator => {
+            WindowKind::Graph => {
+                if let Some(g) = self.graphs.get_mut(&id) {
+                    g.ui(ui, id, self.store, self.names, &self.graph.user_signals);
+                }
+            }
+            WindowKind::Generator => {
                 ui.add_space(8.0);
                 ui.heading(id.title());
                 ui.weak("Coming in a later step.");

@@ -4,6 +4,7 @@
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
+use crate::graph_window::GraphView;
 use crate::trace::TraceView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -194,19 +195,25 @@ struct SavedLayout {
     /// Per-window settings of the Trace windows (title, filters, ...).
     #[serde(default)]
     traces: Vec<(WindowId, TraceView)>,
+    /// Per-window settings of the Graph windows (signals, mode, ...).
+    #[serde(default)]
+    graphs: Vec<(WindowId, GraphView)>,
 }
 
 #[cfg(test)]
 pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
-    layout_to_json_with(dock, Vec::new())
+    layout_to_json_with(dock, Vec::new(), Vec::new())
 }
 
-/// Like [`layout_to_json`], also saving the settings of Trace windows.
+/// Like [`layout_to_json`], also saving the settings of Trace and Graph
+/// windows.
 pub fn layout_to_json_with(
     dock: &Dock,
     mut traces: Vec<(WindowId, TraceView)>,
+    mut graphs: Vec<(WindowId, GraphView)>,
 ) -> Option<serde_json::Value> {
     traces.sort_by_key(|(id, _)| (id.kind, id.n));
+    graphs.sort_by_key(|(id, _)| (id.kind, id.n));
     // Unlaid-out rects are infinite, which JSON cannot represent. Rects are
     // recomputed on the next frame, so store zeros.
     let mut dock = dock.clone();
@@ -220,6 +227,7 @@ pub fn layout_to_json_with(
         version: LAYOUT_VERSION,
         dock,
         traces,
+        graphs,
     })
     .ok()
 }
@@ -228,6 +236,13 @@ pub fn layout_to_json_with(
 pub fn traces_from_json(value: &serde_json::Value) -> Vec<(WindowId, TraceView)> {
     serde_json::from_value::<SavedLayout>(value.clone())
         .map(|s| s.traces)
+        .unwrap_or_default()
+}
+
+/// Saved Graph window settings; empty when absent or invalid.
+pub fn graphs_from_json(value: &serde_json::Value) -> Vec<(WindowId, GraphView)> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .map(|s| s.graphs)
         .unwrap_or_default()
 }
 
@@ -329,7 +344,7 @@ mod tests {
         };
         view.filters.id.enabled = true;
         view.filters.id.text = "100-2FF".into();
-        let json = layout_to_json_with(&dock, vec![(id, view)]).unwrap();
+        let json = layout_to_json_with(&dock, vec![(id, view)], Vec::new()).unwrap();
         let back = traces_from_json(&json);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, id);
@@ -340,6 +355,59 @@ mod tests {
         let old = layout_to_json(&dock).unwrap();
         assert!(traces_from_json(&old).is_empty());
         assert!(traces_from_json(&serde_json::json!("x")).is_empty());
+    }
+
+    #[test]
+    fn graph_config_persists_in_workspace_json() {
+        use crate::graph_window::{GraphLayout, GraphMode, PlotSignal, SeriesStyle, YAxis};
+        use crate::signals::{RawKind, SignalRef};
+        let mut dock = default_layout();
+        let id = open_or_focus(&mut dock, WindowKind::Graph, true);
+        let view = GraphView {
+            title: Some("Engine".into()),
+            signals: vec![
+                PlotSignal {
+                    sig: SignalRef::Dbc {
+                        bus: operow_core::BusId(1),
+                        msg_id: 0x100,
+                        extended: false,
+                        signal_name: "EngineSpeed".into(),
+                    },
+                    color: [10, 20, 30],
+                    axis: YAxis::Y2,
+                    style: SeriesStyle::Step,
+                    visible: false,
+                },
+                PlotSignal {
+                    sig: SignalRef::Raw {
+                        bus: operow_core::BusId(1),
+                        id: 0x200,
+                        extended: true,
+                        kind: RawKind::Byte(3),
+                    },
+                    color: [1, 2, 3],
+                    axis: YAxis::Y1,
+                    style: SeriesStyle::Points,
+                    visible: true,
+                },
+            ],
+            mode: GraphMode::Paused,
+            window_s: 30,
+            layout: GraphLayout::Stacked,
+        };
+        let topo = Topology {
+            workspace: layout_to_json_with(&dock, Vec::new(), vec![(id, view.clone())]),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let ws = back.workspace.as_ref().unwrap();
+        let graphs = graphs_from_json(ws);
+        assert_eq!(graphs, vec![(id, view)]);
+        assert!(layout_from_json(ws).is_some());
+        // Layouts saved before graph settings existed still load.
+        let old = layout_to_json(&dock).unwrap();
+        assert!(graphs_from_json(&old).is_empty());
+        assert!(graphs_from_json(&serde_json::json!("x")).is_empty());
     }
 
     #[test]

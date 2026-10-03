@@ -7,6 +7,7 @@ use operow_core::{NodeKind, UserSignalDef, UserSignalId};
 use crate::dbcs::DbcStore;
 use crate::graph::{Graph, GraphNode};
 use crate::icons;
+use crate::signals::SignalRef;
 
 /// What the user did in the tree this frame.
 #[derive(Default)]
@@ -15,8 +16,8 @@ pub struct TreeOutput {
     pub picked: Option<FlowId>,
     /// "+ New signal..." was clicked.
     pub new_signal: bool,
-    /// "Add to graph" was chosen for a user signal.
-    pub add_signal_to_graph: Option<UserSignalId>,
+    /// "Add to graph" was chosen for a signal.
+    pub add_signal_to_graph: Option<SignalRef>,
     pub delete_signal: Option<UserSignalId>,
 }
 
@@ -131,7 +132,29 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                                                 } else {
                                                     format!("  [{}]", s.unit)
                                                 };
-                                                ui.label(format!("{}{unit}", s.name));
+                                                let sig = SignalRef::Dbc {
+                                                    bus: d.bus,
+                                                    msg_id: m.id,
+                                                    extended: m.extended,
+                                                    signal_name: s.name.clone(),
+                                                };
+                                                let drag_id = egui::Id::new((
+                                                    "tree_sig", i, m.id, m.extended, &s.name,
+                                                ));
+                                                let resp = ui
+                                                    .dnd_drag_source(drag_id, sig.clone(), |ui| {
+                                                        ui.label(format!("{}{unit}", s.name))
+                                                    })
+                                                    .response
+                                                    .on_hover_text(
+                                                        "Drag onto a graph window to plot",
+                                                    );
+                                                resp.context_menu(|ui| {
+                                                    if ui.button("Add to graph").clicked() {
+                                                        out.add_signal_to_graph = Some(sig);
+                                                        ui.close();
+                                                    }
+                                                });
                                             }
                                         });
                                 }
@@ -147,11 +170,16 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                     }
                     for u in &graph.user_signals {
                         let resp = ui
-                            .selectable_label(false, user_signal_label(u))
+                            .dnd_drag_source(
+                                egui::Id::new(("tree_user_sig", u.id)),
+                                SignalRef::User(u.id),
+                                |ui| ui.selectable_label(false, user_signal_label(u)),
+                            )
+                            .response
                             .on_hover_text(user_signal_tooltip(u, &topo));
                         resp.context_menu(|ui| {
                             if ui.button("Add to graph").clicked() {
-                                out.add_signal_to_graph = Some(u.id);
+                                out.add_signal_to_graph = Some(SignalRef::User(u.id));
                                 ui.close();
                             }
                             if ui.button("Delete").clicked() {

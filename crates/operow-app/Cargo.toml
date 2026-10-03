@@ -21,3 +21,4 @@ operow-engine = { path = "../operow-engine" }
 operow-dbc = { path = "../operow-dbc" }
 egui_dock = { version = "0.18", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
+egui_plot = "0.34"

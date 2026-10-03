@@ -9,6 +9,7 @@ use egui_flow::PulseStyle;
 
 use crate::dbcs;
 use crate::graph::{Graph, PulseDir, PulseSpec, pulses_for_events};
+use crate::graph_window::{GraphWindow, YAxis};
 use crate::icons;
 use crate::inspector::Inspector;
 use crate::project_tree;
@@ -58,6 +59,9 @@ pub struct StartupOptions {
     pub demo_filters: bool,
     /// `--open-new-signal`: open the "New user signal" dialog.
     pub open_new_signal: bool,
+    /// `--demo-graph`: open a Graph with EngineSpeed, Throttle (Y2) and
+    /// Running and focus it.
+    pub demo_graph: bool,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -80,6 +84,10 @@ pub struct OperowApp {
     layout_preset: Option<LayoutPreset>,
     /// Per-instance state of every open Trace window.
     traces: HashMap<WindowId, Trace>,
+    /// Per-instance state of every open Graph window.
+    graphs: HashMap<WindowId, GraphWindow>,
+    /// The Graph window that was focused last; "Add to graph" targets it.
+    last_graph: Option<WindowId>,
     /// Every bus event, shared by all windows.
     store: FrameStore,
     settings: AppSettings,
@@ -136,6 +144,8 @@ impl OperowApp {
             dock: workspace::default_layout(),
             layout_preset: Some(LayoutPreset::Default),
             traces: HashMap::new(),
+            graphs: HashMap::new(),
+            last_graph: None,
             store: FrameStore::new(settings.frame_buffer_size),
             settings,
             show_settings: false,
@@ -174,14 +184,25 @@ impl OperowApp {
         for id in open.iter().filter(|w| w.kind == WindowKind::Trace) {
             self.traces.entry(*id).or_default();
         }
+        self.graphs.retain(|id, _| open.contains(id));
+        for id in open.iter().filter(|w| w.kind == WindowKind::Graph) {
+            self.graphs.entry(*id).or_default();
+        }
+        if self.last_graph.is_some_and(|g| !open.contains(&g)) {
+            self.last_graph = None;
+        }
         self.store.set_capacity(self.settings.frame_buffer_size);
         self.store
             .set_reject_when_full(self.settings.when_full == WhenFull::StopMeasurement);
     }
 
-    fn open_window(&mut self, kind: WindowKind, force_new: bool) {
-        workspace::open_or_focus(&mut self.dock, kind, force_new);
+    fn open_window(&mut self, kind: WindowKind, force_new: bool) -> WindowId {
+        let id = workspace::open_or_focus(&mut self.dock, kind, force_new);
         self.layout_preset = None;
+        if kind == WindowKind::Graph {
+            self.last_graph = Some(id);
+        }
+        id
     }
 
     fn set_layout(&mut self, preset: LayoutPreset) {
@@ -196,11 +217,34 @@ impl OperowApp {
         }
     }
 
-    /// Hook for step 4: put `sig` on a graph window.
+    /// The Graph window "Add to graph" targets: the one focused last, else
+    /// the newest open one, else a new "Graph 1".
+    fn target_graph(&mut self) -> WindowId {
+        if let Some(id) = self.last_graph {
+            return id;
+        }
+        let newest = workspace::open_windows(&self.dock)
+            .into_iter()
+            .filter(|w| w.kind == WindowKind::Graph)
+            .max_by_key(|w| w.n);
+        let id = match newest {
+            Some(id) => id,
+            None => self.open_window(WindowKind::Graph, true),
+        };
+        self.sync_instances();
+        id
+    }
+
+    /// Put `sig` on a graph window and bring that window to the front.
     fn on_add_signal_to_graph(&mut self, sig: SignalRef) {
-        // TODO(step 4): create or pick a Graph window and add the signal.
+        let id = self.target_graph();
         let label = sig.label(&self.names, &self.graph.user_signals);
-        self.log(format!("add to graph: {label} (graph wiring comes next)"));
+        if let Some(g) = self.graphs.get_mut(&id) {
+            g.add_signal(sig, &self.names.dbcs, &self.graph.user_signals);
+        }
+        workspace::focus(&mut self.dock, id);
+        self.last_graph = Some(id);
+        self.log(format!("added {label} to {}", id.title()));
     }
 
     fn handle_trace_actions(&mut self, actions: Vec<TraceAction>) {
@@ -314,6 +358,9 @@ impl OperowApp {
                 d.unit = "rpm".into();
             }
         }
+        if opts.demo_graph {
+            self.demo_graph();
+        }
         for t in self.traces.values_mut() {
             if opts.fixed_trace {
                 t.mode = TraceMode::Fixed;
@@ -329,6 +376,38 @@ impl OperowApp {
         if let Some(name) = opts.select.as_deref() {
             self.select_by_name(name);
         }
+    }
+
+    /// `--demo-graph`: EngineSpeed on Y1, Throttle on Y2 and Running as a
+    /// step, on a new focused Graph window (needs `dbc_demo.operow.json`).
+    fn demo_graph(&mut self) {
+        let id = self.open_window(WindowKind::Graph, true);
+        self.sync_instances();
+        let bus = self
+            .names
+            .bus_names
+            .iter()
+            .find(|(_, n)| n.as_str() == "Powertrain")
+            .map(|(b, _)| *b)
+            .or_else(|| self.names.bus_names.keys().next().copied());
+        let (Some(bus), Some(g)) = (bus, self.graphs.get_mut(&id)) else {
+            return;
+        };
+        for name in ["EngineSpeed", "Throttle", "Running"] {
+            g.add_signal(
+                SignalRef::Dbc {
+                    bus,
+                    msg_id: 0x100,
+                    extended: false,
+                    signal_name: name.into(),
+                },
+                &self.names.dbcs,
+                &self.graph.user_signals,
+            );
+        }
+        g.window_s = 5;
+        g.set_axis(1, YAxis::Y2);
+        workspace::focus(&mut self.dock, id);
     }
 
     /// Replace the graph with `topo` loaded from `path` and load the
@@ -348,11 +427,19 @@ impl OperowApp {
             Some(LayoutPreset::Default)
         };
         self.dock = saved.unwrap_or_else(workspace::default_layout);
+        // Graphs refer to the previous project's buses; start from scratch.
+        self.graphs.clear();
+        self.last_graph = None;
         self.sync_instances();
         if let Some(ws) = &topo.workspace {
             for (id, view) in workspace::traces_from_json(ws) {
                 if let Some(t) = self.traces.get_mut(&id) {
                     t.apply_view(view);
+                }
+            }
+            for (id, view) in workspace::graphs_from_json(ws) {
+                if let Some(g) = self.graphs.get_mut(&id) {
+                    g.apply_view(view);
                 }
             }
         }
@@ -616,6 +703,8 @@ impl OperowApp {
         self.names.rebuild(&self.graph.to_topology());
         self.names.dbcs = Default::default();
         self.project_path = None;
+        self.graphs.clear();
+        self.last_graph = None;
         self.store.clear();
     }
 
@@ -658,7 +747,8 @@ impl OperowApp {
             }
             let mut topo = self.graph.to_topology();
             let views = self.traces.iter().map(|(id, t)| (*id, t.view())).collect();
-            topo.workspace = workspace::layout_to_json_with(&self.dock, views);
+            let graphs = self.graphs.iter().map(|(id, g)| (*id, g.view())).collect();
+            topo.workspace = workspace::layout_to_json_with(&self.dock, views, graphs);
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
                 self.last_error = Some(format!("write error: {e}"));
@@ -1178,6 +1268,18 @@ impl eframe::App for OperowApp {
         for t in self.traces.values_mut() {
             t.update(&self.store, &self.names, now);
         }
+        let mut graphs_pending = false;
+        for g in self.graphs.values_mut() {
+            graphs_pending |= g.update(&self.store, &self.names.dbcs, &self.graph.user_signals);
+        }
+        if graphs_pending {
+            ctx.request_repaint();
+        }
+        if let Some((_, tab)) = self.dock.find_active_focused()
+            && tab.kind == WindowKind::Graph
+        {
+            self.last_graph = Some(*tab);
+        }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
@@ -1205,8 +1307,8 @@ impl eframe::App for OperowApp {
         if tree.new_signal {
             self.open_new_signal_dialog();
         }
-        if let Some(id) = tree.add_signal_to_graph {
-            self.on_add_signal_to_graph(SignalRef::User(id));
+        if let Some(sig) = tree.add_signal_to_graph {
+            self.on_add_signal_to_graph(sig);
         }
         if let Some(id) = tree.delete_signal {
             self.graph.user_signals.retain(|u| u.id != id);
@@ -1219,6 +1321,7 @@ impl eframe::App for OperowApp {
                     graph: &mut self.graph,
                     inspector: &mut self.inspector,
                     traces: &mut self.traces,
+                    graphs: &mut self.graphs,
                     store: &self.store,
                     names: &self.names,
                     status_log: &mut self.status_log,

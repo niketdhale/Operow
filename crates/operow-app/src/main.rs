@@ -7,6 +7,7 @@ mod app;
 mod dbcs;
 mod filters;
 mod graph;
+mod graph_window;
 mod icons;
 mod inspector;
 mod project_tree;
@@ -42,6 +43,7 @@ fn main() -> eframe::Result<()> {
             "--layout-demo" => opts.layout_demo = true,
             "--demo-filters" => opts.demo_filters = true,
             "--open-new-signal" => opts.open_new_signal = true,
+            "--demo-graph" => opts.demo_graph = true,
             _ => {}
         }
     }
