@@ -52,6 +52,7 @@ fn main() -> eframe::Result<()> {
             "--demo-generator" => opts.demo_generator = true,
             "--open-log" => opts.open_log = args.next().map(PathBuf::from),
             "--demo-logging" => opts.demo_logging = true,
+            "--demo-errors" => opts.demo_errors = true,
             "--network-view" => {
                 opts.network_view = args
                     .next()

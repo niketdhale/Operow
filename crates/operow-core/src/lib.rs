@@ -7,7 +7,7 @@ mod idexpr;
 mod ids;
 mod topology;
 
-pub use event::{BusEvent, Direction};
+pub use event::{BusEvent, BusEventKind, CanErrorKind, Direction, NodeErrorState};
 pub use frame::{CanFrame, FrameError, dlc_to_len, is_valid_fd_len, len_to_dlc};
 pub use idexpr::IdExpr;
 pub use ids::{BusId, NodeId, Timestamp};

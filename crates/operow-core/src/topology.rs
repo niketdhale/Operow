@@ -158,6 +158,13 @@ pub struct CanBusConfig {
     /// when `fd_enabled` is `false`.
     #[serde(default = "default_data_bitrate")]
     pub data_bitrate: u32,
+    /// Opt-in ACK modelling. When `true`, a frame transmitted while no other
+    /// node on the bus is online (linked and not bus-off) gets no
+    /// acknowledgement: the transmitter sees an ACK error, its TEC rises and
+    /// the frame is retransmitted. When `false` (the default) a lone node
+    /// transmits happily, as in the pre-error-model simulator.
+    #[serde(default)]
+    pub simulate_ack: bool,
 }
 
 /// Attaches a node to a bus.

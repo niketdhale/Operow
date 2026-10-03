@@ -83,6 +83,9 @@ impl SignalRef {
         dbcs: &DbcStore,
         users: &[UserSignalDef],
     ) -> Option<f64> {
+        if ev.is_error() {
+            return None;
+        }
         let f = &ev.frame;
         let data = f.payload();
         match self {
@@ -250,6 +253,7 @@ mod tests {
             frame_uid: 0,
             hop: 0,
             frame: CanFrame::new(id, false, data).unwrap(),
+            kind: Default::default(),
         }
     }
 

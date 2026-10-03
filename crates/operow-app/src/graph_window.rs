@@ -204,6 +204,7 @@ impl Series {
                 self.pts.push_back([t, v]);
             }
             if let Some((bus, id, ext)) = timing
+                && !ev.is_error()
                 && ev.bus == bus
                 && ev.frame.id == id
                 && ev.frame.extended == ext
@@ -1230,7 +1231,7 @@ fn raw_frames(
     }
     let from = store.next_seq().saturating_sub(20_000);
     for (_, ev) in store.iter_from(from) {
-        if ev.bus == bus {
+        if ev.bus == bus && !ev.is_error() {
             let e = ids.entry((ev.frame.id, ev.frame.extended)).or_default();
             *e = (*e).max(ev.frame.payload().len());
         }
@@ -1257,6 +1258,7 @@ mod tests {
             frame_uid: 0,
             hop: 0,
             frame: CanFrame::new(0x100, false, &[b0, 0]).unwrap(),
+            kind: Default::default(),
         }
     }
 

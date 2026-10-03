@@ -45,6 +45,14 @@ impl AppTheme {
         }
     }
 
+    /// Colour of CAN error frames.
+    pub fn error_color(self) -> Color32 {
+        match self {
+            AppTheme::Light => Color32::from_rgb(0xd0, 0x30, 0x30),
+            AppTheme::Dark => Color32::from_rgb(0xff, 0x6b, 0x6b),
+        }
+    }
+
     /// Accent for gateway nodes.
     pub fn gateway_color(self) -> Color32 {
         match self {

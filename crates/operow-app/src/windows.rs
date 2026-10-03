@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use egui_dock::TabViewer;
 use egui_flow::{Flow, FlowOptions};
-use operow_core::BusId;
-use operow_engine::{Command, RunState};
+use operow_core::{BusId, CanErrorKind, NodeErrorState};
+use operow_engine::{Command, NodeErrorInfo, RunState};
 
 use crate::app::LiveBusStats;
 use crate::generator_window::GeneratorWindow;
@@ -32,6 +32,7 @@ pub struct WindowViewer<'a> {
     pub names: &'a NameLookup,
     pub status_log: &'a mut Vec<String>,
     pub bus_stats: &'a HashMap<BusId, LiveBusStats>,
+    pub node_states: &'a [NodeErrorInfo],
     pub run_state: RunState,
     pub theme: AppTheme,
     pub menu_pos: &'a mut Option<egui::Pos2>,
@@ -245,31 +246,90 @@ impl WindowViewer<'_> {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 egui::Grid::new("bus_stats_grid")
-                    .num_columns(5)
+                    .num_columns(6)
                     .spacing([16.0, 6.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        for h in ["Bus", "Load", "Frames/s", "Total", "Errors"] {
-                            ui.strong(h);
-                        }
+                        ui.strong("Bus");
+                        ui.strong("Load");
+                        ui.strong("Frames/s");
+                        ui.strong("Total");
+                        ui.strong("CAN errors")
+                            .on_hover_text("Error frames on the bus; hover a value for the kinds");
+                        ui.strong("Dropped").on_hover_text(
+                            "Frames that were never sent: CAN FD on a classic bus, or from a bus-off node",
+                        );
                         ui.end_row();
                         for (name, s) in rows {
                             ui.label(name);
                             ui.add(
                                 egui::ProgressBar::new((s.load_pct / 100.0).clamp(0.0, 1.0) as f32)
-                                    .desired_width(180.0)
+                                    .desired_width(110.0)
                                     .text(format!("{:.1}%", s.load_pct)),
                             );
                             ui.label(format!("{:.0}", s.frames_per_s));
                             ui.label(s.total_frames.to_string());
-                            if s.error_frames > 0 {
-                                ui.colored_label(ERROR_RED, s.error_frames.to_string());
+                            let errors = s.can_errors.total();
+                            if errors > 0 {
+                                let kinds: Vec<String> = CanErrorKind::ALL
+                                    .iter()
+                                    .filter(|k| s.can_errors.get(**k) > 0)
+                                    .map(|k| format!("{}: {}", k.label(), s.can_errors.get(*k)))
+                                    .collect();
+                                ui.colored_label(ERROR_RED, errors.to_string())
+                                    .on_hover_text(kinds.join("\n"));
+                            } else {
+                                ui.label("0");
+                            }
+                            let dropped = s.error_frames + s.dropped_bus_off;
+                            if dropped > 0 {
+                                ui.colored_label(ERROR_RED, dropped.to_string());
                             } else {
                                 ui.label("0");
                             }
                             ui.end_row();
                         }
                     });
+                if !self.node_states.is_empty() {
+                    ui.add_space(12.0);
+                    ui.strong("Nodes");
+                    self.node_states_ui(ui);
+                }
+            });
+    }
+
+    /// Per-node fault-confinement table: state and TEC/REC on every bus.
+    fn node_states_ui(&self, ui: &mut egui::Ui) {
+        let mut rows: Vec<(String, String, &NodeErrorInfo)> = self
+            .node_states
+            .iter()
+            .map(|n| (self.names.node_name(n.node), self.names.bus_name(n.bus), n))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        egui::Grid::new("node_state_grid")
+            .num_columns(5)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for h in ["Node", "Bus", "State", "TEC", "REC"] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (node, bus, n) in rows {
+                    ui.label(node);
+                    ui.label(bus);
+                    let text = n.state.label();
+                    match n.state {
+                        NodeErrorState::ErrorActive => ui.label(text),
+                        NodeErrorState::ErrorPassive => {
+                            ui.colored_label(egui::Color32::from_rgb(0xd0, 0x90, 0x10), text)
+                        }
+                        NodeErrorState::BusOff => ui.colored_label(ERROR_RED, text),
+                    };
+                    ui.label(n.tec.to_string());
+                    ui.label(n.rec.to_string());
+                    ui.end_row();
+                }
             });
     }
 }

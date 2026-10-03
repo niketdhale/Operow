@@ -137,6 +137,7 @@ impl Database {
                     bitrate,
                     fd_enabled: false,
                     data_bitrate: 2_000_000,
+                    simulate_ack: false,
                 });
                 (id, topo.buses.len() - 1)
             }
@@ -236,6 +237,7 @@ impl Database {
                 bitrate,
                 fd_enabled: self.messages.iter().any(|m| m.dlc > 8),
                 data_bitrate: 2_000_000,
+                simulate_ack: false,
             }],
             links,
             databases: Vec::new(),

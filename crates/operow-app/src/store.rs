@@ -136,6 +136,7 @@ mod tests {
             frame_uid: 0,
             hop: 0,
             frame: CanFrame::new(id, false, &[1, 2, 3]).unwrap(),
+            kind: Default::default(),
         }
     }
 

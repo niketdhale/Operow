@@ -158,6 +158,19 @@ pub fn generator_demo_layout(generator: WindowId) -> Dock {
     dock
 }
 
+/// Network on top; Trace and Statistics side by side below (`--demo-errors`).
+pub fn errors_demo_layout() -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [_, bottom] = tree.split_below(
+        NodeIndex::root(),
+        0.35,
+        vec![w(WindowKind::Trace), w(WindowKind::Log)],
+    );
+    tree.split_right(bottom, 0.55, vec![w(WindowKind::Statistics)]);
+    dock
+}
+
 pub fn default_layout() -> Dock {
     LayoutPreset::Default.build()
 }

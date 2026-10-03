@@ -285,6 +285,7 @@ impl Graph {
                 bitrate: 500_000,
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
+                simulate_ack: false,
             }),
         );
         self.editor.commit(&self.state);
@@ -1367,6 +1368,7 @@ mod tests {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         };
         assert_eq!(
             bus_bar_label(&b, Some(12.34)),
@@ -1453,6 +1455,8 @@ pub struct PulseKind {
     pub fd: bool,
     /// Sent by a Generator window (a virtual sender with no wire).
     pub generator: bool,
+    /// A CAN error frame: only the sender's wire pulses, in red.
+    pub error: bool,
 }
 
 /// One animated hop of a frame along an ECU-bus wire.
@@ -1494,6 +1498,7 @@ pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> 
             forwarded: ev.hop > 0,
             fd: ev.frame.fd,
             generator,
+            error: ev.is_error(),
         };
         let base = 2 * ev.hop.min(MAX_DELAYED_HOPS);
         let spec = |node, dir, legs| PulseSpec {
@@ -1511,6 +1516,9 @@ pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> 
             PulseDir::ToBus,
             if generator { 0 } else { base },
         ));
+        if ev.is_error() {
+            continue;
+        }
         for l in links
             .iter()
             .filter(|l| l.bus == ev.bus && l.node != ev.sender)
@@ -1546,6 +1554,7 @@ mod pulse_tests {
             frame_uid: 1,
             hop,
             frame,
+            kind: Default::default(),
         }
     }
 
@@ -1564,6 +1573,7 @@ mod pulse_tests {
             forwarded,
             fd,
             generator,
+            error: false,
         }
     }
 

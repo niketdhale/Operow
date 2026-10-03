@@ -2,8 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 use operow_core::{
-    BusEvent, BusId, CanBusConfig, CanFrame, Direction, NodeId, NodeKind, Timestamp, Topology,
-    TopologyError,
+    BusEvent, BusEventKind, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, NodeErrorState,
+    NodeId, NodeKind, Timestamp, Topology, TopologyError,
 };
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
@@ -37,6 +37,155 @@ impl GeneratorId {
     }
 }
 
+// --- CAN error model -------------------------------------------------------
+//
+// Fault confinement follows ISO 11898-1 in a simplified form, tracked per
+// (node, bus):
+//
+// - A transmitter whose frame is corrupted adds 8 to its TEC. Exception: an
+//   ACK error seen by an error-passive transmitter leaves the TEC alone, so a
+//   lone node on a `simulate_ack` bus ends up error passive but never bus-off.
+// - Every receiver that is online adds 1 to its REC when it sees an error
+//   frame. The "+8 when a receiver detects a dominant bit after its own error
+//   flag" rule is not modelled.
+// - A successful transmission lowers the TEC by 1 (minimum 0). A successful
+//   reception lowers the REC by 1 (minimum 0), or sets it to 120 when it was
+//   above 127.
+// - Error passive when TEC > 127 or REC > 127 (back to error active once both
+//   are <= 127); bus-off when TEC > 255.
+// - A bus-off node drops everything it would send, receives nothing and, after
+//   128 * 11 = 1408 bit times at the nominal bitrate, comes back error active
+//   with both counters at 0 (the "bus must be idle" condition is not checked).
+// - A frame hit by an error occupies the bus until the error is detected, then
+//   for an error frame of 20 bit times (6 flag + up to 6 superposed flag + 8
+//   delimiter) when the transmitter is error active or 14 (6 + 8, no
+//   superposition) when it is error passive, then a 3-bit intermission. The
+//   frame is queued again and re-arbitrates, as real CAN does.
+// - An error-passive node waits an extra 8 bit times ("suspend transmission")
+//   after each of its own transmissions, failed or successful, before it may
+//   start the next one.
+
+/// Counter limit above which a node becomes error passive.
+const ERROR_PASSIVE_LIMIT: u16 = 127;
+/// Counter limit above which a transmitter goes bus-off.
+const BUS_OFF_LIMIT: u16 = 255;
+/// TEC increase for a transmit error.
+const TEC_ERROR_STEP: u16 = 8;
+/// REC value after a successful reception while it was above 127.
+const REC_RECOVERED: u16 = 120;
+/// Bit times a node stays bus-off (128 occurrences of 11 recessive bits).
+const BUS_OFF_RECOVERY_BITS: u64 = 128 * 11;
+/// Bit times of an error frame sent by an error-active node.
+const ACTIVE_ERROR_FRAME_BITS: u64 = 6 + 6 + 8;
+/// Bit times of an error frame sent by an error-passive node.
+const PASSIVE_ERROR_FRAME_BITS: u64 = 6 + 8;
+/// Bit times of intermission after an error frame.
+const INTERMISSION_BITS: u64 = 3;
+/// Extra bit times an error-passive node waits after its own transmission.
+const SUSPEND_BITS: u64 = 8;
+/// Bit times between the end of a frame's ACK delimiter region and its end
+/// (EOF 7 + IFS 3); ACK and CRC errors are flagged that long before the end.
+const FRAME_TAIL_BITS: u64 = 10;
+/// Seed of the injection random generator unless [`Simulation::set_seed`] is
+/// called.
+const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Small deterministic xorshift64* generator for probabilistic injection.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(if seed == 0 { DEFAULT_SEED } else { seed })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in `[0, 1)`.
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// How often matching transmissions are corrupted by an [`InjectSpec`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InjectMode {
+    /// Corrupt the next `n` matching transmissions (retransmissions count).
+    Count(u32),
+    /// Corrupt every `n`th matching transmission (`n == 0` acts like 1).
+    EveryNth(u32),
+    /// Corrupt each matching transmission with probability `p` (0.0..=1.0),
+    /// drawn from the simulation's seeded generator.
+    Probability(f64),
+}
+
+/// A fault-injection rule for [`Simulation::inject_errors`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InjectSpec {
+    pub bus: BusId,
+    /// Only transmissions by this node match; `None` matches any sender.
+    pub node: Option<NodeId>,
+    /// Only frames with this `(id, extended)` match; `None` matches any.
+    pub id: Option<(u32, bool)>,
+    pub kind: CanErrorKind,
+    pub mode: InjectMode,
+    /// Upper bound on the number of corruptions; the rule is removed when it
+    /// reaches 0. `None` is unbounded, except that `Count(n)` is always
+    /// bounded by `n`.
+    pub remaining: Option<u32>,
+}
+
+struct ActiveInject {
+    spec: InjectSpec,
+    /// Matching transmissions seen so far (for `EveryNth`).
+    matched: u64,
+    left: Option<u32>,
+}
+
+/// Fault-confinement counters and state of one node on one bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeErrorInfo {
+    pub node: NodeId,
+    pub bus: BusId,
+    pub state: NodeErrorState,
+    pub tec: u16,
+    pub rec: u16,
+}
+
+#[derive(Default, Clone, Copy)]
+struct NodeErr {
+    tec: u16,
+    rec: u16,
+    state: NodeErrorState,
+    /// The node may not start a transmission before this time.
+    suspend_until: u64,
+    /// When a bus-off node comes back.
+    recover_at: u64,
+}
+
+impl NodeErr {
+    /// Recompute the state from the counters (bus-off is left only through
+    /// recovery).
+    fn refresh(&mut self) {
+        if self.state == NodeErrorState::BusOff {
+            return;
+        }
+        self.state = if self.tec > BUS_OFF_LIMIT {
+            NodeErrorState::BusOff
+        } else if self.tec > ERROR_PASSIVE_LIMIT || self.rec > ERROR_PASSIVE_LIMIT {
+            NodeErrorState::ErrorPassive
+        } else {
+            NodeErrorState::ErrorActive
+        };
+    }
+}
+
 /// Errors returned by [`Simulation::new`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SimError {
@@ -48,14 +197,56 @@ pub enum SimError {
     Replay { node: String, msg: String },
 }
 
+/// Number of CAN error frames per [`CanErrorKind`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CanErrorCounts {
+    pub bit: u64,
+    pub stuff: u64,
+    pub crc: u64,
+    pub form: u64,
+    pub ack: u64,
+}
+
+impl CanErrorCounts {
+    pub fn get(&self, kind: CanErrorKind) -> u64 {
+        match kind {
+            CanErrorKind::Bit => self.bit,
+            CanErrorKind::Stuff => self.stuff,
+            CanErrorKind::Crc => self.crc,
+            CanErrorKind::Form => self.form,
+            CanErrorKind::Ack => self.ack,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.bit + self.stuff + self.crc + self.form + self.ack
+    }
+
+    fn add(&mut self, kind: CanErrorKind) {
+        match kind {
+            CanErrorKind::Bit => self.bit += 1,
+            CanErrorKind::Stuff => self.stuff += 1,
+            CanErrorKind::Crc => self.crc += 1,
+            CanErrorKind::Form => self.form += 1,
+            CanErrorKind::Ack => self.ack += 1,
+        }
+    }
+}
+
 /// Per-bus utilization counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BusStats {
     pub frames: u64,
     pub busy_ns: u64,
     /// Frames that could not be transmitted (currently: CAN FD frames sent
-    /// onto a bus that does not have `fd_enabled` set).
+    /// onto a bus that does not have `fd_enabled` set). CAN error frames are
+    /// counted separately in [`BusStats::can_errors`].
     pub error_frames: u64,
+    /// CAN error frames (bit, stuff, CRC, form, ACK) seen on the bus.
+    pub can_errors: CanErrorCounts,
+    /// Frames dropped because their sender was bus-off (new ones, queued
+    /// ones, and one aborted or abandoned in flight).
+    pub dropped_bus_off: u64,
     /// Forwarded frames dropped because they exceeded [`MAX_HOPS`].
     pub routing_drops: u64,
 }
@@ -90,6 +281,28 @@ enum EventKind {
         meta: FrameMeta,
         frame: CanFrame,
         duration_ns: u64,
+    },
+    /// An error is detected `elapsed_ns` into a transmission: the error event
+    /// is emitted and the counters change.
+    TxError {
+        bus: BusId,
+        meta: FrameMeta,
+        frame: CanFrame,
+        error: CanErrorKind,
+        elapsed_ns: u64,
+    },
+    /// The error frame and intermission are over: the bus is free and the
+    /// frame is retransmitted.
+    ErrorEnd {
+        bus: BusId,
+        meta: FrameMeta,
+        frame: CanFrame,
+        busy_ns: u64,
+    },
+    /// A bus-off node may rejoin the bus (stale unless `recover_at` matches).
+    Recover {
+        node: NodeId,
+        bus: BusId,
     },
 }
 
@@ -154,6 +367,9 @@ pub struct Simulation {
     all_buses: Vec<BusId>,
     gen_rows: HashMap<(GeneratorId, u32), GenCyclic>,
     gen_chain: u64,
+    node_err: HashMap<(NodeId, BusId), NodeErr>,
+    injections: Vec<ActiveInject>,
+    rng: Rng,
 }
 
 impl Simulation {
@@ -220,6 +436,9 @@ impl Simulation {
             all_buses,
             gen_rows: HashMap::new(),
             gen_chain: 0,
+            node_err: HashMap::new(),
+            injections: Vec::new(),
+            rng: Rng::new(DEFAULT_SEED),
         })
     }
 
@@ -253,6 +472,218 @@ impl Simulation {
     /// Per-bus statistics collected so far.
     pub fn stats(&self) -> &HashMap<BusId, BusStats> {
         &self.stats
+    }
+
+    /// Reseed the generator behind [`InjectMode::Probability`], for
+    /// reproducible runs.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
+    }
+
+    /// Add a fault-injection rule. Matching transmissions are corrupted: an
+    /// error event is emitted, the counters change and the frame is
+    /// retransmitted. When several rules match, the first one that fires
+    /// wins.
+    pub fn inject_errors(&mut self, spec: InjectSpec) {
+        let left = match spec.mode {
+            InjectMode::Count(n) => Some(spec.remaining.map_or(n, |r| r.min(n))),
+            _ => spec.remaining,
+        };
+        if left == Some(0) {
+            return;
+        }
+        self.injections.push(ActiveInject {
+            spec,
+            matched: 0,
+            left,
+        });
+    }
+
+    /// Remove every injection rule.
+    pub fn clear_injections(&mut self) {
+        self.injections.clear();
+    }
+
+    /// Fault-confinement state, TEC and REC of `node` on `bus`.
+    pub fn node_state(&self, node: NodeId, bus: BusId) -> (NodeErrorState, u16, u16) {
+        self.node_err
+            .get(&(node, bus))
+            .map_or((NodeErrorState::ErrorActive, 0, 0), |e| {
+                (e.state, e.tec, e.rec)
+            })
+    }
+
+    /// State of every (node, bus) link of the topology, ordered by node and
+    /// bus. Generators are not included.
+    pub fn node_states(&self) -> Vec<NodeErrorInfo> {
+        let mut v: Vec<NodeErrorInfo> = self
+            .node_buses
+            .iter()
+            .flat_map(|(node, buses)| buses.iter().map(move |bus| (*node, *bus)))
+            .map(|(node, bus)| {
+                let (state, tec, rec) = self.node_state(node, bus);
+                NodeErrorInfo {
+                    node,
+                    bus,
+                    state,
+                    tec,
+                    rec,
+                }
+            })
+            .collect();
+        v.sort_by_key(|i| (i.node, i.bus));
+        v
+    }
+
+    /// Force `node` bus-off on `bus` now; it recovers after the usual
+    /// 1408 bit times. Does nothing for a node that is not linked to `bus`
+    /// (generators count as linked to every bus) or is already bus-off.
+    pub fn force_bus_off(&mut self, node: NodeId, bus: BusId) {
+        self.ensure_started();
+        let linked = GeneratorId::from_node(node).is_some()
+            || self.node_buses.get(&node).is_some_and(|b| b.contains(&bus));
+        if !linked || self.is_bus_off(node, bus) {
+            return;
+        }
+        let e = self.node_err.entry((node, bus)).or_default();
+        e.tec = BUS_OFF_LIMIT + 1;
+        e.state = NodeErrorState::BusOff;
+        self.enter_bus_off(node, bus);
+    }
+
+    fn is_bus_off(&self, node: NodeId, bus: BusId) -> bool {
+        self.node_err
+            .get(&(node, bus))
+            .is_some_and(|e| e.state == NodeErrorState::BusOff)
+    }
+
+    fn err_state(&self, node: NodeId, bus: BusId) -> NodeErrorState {
+        self.node_state(node, bus).0
+    }
+
+    /// Duration of one nominal bit on `bus`.
+    fn bit_ns(&self, bus: BusId) -> u64 {
+        let rate = self.bus_configs.get(&bus).map_or(500_000, |c| c.bitrate);
+        1_000_000_000u64.div_ceil(u64::from(rate.max(1)))
+    }
+
+    /// Nodes that see a frame sent by `sender` on `bus`: every other linked
+    /// node that is not bus-off.
+    fn receivers(&self, bus: BusId, sender: NodeId) -> Vec<NodeId> {
+        self.bus_nodes
+            .get(&bus)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .copied()
+                    .filter(|n| *n != sender && !self.is_bus_off(*n, bus))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Finish entering bus-off: drop the node's queued frames on `bus` and
+    /// schedule its recovery. The caller has set the state.
+    fn enter_bus_off(&mut self, node: NodeId, bus: BusId) {
+        let recover_at = self.now + BUS_OFF_RECOVERY_BITS * self.bit_ns(bus);
+        if let Some(e) = self.node_err.get_mut(&(node, bus)) {
+            e.recover_at = recover_at;
+        }
+        let mut dropped = 0;
+        if let Some(pending) = self.bus_pending.get_mut(&bus) {
+            let before = pending.len();
+            pending.retain(|(_, m)| m.sender != node);
+            dropped = (before - pending.len()) as u64;
+        }
+        self.stats.entry(bus).or_default().dropped_bus_off += dropped;
+        self.schedule(recover_at, EventKind::Recover { node, bus });
+    }
+
+    fn count_tx_ok(&mut self, node: NodeId, bus: BusId) {
+        let e = self.node_err.entry((node, bus)).or_default();
+        e.tec = e.tec.saturating_sub(1);
+        e.refresh();
+    }
+
+    fn count_rx_ok(&mut self, node: NodeId, bus: BusId) {
+        let e = self.node_err.entry((node, bus)).or_default();
+        e.rec = if e.rec > ERROR_PASSIVE_LIMIT {
+            REC_RECOVERED
+        } else {
+            e.rec.saturating_sub(1)
+        };
+        e.refresh();
+    }
+
+    fn count_tx_error(&mut self, node: NodeId, bus: BusId, error: CanErrorKind) {
+        let e = self.node_err.entry((node, bus)).or_default();
+        if e.state == NodeErrorState::BusOff {
+            return;
+        }
+        if !(error == CanErrorKind::Ack && e.state == NodeErrorState::ErrorPassive) {
+            e.tec = e.tec.saturating_add(TEC_ERROR_STEP);
+        }
+        e.refresh();
+        if e.state == NodeErrorState::BusOff {
+            self.enter_bus_off(node, bus);
+        }
+    }
+
+    fn count_rx_error(&mut self, node: NodeId, bus: BusId) {
+        let e = self.node_err.entry((node, bus)).or_default();
+        e.rec = e.rec.saturating_add(1);
+        e.refresh();
+    }
+
+    /// Hold an error-passive `node` back for the suspend-transmission time
+    /// after a transmission that ends at `end`.
+    fn suspend_if_passive(&mut self, node: NodeId, bus: BusId, end: u64) {
+        let suspend = SUSPEND_BITS * self.bit_ns(bus);
+        if let Some(e) = self.node_err.get_mut(&(node, bus))
+            && e.state == NodeErrorState::ErrorPassive
+        {
+            e.suspend_until = end + suspend;
+        }
+    }
+
+    /// The error, if any, that corrupts the transmission of `frame` by
+    /// `meta.sender` on `bus`: injection rules first, then a missing ACK.
+    fn pick_error(
+        &mut self,
+        bus: BusId,
+        frame: &CanFrame,
+        meta: &FrameMeta,
+    ) -> Option<CanErrorKind> {
+        let mut hit = None;
+        for inj in &mut self.injections {
+            let s = inj.spec;
+            if s.bus != bus
+                || s.node.is_some_and(|n| n != meta.sender)
+                || s.id
+                    .is_some_and(|(id, ext)| id != frame.id || ext != frame.extended)
+            {
+                continue;
+            }
+            inj.matched += 1;
+            let fire = match s.mode {
+                InjectMode::Count(_) => true,
+                InjectMode::EveryNth(n) => inj.matched % u64::from(n.max(1)) == 0,
+                InjectMode::Probability(p) => self.rng.next_f64() < p,
+            };
+            if fire {
+                if let Some(l) = &mut inj.left {
+                    *l -= 1;
+                }
+                hit = Some(s.kind);
+                break;
+            }
+        }
+        self.injections.retain(|i| i.left != Some(0));
+        if hit.is_some() {
+            return hit;
+        }
+        let simulate_ack = self.bus_configs.get(&bus).is_some_and(|c| c.simulate_ack);
+        (simulate_ack && self.receivers(bus, meta.sender).is_empty()).then_some(CanErrorKind::Ack)
     }
 
     /// Inject a one-off frame transmission from `node`, outside of any ECU
@@ -348,6 +779,10 @@ impl Simulation {
             None => linked,
         };
         for bus in targets {
+            if self.is_bus_off(node, bus) {
+                self.stats.entry(bus).or_default().dropped_bus_off += 1;
+                continue;
+            }
             self.bus_pending.entry(bus).or_default().push((frame, meta));
             self.schedule(self.now, EventKind::Arbitrate { bus });
         }
@@ -434,19 +869,38 @@ impl Simulation {
             return;
         }
         loop {
-            let Some(pending) = self.bus_pending.get_mut(&bus) else {
+            let Some(pending) = self.bus_pending.get(&bus) else {
                 return;
             };
-            if pending.is_empty() {
-                return;
+            // Lowest arbitration key among the frames whose sender is not
+            // suspended; remember when the earliest suspended one is due.
+            let mut winner: Option<(usize, (u32, bool))> = None;
+            let mut wake: Option<u64> = None;
+            for (i, (frame, meta)) in pending.iter().enumerate() {
+                let until = self
+                    .node_err
+                    .get(&(meta.sender, bus))
+                    .map_or(0, |e| e.suspend_until);
+                if until > self.now {
+                    wake = Some(wake.map_or(until, |w| w.min(until)));
+                    continue;
+                }
+                let key = arbitration_key(frame);
+                if winner.is_none_or(|(_, best)| key < best) {
+                    winner = Some((i, key));
+                }
             }
-            let winner_idx = pending
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (frame, _))| arbitration_key(frame))
-                .map(|(i, _)| i)
-                .expect("pending is non-empty");
-            let (frame, meta) = pending.remove(winner_idx);
+            let Some((winner_idx, _)) = winner else {
+                if let Some(at) = wake {
+                    self.schedule(at, EventKind::Arbitrate { bus });
+                }
+                return;
+            };
+            let (frame, meta) = self
+                .bus_pending
+                .get_mut(&bus)
+                .expect("pending exists")
+                .remove(winner_idx);
 
             let fd_enabled = self
                 .bus_configs
@@ -466,15 +920,40 @@ impl Simulation {
                 .unwrap_or((500_000, 500_000));
             let duration_ns = frame_duration_ns_any(&frame, nominal, data_rate);
             self.bus_busy.insert(bus, true);
-            self.schedule(
-                self.now + duration_ns,
-                EventKind::TxComplete {
-                    bus,
-                    meta,
-                    frame,
-                    duration_ns,
-                },
-            );
+            match self.pick_error(bus, &frame, &meta) {
+                None => self.schedule(
+                    self.now + duration_ns,
+                    EventKind::TxComplete {
+                        bus,
+                        meta,
+                        frame,
+                        duration_ns,
+                    },
+                ),
+                Some(error) => {
+                    // Bit, stuff and form errors strike mid-frame; CRC and
+                    // ACK errors are flagged after the ACK slot, shortly
+                    // before the frame would have ended.
+                    let half = duration_ns / 2;
+                    let elapsed_ns = match error {
+                        CanErrorKind::Crc | CanErrorKind::Ack => duration_ns
+                            .saturating_sub(FRAME_TAIL_BITS * self.bit_ns(bus))
+                            .max(half),
+                        _ => half,
+                    }
+                    .max(1);
+                    self.schedule(
+                        self.now + elapsed_ns,
+                        EventKind::TxError {
+                            bus,
+                            meta,
+                            frame,
+                            error,
+                            elapsed_ns,
+                        },
+                    );
+                }
+            }
             return;
         }
     }
@@ -508,9 +987,14 @@ impl Simulation {
                 duration_ns,
             } => {
                 self.bus_busy.insert(bus, false);
-                let stats = self.stats.entry(bus).or_default();
-                stats.frames += 1;
-                stats.busy_ns += duration_ns;
+                self.stats.entry(bus).or_default().busy_ns += duration_ns;
+                if self.is_bus_off(meta.sender, bus) {
+                    // The sender was forced bus-off mid-frame: the frame is lost.
+                    self.stats.entry(bus).or_default().dropped_bus_off += 1;
+                    self.try_arbitrate(bus);
+                    return;
+                }
+                self.stats.entry(bus).or_default().frames += 1;
 
                 out.push(BusEvent {
                     time: Timestamp(self.now),
@@ -525,17 +1009,92 @@ impl Simulation {
                     frame_uid: meta.uid,
                     hop: meta.hop,
                     frame,
+                    kind: BusEventKind::Frame,
                 });
 
-                let receivers = self.bus_nodes.get(&bus).cloned().unwrap_or_default();
-                for node in receivers {
-                    if node == meta.sender {
-                        continue;
-                    }
+                self.count_tx_ok(meta.sender, bus);
+                self.suspend_if_passive(meta.sender, bus, self.now);
+                for node in self.receivers(bus, meta.sender) {
+                    self.count_rx_ok(node, bus);
                     self.run_callback(node, Some(meta), |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
                 }
 
                 self.try_arbitrate(bus);
+            }
+            EventKind::TxError {
+                bus,
+                meta,
+                frame,
+                error,
+                elapsed_ns,
+            } => {
+                let sender = meta.sender;
+                let passive = self.err_state(sender, bus) == NodeErrorState::ErrorPassive;
+                let flag_bits = if passive {
+                    PASSIVE_ERROR_FRAME_BITS
+                } else {
+                    ACTIVE_ERROR_FRAME_BITS
+                };
+                let tail_ns = (flag_bits + INTERMISSION_BITS) * self.bit_ns(bus);
+                self.stats.entry(bus).or_default().can_errors.add(error);
+                out.push(BusEvent {
+                    time: Timestamp(self.now),
+                    bus,
+                    sender,
+                    origin: meta.origin,
+                    dir: if meta.hop == 0 {
+                        Direction::Tx
+                    } else {
+                        Direction::Rx
+                    },
+                    frame_uid: meta.uid,
+                    hop: meta.hop,
+                    frame,
+                    kind: BusEventKind::Error {
+                        error,
+                        node: sender,
+                    },
+                });
+                let receivers = self.receivers(bus, sender);
+                self.count_tx_error(sender, bus, error);
+                for node in receivers {
+                    self.count_rx_error(node, bus);
+                }
+                self.suspend_if_passive(sender, bus, self.now + tail_ns);
+                self.schedule(
+                    self.now + tail_ns,
+                    EventKind::ErrorEnd {
+                        bus,
+                        meta,
+                        frame,
+                        busy_ns: elapsed_ns + tail_ns,
+                    },
+                );
+            }
+            EventKind::ErrorEnd {
+                bus,
+                meta,
+                frame,
+                busy_ns,
+            } => {
+                self.bus_busy.insert(bus, false);
+                self.stats.entry(bus).or_default().busy_ns += busy_ns;
+                if self.is_bus_off(meta.sender, bus) {
+                    self.stats.entry(bus).or_default().dropped_bus_off += 1;
+                } else {
+                    // Retransmit: the frame takes part in arbitration again.
+                    self.bus_pending.entry(bus).or_default().push((frame, meta));
+                }
+                self.try_arbitrate(bus);
+            }
+            EventKind::Recover { node, bus } => {
+                let now = self.now;
+                if let Some(e) = self.node_err.get_mut(&(node, bus))
+                    && e.state == NodeErrorState::BusOff
+                    && e.recover_at == now
+                {
+                    *e = NodeErr::default();
+                }
             }
         }
     }
