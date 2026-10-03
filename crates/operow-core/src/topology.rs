@@ -145,6 +145,45 @@ pub struct DbcRef {
     pub bus: BusId,
 }
 
+/// Identifier of a project-level user signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserSignalId(pub u32);
+
+/// Bit numbering of a [`UserSignalDef`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SignalByteOrder {
+    /// Little-endian (`@1` in DBC).
+    #[default]
+    Intel,
+    /// Big-endian (`@0`); `start_bit` is the MSB position.
+    Motorola,
+}
+
+/// A signal defined by the user on a raw CAN message, independent of any
+/// DBC. Plain fields only: the application turns it into a decoder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserSignalDef {
+    pub id: UserSignalId,
+    pub name: String,
+    pub bus: BusId,
+    /// CAN identifier of the carrying message.
+    pub msg_id: u32,
+    #[serde(default)]
+    pub extended: bool,
+    pub start_bit: u16,
+    /// Width in bits.
+    pub size: u16,
+    #[serde(default)]
+    pub byte_order: SignalByteOrder,
+    #[serde(default)]
+    pub signed: bool,
+    pub factor: f64,
+    pub offset: f64,
+    #[serde(default)]
+    pub unit: String,
+}
+
 /// The full static network description of a simulation.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Topology {
@@ -157,6 +196,13 @@ pub struct Topology {
     /// DBC files attached to buses; used for trace decoding only.
     #[serde(default)]
     pub databases: Vec<DbcRef>,
+    /// Signals the user defined on raw messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_signals: Vec<UserSignalDef>,
+    /// Opaque UI workspace (window layout) saved with the project. The core
+    /// crate does not interpret it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<serde_json::Value>,
 }
 
 /// Errors returned by [`Topology::validate`].

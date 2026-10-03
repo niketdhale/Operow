@@ -38,7 +38,7 @@
         60.0,
         60.0
       ],
-      "script": null
+      "script": "fn on_start() {\n    this.t = 0;\n    set_timer(1, 20);\n}\n\nfn on_timer(id) {\n    this.t += 1;\n    let ph = this.t.to_float() * 0.06;\n    let rpm_raw = ((3000.0 + 2000.0 * sin(ph)) / 0.25).to_int();\n    let thr_raw = (500.0 + 400.0 * sin(ph * 1.7)).to_int();\n    let run = if this.t % 100 < 70 { 1 } else { 0 };\n    set_payload(0, [(rpm_raw >> 8) & 255, rpm_raw & 255, 127, thr_raw & 255, (thr_raw >> 8) & 3, run, 0, 0]);\n    set_timer(1, 20);\n}\n"
     },
     {
       "id": 2,

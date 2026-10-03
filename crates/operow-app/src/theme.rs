@@ -9,13 +9,6 @@ pub enum AppTheme {
 }
 
 impl AppTheme {
-    pub fn toggled(self) -> Self {
-        match self {
-            AppTheme::Light => AppTheme::Dark,
-            AppTheme::Dark => AppTheme::Light,
-        }
-    }
-
     pub fn apply(self, ctx: &egui::Context) {
         let visuals = match self {
             AppTheme::Light => light_visuals(),
@@ -49,6 +42,16 @@ impl AppTheme {
         match self {
             AppTheme::Light => Color32::from_rgb(0x0e, 0x80, 0x8a),
             AppTheme::Dark => Color32::from_rgb(0x4d, 0xdc, 0xe6),
+        }
+    }
+}
+
+impl AppTheme {
+    /// Colour of pulses for frames sent by a Generator window.
+    pub fn generator_color(self) -> Color32 {
+        match self {
+            AppTheme::Light => Color32::from_rgb(0xc0, 0x1a, 0x7a),
+            AppTheme::Dark => Color32::from_rgb(0xff, 0x6e, 0xc7),
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Left side panel: node palette + properties inspector for the selected
+//! Properties tab: inspector for the selected
 //! ECU or CAN bus.
 
 use egui_flow::NodeId as FlowId;
@@ -160,20 +160,6 @@ impl Inspector {
             self.live_payload.clear();
             self.live_error.clear();
         }
-        ui.heading("Palette");
-        ui.horizontal(|ui| {
-            if icons::icon_button_enabled(ui, !running, icons::ecu(), "Add ECU").clicked() {
-                graph.add_ecu(egui::pos2(40.0, 40.0), "NewEcu");
-            }
-            if icons::icon_button_enabled(ui, !running, icons::gateway(), "Add gateway").clicked() {
-                graph.add_gateway(egui::pos2(40.0, 120.0));
-            }
-            if icons::icon_button_enabled(ui, !running, icons::bus(), "Add CAN bus").clicked() {
-                graph.add_bus(egui::pos2(40.0, 200.0));
-            }
-        });
-        ui.separator();
-        ui.heading("Properties");
         if running {
             ui.label(
                 egui::RichText::new("Editing is disabled while the measurement is running.")
@@ -404,6 +390,7 @@ impl Inspector {
                 for (i, msg) in ecu.tx.iter_mut().enumerate() {
                     let header = msg_summary(msg, &linked);
                     egui::CollapsingHeader::new(format!("{} \u{2013} {header}", msg.name))
+                        .icon(crate::icons::disclosure)
                         .id_salt(("tx_msg", sel, i))
                         .default_open(true)
                         .show(ui, |ui| {

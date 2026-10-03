@@ -5,12 +5,23 @@
 
 mod app;
 mod dbcs;
+mod filters;
+mod generator_window;
 mod graph;
+mod graph_window;
 mod icons;
 mod inspector;
+mod network_view;
+mod project_tree;
 mod script_editor;
+mod settings;
+mod signal_dialog;
+mod signals;
+mod store;
 mod theme;
 mod trace;
+mod windows;
+mod workspace;
 
 use std::path::PathBuf;
 
@@ -30,6 +41,17 @@ fn main() -> eframe::Result<()> {
             "--dbc" => opts.dbc = args.next().map(PathBuf::from),
             "--dbc-bus" => opts.dbc_bus = args.next(),
             "--open-import-dialog" => opts.import_dialog = args.next().map(PathBuf::from),
+            "--open-settings" => opts.open_settings = true,
+            "--layout-demo" => opts.layout_demo = true,
+            "--demo-filters" => opts.demo_filters = true,
+            "--open-new-signal" => opts.open_new_signal = true,
+            "--demo-graph" => opts.demo_graph = true,
+            "--demo-generator" => opts.demo_generator = true,
+            "--network-view" => {
+                opts.network_view = args
+                    .next()
+                    .and_then(|v| network_view::NetworkView::parse(&v))
+            }
             _ => {}
         }
     }
@@ -46,8 +68,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            theme::AppTheme::Light.apply(&cc.egui_ctx);
-            let mut app = app::OperowApp::new(screenshot_path);
+            let settings = settings::AppSettings::load(cc.storage);
+            if settings.dark_theme {
+                theme::AppTheme::Dark.apply(&cc.egui_ctx);
+            } else {
+                theme::AppTheme::Light.apply(&cc.egui_ctx);
+            }
+            let mut app = app::OperowApp::new(screenshot_path, settings);
             app.configure_startup(opts);
             Ok(Box::new(app))
         }),
