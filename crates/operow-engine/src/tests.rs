@@ -3,13 +3,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use operow_core::{
-    BusId, CanBusConfig, CanFrame, Direction, EcuConfig, IdFilter, Link, NodeId, NodeKind,
-    RouteRule, SendType, Timestamp, Topology, TxMessage,
+    BusEvent, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, EcuConfig, IdFilter, Link,
+    NodeErrorState, NodeId, NodeKind, RouteRule, SendType, Timestamp, Topology, TxMessage,
 };
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx};
 use crate::runner::{Command, Engine, EngineEvent};
-use crate::sim::{GENERATOR_NODE_BASE, GeneratorId, MAX_HOPS, Simulation};
+use crate::sim::{
+    GENERATOR_NODE_BASE, GeneratorId, InjectMode, InjectSpec, MAX_HOPS, MsgControl, Simulation,
+};
 use crate::timing::{frame_bits, frame_duration_ns};
 
 fn topo_with_two_senders() -> Topology {
@@ -52,6 +54,7 @@ fn topo_with_two_senders() -> Topology {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![
             Link {
@@ -116,6 +119,7 @@ fn periodic_message_produces_expected_frame_count() {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -185,6 +189,7 @@ fn sender_does_not_receive_its_own_frame() {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![
             Link {
@@ -280,6 +285,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             bitrate: 500_000,
             fd_enabled,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -333,6 +339,7 @@ fn bus(id: u32, name: &str) -> CanBusConfig {
         bitrate: 500_000,
         fd_enabled: false,
         data_bitrate: 2_000_000,
+        simulate_ack: false,
     }
 }
 
@@ -1234,4 +1241,743 @@ fn replay_streams_logs_larger_than_one_chunk() {
     let out = run_ms(&topo, 6000);
     assert_eq!(out.len(), 5000);
     assert!(out.windows(2).all(|w| w[0].time <= w[1].time));
+}
+
+// --- CAN error model --------------------------------------------------------
+
+/// One bus (id 1) with a node per `(node id, frame id, period ms)`; each node
+/// cyclically sends its frame (first one at t = 0).
+fn err_topo(nodes: &[(u32, u32, u32)], bitrate: u32, simulate_ack: bool) -> Topology {
+    Topology {
+        nodes: nodes
+            .iter()
+            .map(|&(id, frame_id, period_ms)| EcuConfig {
+                id: NodeId(id),
+                name: format!("N{id}"),
+                tx: vec![TxMessage {
+                    name: "Msg".into(),
+                    frame: CanFrame::new(frame_id, false, &[1, 2]).unwrap(),
+                    period_ms,
+                    enabled: true,
+                    bus: None,
+                    send_type: Default::default(),
+                }],
+                kind: Default::default(),
+                pos: (0.0, 0.0),
+                script: None,
+            })
+            .collect(),
+        buses: vec![CanBusConfig {
+            id: BusId(1),
+            name: "CAN0".into(),
+            bitrate,
+            fd_enabled: false,
+            data_bitrate: 2_000_000,
+            simulate_ack,
+        }],
+        links: nodes
+            .iter()
+            .map(|&(id, ..)| Link {
+                node: NodeId(id),
+                bus: BusId(1),
+            })
+            .collect(),
+        databases: vec![],
+        user_signals: vec![],
+        workspace: None,
+    }
+}
+
+fn inject_spec(node: u32, kind: CanErrorKind, mode: InjectMode) -> InjectSpec {
+    InjectSpec {
+        bus: BusId(1),
+        node: Some(NodeId(node)),
+        id: None,
+        kind,
+        mode,
+        remaining: None,
+    }
+}
+
+fn error_events(out: &[BusEvent]) -> Vec<&BusEvent> {
+    out.iter().filter(|e| e.is_error()).collect()
+}
+
+fn frame_events(out: &[BusEvent]) -> Vec<&BusEvent> {
+    out.iter().filter(|e| !e.is_error()).collect()
+}
+
+/// Step the simulation until `n` error events have been produced.
+fn run_to_error(sim: &mut Simulation, out: &mut Vec<BusEvent>, n: usize) {
+    let mut t = sim.now().0;
+    while error_events(out).len() < n {
+        t += 10_000;
+        assert!(t < 1_000_000_000, "never reached {n} errors");
+        sim.run_until(Timestamp(t), out);
+    }
+}
+
+const N1: NodeId = NodeId(1);
+const N2: NodeId = NodeId(2);
+const BUS1: BusId = BusId(1);
+
+#[test]
+fn error_event_carries_the_failed_frame() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Crc, InjectMode::Count(1)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    let err = out[0];
+    assert!(err.is_error());
+    assert_eq!(err.error_kind(), Some(CanErrorKind::Crc));
+    assert_eq!(
+        err.kind,
+        operow_core::BusEventKind::Error {
+            error: CanErrorKind::Crc,
+            node: N1
+        }
+    );
+    assert_eq!(
+        (err.sender, err.frame.id, err.dir),
+        (N1, 0x100, Direction::Tx)
+    );
+    // The frame is retransmitted with the same uid after the error frame.
+    let ok = frame_events(&out)
+        .into_iter()
+        .find(|e| e.frame.id == 0x100)
+        .unwrap();
+    assert_eq!(ok.frame_uid, err.frame_uid);
+    assert!(ok.time > err.time);
+    assert_eq!(sim.stats()[&BUS1].can_errors.crc, 1);
+    assert_eq!(sim.stats()[&BUS1].can_errors.total(), 1);
+}
+
+#[test]
+fn errors_drive_the_transmitter_error_passive() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(100)));
+    let mut out = Vec::new();
+    run_to_error(&mut sim, &mut out, 15);
+    assert_eq!(
+        sim.node_state(N1, BUS1),
+        (NodeErrorState::ErrorActive, 120, 0)
+    );
+    // The receiver counted every error frame.
+    assert_eq!(
+        sim.node_state(N2, BUS1),
+        (NodeErrorState::ErrorActive, 0, 15)
+    );
+    run_to_error(&mut sim, &mut out, 16);
+    assert_eq!(
+        sim.node_state(N1, BUS1),
+        (NodeErrorState::ErrorPassive, 128, 0)
+    );
+}
+
+#[test]
+fn passive_node_returns_to_active_when_counters_drop() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(16)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    assert_eq!(error_events(&out).len(), 16);
+    // The retransmission succeeded: TEC 128 - 1 = 127 is no longer passive,
+    // and the receivers' REC (16) dropped by one per good frame.
+    let (state, tec, _) = sim.node_state(N1, BUS1);
+    assert_eq!((state, tec), (NodeErrorState::ErrorActive, 127));
+    let (_, _, rec) = sim.node_state(N2, BUS1);
+    assert!(rec < 16, "rec {rec}");
+}
+
+#[test]
+fn errors_drive_the_transmitter_bus_off() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Stuff, InjectMode::Count(1000)));
+    let mut out = Vec::new();
+    // 32 errors: +8 each reaches TEC 256 (> 255), then node 1 goes silent.
+    run_to_error(&mut sim, &mut out, 32);
+    assert_eq!(sim.node_state(N1, BUS1), (NodeErrorState::BusOff, 256, 0));
+    let t = sim.now().0;
+    sim.run_until(Timestamp(t + 100_000), &mut out);
+    assert_eq!(error_events(&out).len(), 32);
+    assert!(frame_events(&out).iter().all(|e| e.sender != N1));
+    assert_eq!(sim.stats()[&BUS1].dropped_bus_off, 1, "the abandoned frame");
+}
+
+#[test]
+fn bus_off_recovers_after_1408_bit_times() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(1000)));
+    let mut out = Vec::new();
+    run_to_error(&mut sim, &mut out, 32);
+    let off_at = error_events(&out)[31].time.0;
+    let recover_ns = 1408 * 2000;
+    sim.run_until(Timestamp(off_at + recover_ns - 1), &mut out);
+    assert_eq!(sim.node_state(N1, BUS1).0, NodeErrorState::BusOff);
+    sim.run_until(Timestamp(off_at + recover_ns), &mut out);
+    assert_eq!(
+        sim.node_state(N1, BUS1),
+        (NodeErrorState::ErrorActive, 0, 0)
+    );
+}
+
+#[test]
+fn error_passive_transmitter_waits_the_suspend_time() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(20)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(10), &mut out);
+    let errs = error_events(&out);
+    assert_eq!(errs.len(), 20);
+    let bit = 2000;
+    let frame = CanFrame::new(0x100, false, &[1, 2]).unwrap();
+    let half = frame_duration_ns(&frame, 500_000) / 2;
+    // Active: 20-bit error frame + 3 intermission, then retransmit.
+    assert_eq!(errs[1].time.0 - errs[0].time.0, 23 * bit + half);
+    // Passive: 14-bit error frame + 3 intermission + 8 suspend.
+    assert_eq!(errs[18].time.0 - errs[17].time.0, (14 + 3 + 8) * bit + half);
+}
+
+#[test]
+fn lone_node_with_simulate_ack_goes_passive_but_never_bus_off() {
+    let topo = err_topo(&[(1, 0x100, 1000)], 500_000, true);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(200), &mut out);
+    assert!(frame_events(&out).is_empty());
+    let errs = error_events(&out);
+    assert!(errs.len() > 100, "{} ack errors", errs.len());
+    assert!(
+        errs.iter()
+            .all(|e| e.error_kind() == Some(CanErrorKind::Ack))
+    );
+    // 16 errors reach TEC 128; further ACK errors leave it unchanged.
+    assert_eq!(
+        sim.node_state(N1, BUS1),
+        (NodeErrorState::ErrorPassive, 128, 0)
+    );
+    assert_eq!(sim.stats()[&BUS1].can_errors.ack, errs.len() as u64);
+}
+
+#[test]
+fn no_ack_error_when_another_node_is_online() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 10)], 500_000, true);
+    let out = run_ms(&topo, 100);
+    assert!(error_events(&out).is_empty());
+    assert_eq!(frame_events(&out).len(), 20);
+}
+
+#[test]
+fn no_ack_error_without_simulate_ack() {
+    let topo = err_topo(&[(1, 0x100, 10)], 500_000, false);
+    let out = run_ms(&topo, 100);
+    assert!(error_events(&out).is_empty());
+    assert_eq!(frame_events(&out).len(), 10);
+}
+
+#[test]
+fn ack_error_returns_once_the_only_other_node_is_bus_off() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 125_000, true);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.force_bus_off(N2, BUS1);
+    let mut out = Vec::new();
+    // Node 2 is offline until ~11.3 ms; node 1 sees no ACK meanwhile.
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    assert!(
+        error_events(&out)
+            .iter()
+            .all(|e| e.error_kind() == Some(CanErrorKind::Ack))
+    );
+    assert!(!error_events(&out).is_empty());
+    assert!(frame_events(&out).is_empty());
+}
+
+#[test]
+fn bus_off_node_drops_transmissions_and_receives_nothing() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 125_000, false);
+    let rx1 = Arc::new(AtomicU32::new(0));
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_ecu(
+        N1,
+        Box::new(CountingEcu {
+            counter: rx1.clone(),
+        }),
+    );
+    sim.set_ecu(
+        N2,
+        Box::new(CountingEcu {
+            counter: Arc::new(AtomicU32::new(0)),
+        }),
+    );
+    let frame = CanFrame::new(0x123, false, &[7]).unwrap();
+    sim.force_bus_off_with(N1, BUS1, crate::sim::BusOffRecovery::Auto);
+    assert_eq!(sim.node_state(N1, BUS1).0, NodeErrorState::BusOff);
+    let mut out = Vec::new();
+    sim.send_once(N1, None, frame);
+    sim.send_once(N2, None, frame);
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sender, N2);
+    assert_eq!(
+        rx1.load(Ordering::SeqCst),
+        0,
+        "bus-off node must not receive"
+    );
+    assert_eq!(sim.stats()[&BUS1].dropped_bus_off, 1);
+
+    // Recovery takes 1408 bits = 11.264 ms at 125 kbit/s.
+    sim.run_until(Timestamp::from_ms(12), &mut out);
+    assert_eq!(
+        sim.node_state(N1, BUS1),
+        (NodeErrorState::ErrorActive, 0, 0)
+    );
+    sim.send_once(N2, None, frame);
+    sim.send_once(N1, None, frame);
+    sim.run_until(Timestamp::from_ms(20), &mut out);
+    assert_eq!(out.len(), 3);
+    assert_eq!(rx1.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn force_bus_off_ignores_unlinked_pairs() {
+    let topo = err_topo(&[(1, 0x100, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.force_bus_off(NodeId(9), BUS1);
+    sim.force_bus_off(N1, BusId(7));
+    assert_eq!(sim.node_state(N1, BUS1).0, NodeErrorState::ErrorActive);
+    assert_eq!(
+        sim.node_state(NodeId(9), BUS1).0,
+        NodeErrorState::ErrorActive
+    );
+    assert_eq!(sim.node_states().len(), 1);
+}
+
+#[test]
+fn injection_count_filters_and_retransmission() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    // Filters: another node, another id and another bus never match.
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(2, CanErrorKind::Form, InjectMode::Count(5)));
+    sim.inject_errors(InjectSpec {
+        id: Some((0x100, true)),
+        ..inject_spec(1, CanErrorKind::Form, InjectMode::Count(5))
+    });
+    sim.inject_errors(InjectSpec {
+        bus: BusId(2),
+        ..inject_spec(1, CanErrorKind::Form, InjectMode::Count(5))
+    });
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(10), &mut out);
+    assert_eq!(
+        error_events(&out).iter().filter(|e| e.sender == N1).count(),
+        0
+    );
+    // Node 2's frame (0x200) was hit five times, then got through.
+    let n2_errs = error_events(&out).iter().filter(|e| e.sender == N2).count();
+    assert_eq!(n2_errs, 5);
+    assert_eq!(frame_events(&out).len(), 2);
+    assert!(
+        error_events(&out)
+            .iter()
+            .all(|e| e.error_kind() == Some(CanErrorKind::Form))
+    );
+}
+
+#[test]
+fn injection_every_nth_and_remaining_cap() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(InjectSpec {
+        id: Some((0x100, false)),
+        ..inject_spec(1, CanErrorKind::Bit, InjectMode::EveryNth(3))
+    });
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(200), &mut out);
+    let errs = error_events(&out).len();
+    let ok = frame_events(&out).iter().filter(|e| e.sender == N1).count();
+    assert_eq!(ok, 20, "every cyclic frame gets through eventually");
+    // Every third attempt (retransmissions included) is corrupted.
+    assert_eq!(errs, (errs + ok) / 3);
+    assert!(errs >= 9);
+
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(InjectSpec {
+        remaining: Some(5),
+        ..inject_spec(1, CanErrorKind::Bit, InjectMode::EveryNth(1))
+    });
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(200), &mut out);
+    assert_eq!(error_events(&out).len(), 5);
+}
+
+fn probability_run(seed: u64, p: f64) -> (usize, usize) {
+    let topo = err_topo(&[(1, 0x100, 1), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_seed(seed);
+    sim.inject_errors(inject_spec(
+        1,
+        CanErrorKind::Crc,
+        InjectMode::Probability(p),
+    ));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(1500), &mut out);
+    let errs = error_events(&out).len();
+    let ok = frame_events(&out).iter().filter(|e| e.sender == N1).count();
+    (errs, errs + ok)
+}
+
+#[test]
+fn injection_probability_is_seeded_and_close_to_p() {
+    let (errs, attempts) = probability_run(42, 0.1);
+    assert!(attempts > 1000, "{attempts} attempts");
+    let rate = errs as f64 / attempts as f64;
+    assert!((0.07..0.13).contains(&rate), "rate {rate}");
+    assert_eq!(probability_run(42, 0.1), (errs, attempts), "same seed");
+    assert_ne!(probability_run(7, 0.1), (errs, attempts), "other seed");
+    assert_eq!(probability_run(1, 0.0).0, 0);
+}
+
+#[test]
+fn clear_injections_stops_errors() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(
+        1,
+        CanErrorKind::Bit,
+        InjectMode::Probability(1.0),
+    ));
+    sim.clear_injections();
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(50), &mut out);
+    assert!(error_events(&out).is_empty());
+}
+
+#[test]
+fn error_frames_occupy_the_bus() {
+    let topo = err_topo(&[(1, 0x100, 1000), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(2)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(10), &mut out);
+    let stats = sim.stats()[&BUS1];
+    let frame = CanFrame::new(0x100, false, &[1, 2]).unwrap();
+    let dur = frame_duration_ns(&frame, 500_000);
+    let other = CanFrame::new(0x200, false, &[1, 2]).unwrap();
+    let expected = 2 * (dur / 2 + 23 * 2000) + dur + frame_duration_ns(&other, 500_000);
+    assert_eq!(stats.busy_ns, expected);
+    assert_eq!(stats.frames, 2, "error frames are not counted as frames");
+}
+
+#[test]
+fn runner_reports_node_states_and_accepts_error_commands() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 10)], 500_000, false);
+    let h = Engine::spawn();
+    h.cmd.send(Command::Load(topo)).unwrap();
+    h.cmd
+        .send(Command::InjectErrors(inject_spec(
+            1,
+            CanErrorKind::Crc,
+            InjectMode::Count(3),
+        )))
+        .unwrap();
+    h.cmd.send(Command::ForceBusOff(N2, BUS1)).unwrap();
+    h.cmd.send(Command::SetSpeed(0.0)).unwrap();
+    h.cmd.send(Command::Start).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_bus_off = false;
+    while std::time::Instant::now() < deadline && !saw_bus_off {
+        if let Ok(EngineEvent::NodeStates { nodes, .. }) =
+            h.events.recv_timeout(Duration::from_millis(100))
+        {
+            saw_bus_off = nodes.iter().any(|n| n.node == N2);
+            assert_eq!(nodes.len(), 2);
+        }
+    }
+    assert!(saw_bus_off, "no NodeStates event");
+    h.shutdown();
+}
+
+// ---- runtime node / message controls ----
+
+/// Node 1 sends 0x100 every 10 ms on bus 1; node 2 listens on bus 1.
+fn ctl_topo() -> Topology {
+    Topology {
+        nodes: vec![
+            node(1, vec![periodic(0x100, 10, None)], NodeKind::Ecu),
+            node(2, vec![], NodeKind::Ecu),
+        ],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1), link(2, 1)],
+        databases: vec![],
+        user_signals: vec![],
+        workspace: None,
+    }
+}
+
+/// Events produced up to `to_ms` since the previous call.
+fn run_span(sim: &mut Simulation, to_ms: u64) -> Vec<BusEvent> {
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(to_ms), &mut out);
+    out
+}
+
+fn counting_sim(topo: &Topology) -> (Simulation, Arc<AtomicU32>) {
+    let mut sim = Simulation::new(topo).unwrap();
+    let counter = Arc::new(AtomicU32::new(0));
+    sim.set_ecu(
+        NodeId(2),
+        Box::new(CountingEcu {
+            counter: counter.clone(),
+        }),
+    );
+    (sim, counter)
+}
+
+#[test]
+fn offline_transmitter_stops_and_resumes() {
+    let mut sim = Simulation::new(&ctl_topo()).unwrap();
+    assert_eq!(run_span(&mut sim, 100).len(), 10);
+    sim.set_node_online(NodeId(1), None, false);
+    assert!(!sim.node_online(NodeId(1), BusId(1)));
+    assert!(run_span(&mut sim, 200).is_empty());
+    assert!(sim.stats()[&BusId(1)].dropped_offline >= 9);
+    sim.set_node_online(NodeId(1), Some(BusId(1)), true);
+    assert!(run_span(&mut sim, 300).len() >= 9);
+}
+
+#[test]
+fn offline_receiver_gets_nothing_and_resumes() {
+    let (mut sim, counter) = counting_sim(&ctl_topo());
+    run_span(&mut sim, 50);
+    let before = counter.load(Ordering::SeqCst);
+    assert!(before >= 4);
+    sim.set_node_online(NodeId(2), None, false);
+    run_span(&mut sim, 150);
+    assert_eq!(counter.load(Ordering::SeqCst), before);
+    sim.set_node_online(NodeId(2), None, true);
+    run_span(&mut sim, 250);
+    assert!(counter.load(Ordering::SeqCst) >= before + 9);
+}
+
+#[test]
+fn offline_node_does_not_ack() {
+    let mut topo = ctl_topo();
+    topo.buses[0].simulate_ack = true;
+    let mut sim = Simulation::new(&topo).unwrap();
+    assert_eq!(sim.stats().get(&BusId(1)).unwrap().can_errors.ack, 0);
+    sim.set_node_online(NodeId(2), None, false);
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    assert!(sim.stats()[&BusId(1)].can_errors.ack > 0, "no ACK expected");
+}
+
+#[test]
+fn offline_gateway_does_not_forward_then_resumes() {
+    let topo = gateway_topo(vec![route(1, 2, IdFilter::Any, None, 0)]);
+    let mut topo = topo;
+    topo.nodes[0].tx[0].period_ms = 10;
+    let mut sim = Simulation::new(&topo).unwrap();
+    let on_b = |ev: &[BusEvent]| ev.iter().filter(|e| e.bus == BusId(2)).count();
+    assert!(on_b(&run_span(&mut sim, 50)) >= 4);
+    sim.set_node_online(NodeId(3), None, false);
+    let ev = run_span(&mut sim, 150);
+    assert_eq!(on_b(&ev), 0);
+    assert!(ev.iter().any(|e| e.bus == BusId(1)), "source keeps sending");
+    sim.set_node_online(NodeId(3), None, true);
+    assert!(on_b(&run_span(&mut sim, 250)) >= 8);
+}
+
+#[test]
+fn offline_on_one_bus_keeps_the_other() {
+    let topo = gateway_topo(vec![route(1, 2, IdFilter::Any, None, 0)]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_node_online(NodeId(3), Some(BusId(2)), false);
+    assert!(sim.node_online(NodeId(3), BusId(1)));
+    assert!(!sim.node_online(NodeId(3), BusId(2)));
+}
+
+#[test]
+fn msg_control_pause_and_resume() {
+    let mut sim = Simulation::new(&ctl_topo()).unwrap();
+    let ctl = MsgControl {
+        paused: true,
+        ..Default::default()
+    };
+    sim.set_msg_control(NodeId(1), (0x100, false), ctl);
+    assert!(run_span(&mut sim, 100).is_empty());
+    assert!(sim.stats()[&BusId(1)].dropped_msg_control >= 9);
+    sim.set_msg_control(NodeId(1), (0x100, false), MsgControl::default());
+    assert!(run_span(&mut sim, 200).len() >= 9);
+}
+
+fn drop_count(seed: u64, pct: f32) -> usize {
+    let mut topo = ctl_topo();
+    topo.nodes[0].tx[0].period_ms = 1;
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_seed(seed);
+    sim.set_msg_control(
+        NodeId(1),
+        (0x100, false),
+        MsgControl {
+            drop_pct: pct,
+            ..Default::default()
+        },
+    );
+    run_span(&mut sim, 2000).len()
+}
+
+#[test]
+fn msg_control_drop_pct_is_seeded_and_bounded() {
+    let sent = drop_count(7, 0.0) as f64;
+    let kept = drop_count(7, 30.0) as f64;
+    let frac = 1.0 - kept / sent;
+    assert!((0.25..0.35).contains(&frac), "dropped {frac}");
+    assert_eq!(drop_count(7, 30.0) as f64, kept, "same seed, same result");
+    assert_eq!(drop_count(7, 100.0), 0);
+}
+
+#[test]
+fn msg_control_delay_and_jitter_bounds() {
+    let first_time = |ctl: MsgControl| {
+        let mut sim = Simulation::new(&ctl_topo()).unwrap();
+        sim.set_msg_control(NodeId(1), (0x100, false), ctl);
+        let ev = run_span(&mut sim, 5);
+        ev.first().map(|e| e.time.0)
+    };
+    let dur = frame_duration_ns(&CanFrame::new(0x100, false, &[1]).unwrap(), 500_000);
+    assert_eq!(first_time(MsgControl::default()), Some(dur));
+    // 3 ms delay: nothing before 3 ms, the first frame completes at 3 ms + dur.
+    let d = first_time(MsgControl {
+        delay_ms: 3.0,
+        ..Default::default()
+    });
+    assert_eq!(d, Some(3_000_000 + dur));
+    // Jitter only: queued within +-2 ms (negative clamps to now).
+    for seed in 1..30u64 {
+        let mut sim = Simulation::new(&ctl_topo()).unwrap();
+        sim.set_seed(seed);
+        sim.set_msg_control(
+            NodeId(1),
+            (0x100, false),
+            MsgControl {
+                delay_ms: 1.0,
+                jitter_ms: 2.0,
+                ..Default::default()
+            },
+        );
+        let ev = run_span(&mut sim, 5);
+        let t = ev.first().expect("frame within 5ms").time.0;
+        assert!(t >= dur && t <= 3_000_000 + dur, "t = {t}");
+    }
+}
+
+#[test]
+fn msg_control_applies_to_script_output_by_id() {
+    let script = r#"
+        fn on_message(msg) {
+            if msg.id == 0x100 {
+                output(#{ id: 0x200, data: msg.data, bus: msg.bus });
+            }
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    sim.set_msg_control(
+        NodeId(1),
+        (0x200, false),
+        MsgControl {
+            paused: true,
+            ..Default::default()
+        },
+    );
+    let ev = run_span(&mut sim, 20);
+    assert!(ev.iter().any(|e| e.frame.id == 0x100));
+    assert!(!ev.iter().any(|e| e.frame.id == 0x200));
+    assert!(sim.stats()[&BusId(1)].dropped_msg_control >= 1);
+}
+
+#[test]
+fn msg_control_sanitizes_values() {
+    let c = MsgControl {
+        paused: false,
+        drop_pct: 250.0,
+        delay_ms: -4.0,
+        jitter_ms: f32::NAN,
+    }
+    .sanitized();
+    assert_eq!(c.drop_pct, 100.0);
+    assert_eq!(c.delay_ms, 0.0);
+    assert_eq!(c.jitter_ms, 0.0);
+    assert!(MsgControl::default().is_noop());
+}
+
+#[test]
+fn runtime_controls_reset_on_stop() {
+    let h = Engine::spawn();
+    h.cmd.send(Command::Load(ctl_topo())).unwrap();
+    h.cmd
+        .send(Command::SetNodeOnline {
+            node: NodeId(1),
+            bus: None,
+            online: false,
+        })
+        .unwrap();
+    h.cmd.send(Command::Stop).unwrap();
+    h.cmd.send(Command::SetSpeed(0.0)).unwrap();
+    h.cmd.send(Command::Start).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while std::time::Instant::now() < deadline && !saw {
+        if let Ok(EngineEvent::Frames(f)) = h.events.recv_timeout(Duration::from_millis(100)) {
+            saw = !f.is_empty();
+        }
+    }
+    assert!(saw, "node should be online again after Stop");
+    h.shutdown();
+}
+
+#[test]
+fn manual_bus_off_holds_until_recovered_and_counts_events() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 10)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.force_bus_off(N1, BUS1);
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(50), &mut out);
+    let info = |sim: &Simulation| {
+        sim.node_states()
+            .into_iter()
+            .find(|i| i.node == N1)
+            .unwrap()
+    };
+    assert_eq!(info(&sim).state, NodeErrorState::BusOff, "no auto recovery");
+    assert_eq!(info(&sim).bus_off_events, 1);
+    assert!(out.iter().all(|e| e.sender != N1));
+    sim.recover_bus_off(N1, BUS1);
+    assert_eq!(info(&sim).state, NodeErrorState::ErrorActive);
+    assert_eq!(info(&sim).bus_off_events, 1, "counter survives recovery");
+    out.clear();
+    sim.run_until(Timestamp::from_ms(100), &mut out);
+    assert!(out.iter().any(|e| e.sender == N1));
+}
+
+#[test]
+fn injected_bus_off_recovers_automatically_and_is_counted() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(40)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(200), &mut out);
+    let i = sim
+        .node_states()
+        .into_iter()
+        .find(|i| i.node == N1)
+        .unwrap();
+    assert!(i.bus_off_events >= 1);
+    assert!(i.last_bus_off_ns > 0);
+    assert_ne!(i.state, NodeErrorState::BusOff, "auto recovery");
 }

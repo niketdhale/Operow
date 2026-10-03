@@ -496,7 +496,10 @@ pub fn eval_condition(
 ) -> bool {
     match c {
         Condition::IdSeen { bus, id, ext } => {
-            bus.is_none_or(|b| b == ev.bus) && ev.frame.id == *id && ev.frame.extended == *ext
+            !ev.is_error()
+                && bus.is_none_or(|b| b == ev.bus)
+                && ev.frame.id == *id
+                && ev.frame.extended == *ext
         }
         Condition::Signal { signal, cmp } => signal
             .sample_with_prev(ev, None, dbcs, users)
@@ -831,7 +834,11 @@ impl LogRuntime {
                         time: ev.time,
                         channel,
                         dir: ev.dir,
-                        kind: RecordKind::Frame(ev.frame),
+                        kind: if ev.is_error() {
+                            RecordKind::ErrorFrame
+                        } else {
+                            RecordKind::Frame(ev.frame)
+                        },
                     });
                     self.last_time = ev.time;
                     self.session_frames += 1;
@@ -948,6 +955,7 @@ mod tests {
             frame_uid: 0,
             hop: 0,
             frame: CanFrame::new(id, false, &[b0, 0]).unwrap(),
+            kind: Default::default(),
         }
     }
 
@@ -1305,6 +1313,54 @@ mod tests {
     fn runtime_writes_a_triggered_blf_file() {
         let (ids, _) = run_triggered(LogFormat::Blf);
         assert_eq!(ids, [2, 3, 4]);
+    }
+
+    #[test]
+    fn error_events_are_logged_as_error_frames() {
+        let dir = std::env::temp_dir().join(format!("operow-log-err-{}", std::process::id()));
+        let cfg = LoggingConfig {
+            enabled: true,
+            pattern: "e_{n}.asc".into(),
+            folder: Some(dir.clone()),
+            ..Default::default()
+        };
+        let mut err = ev(2, 10);
+        err.kind = operow_core::BusEventKind::Error {
+            error: operow_core::CanErrorKind::Crc,
+            node: operow_core::NodeId(1),
+        };
+        let mut store = FrameStore::new(100);
+        let dbcs = DbcStore::default();
+        let buses = [BusId(1)];
+        let mut rt = LogRuntime::default();
+        for (running, batch) in [
+            (true, vec![]),
+            (true, vec![ev(1, 0), err, ev(3, 20)]),
+            (false, vec![]),
+        ] {
+            store.push_batch(&batch);
+            let ctx = LogContext {
+                store: &store,
+                buses: &buses,
+                project: "p",
+                project_dir: None,
+                dbcs: &dbcs,
+                users: &[],
+            };
+            rt.update(&cfg, running, &[], &ctx);
+        }
+        let path = rt.files[0].path.clone();
+        drop(rt);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let recs: Vec<LogRecord> = operow_log::AscReader::new(bytes.as_slice())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let kinds: Vec<bool> = recs
+            .iter()
+            .map(|r| r.kind == RecordKind::ErrorFrame)
+            .collect();
+        assert_eq!(kinds, [false, true, false]);
     }
 
     /// Log a triggered recording; the frame ids read back and the raw text.

@@ -258,7 +258,10 @@ impl NewSignalDialog {
         let rows = preview_bytes(&mask);
         let live: Option<&BusEvent> = def.and_then(|d| {
             store.find_latest(LIVE_SCAN, |e| {
-                e.bus == d.bus && e.frame.id == d.msg_id && e.frame.extended == d.extended
+                !e.is_error()
+                    && e.bus == d.bus
+                    && e.frame.id == d.msg_id
+                    && e.frame.extended == d.extended
             })
         });
 

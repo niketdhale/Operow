@@ -153,6 +153,7 @@ pub fn msg_summary(msg: &TxMessage, linked: &[(BusId, String)]) -> String {
 
 impl Inspector {
     /// Draws the inspector; returns engine commands issued by live controls.
+    /// `extra` draws more content below the selected node's properties.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -160,6 +161,7 @@ impl Inspector {
         running: bool,
         dbcs: &DbcStore,
         project_dir: Option<&Path>,
+        extra: &mut dyn FnMut(&mut egui::Ui, &Graph, FlowId),
     ) -> Vec<Command> {
         let mut cmds = Vec::new();
         if running != self.was_running {
@@ -194,6 +196,7 @@ impl Inspector {
         egui::ScrollArea::both().show(ui, |ui| {
             self.project_dir = project_dir.map(Path::to_path_buf);
             self.node_ui(ui, graph, sel, running, dbcs, &mut cmds);
+            extra(ui, graph, sel);
         });
         cmds
     }

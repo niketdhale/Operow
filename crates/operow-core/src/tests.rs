@@ -27,6 +27,7 @@ fn topology_json_roundtrip() {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -236,6 +237,7 @@ fn validate_rejects_bad_bus_references() {
                 bitrate: 500_000,
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
+                simulate_ack: false,
             })
             .collect(),
         links: vec![Link {
@@ -392,6 +394,7 @@ fn replay_topology(map: Vec<(u8, BusId)>) -> Topology {
             bitrate: 500_000,
             fd_enabled: false,
             data_bitrate: 2_000_000,
+            simulate_ack: false,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -427,4 +430,37 @@ fn replay_node_must_be_linked_to_mapped_bus() {
             bus: BusId(2)
         })
     );
+}
+
+#[test]
+fn bus_event_without_kind_deserializes_as_frame() {
+    use crate::{BusEvent, BusEventKind, CanErrorKind, Direction, Timestamp};
+    let ev = BusEvent {
+        time: Timestamp(5),
+        bus: BusId(1),
+        sender: NodeId(1),
+        origin: NodeId(1),
+        dir: Direction::Tx,
+        frame_uid: 0,
+        hop: 0,
+        frame: CanFrame::new(0x10, false, &[1]).unwrap(),
+        kind: BusEventKind::Error {
+            error: CanErrorKind::Ack,
+            node: NodeId(1),
+        },
+    };
+    let mut v = serde_json::to_value(ev).unwrap();
+    assert!(v.get("kind").is_some());
+    let back: BusEvent = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back, ev);
+    v.as_object_mut().unwrap().remove("kind");
+    let old: BusEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(old.kind, BusEventKind::Frame);
+    assert!(!old.is_error());
+}
+
+#[test]
+fn bus_without_simulate_ack_defaults_to_false() {
+    let b: CanBusConfig = serde_json::from_str(r#"{"id":1,"name":"A","bitrate":500000}"#).unwrap();
+    assert!(!b.simulate_ack);
 }

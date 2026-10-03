@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui_extras::{Column, TableBuilder};
-use operow_core::{BusEvent, BusId, CanFrame, Direction, NodeId};
+use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::dbcs::{self, DbcStore};
@@ -49,10 +49,14 @@ pub struct TraceRow {
     pub dlc: u8,
     pub data: [u8; 64],
     pub msg_name: String,
+    /// Set for error frames; `id` is then the frame that failed, `dlc` and
+    /// `data` are empty.
+    pub error: Option<CanErrorKind>,
 }
 
 impl TraceRow {
     pub fn from_event(ev: &BusEvent, names: &NameLookup) -> TraceRow {
+        let error = ev.error_kind();
         TraceRow {
             time_s: ev.time.as_secs_f64(),
             bus: ev.bus,
@@ -65,13 +69,29 @@ impl TraceRow {
             extended: ev.frame.extended,
             fd: ev.frame.fd,
             brs: ev.frame.brs,
-            dlc: ev.frame.dlc,
-            data: ev.frame.data,
-            msg_name: names.msg_name(ev.bus, ev.origin, ev.frame.id, ev.frame.extended),
+            dlc: if error.is_some() { 0 } else { ev.frame.dlc },
+            data: if error.is_some() {
+                [0; 64]
+            } else {
+                ev.frame.data
+            },
+            msg_name: if error.is_some() {
+                "ErrorFrame".to_string()
+            } else {
+                names.msg_name(ev.bus, ev.origin, ev.frame.id, ev.frame.extended)
+            },
+            error,
         }
     }
 
-    pub fn frame_type(&self) -> &'static str {
+    pub fn frame_type(&self) -> String {
+        if let Some(kind) = self.error {
+            return format!("Error {}", kind.label());
+        }
+        self.frame_type_plain().to_string()
+    }
+
+    fn frame_type_plain(&self) -> &'static str {
         match (self.fd, self.brs) {
             (false, _) => "CAN",
             (true, false) => "CAN FD",
@@ -187,7 +207,7 @@ impl Col {
             Col::Name => 120.0,
             Col::Dir => 66.0,
             Col::Hop => 60.0,
-            Col::Type => 80.0,
+            Col::Type => 90.0,
             Col::Count => 70.0,
             Col::Dt => 80.0,
             Col::Dlc => 60.0,
@@ -208,7 +228,7 @@ fn cell_text(col: Col, r: &TraceRow, agg: Option<(u64, Option<f64>)>) -> String 
         Col::Name => r.msg_name.clone(),
         Col::Dir => r.dir_label().to_string(),
         Col::Hop => r.hop.to_string(),
-        Col::Type => r.frame_type().to_string(),
+        Col::Type => r.frame_type(),
         Col::Count => agg.map_or(String::new(), |a| a.0.to_string()),
         Col::Dt => agg
             .and_then(|a| a.1)
@@ -266,6 +286,8 @@ struct FixedKey {
     extended: bool,
     /// `true` for Rx (so Tx sorts first).
     rx: bool,
+    /// Error frames get their own rows, after the frames.
+    error: bool,
 }
 
 /// One fixed-position row: the latest frame for a key plus aggregates.
@@ -307,6 +329,7 @@ fn apply_fixed(fixed: &mut HashMap<FixedKey, FixedRow>, seq: u64, ev: &BusEvent,
         id: ev.frame.id,
         extended: ev.frame.extended,
         rx: ev.dir == Direction::Rx,
+        error: ev.is_error(),
     };
     match fixed.get_mut(&key) {
         Some(f) => {
@@ -359,6 +382,7 @@ fn event_matches(c: &CompiledFilters, ev: &BusEvent, names: &NameLookup) -> bool
         data: ev.frame.payload(),
         dlc: ev.frame.dlc_code(),
         hop: ev.hop,
+        error: ev.is_error(),
     })
 }
 
@@ -373,7 +397,7 @@ fn fixed_items<'a>(
         .iter()
         .filter(|(_, f)| event_matches(c, &f.ev, names))
         .collect();
-    v.sort_by_cached_key(|(k, _)| (names.bus_name(k.bus), k.id, k.extended, k.rx));
+    v.sort_by_cached_key(|(k, _)| (names.bus_name(k.bus), k.id, k.extended, k.rx, k.error));
     v
 }
 
@@ -793,6 +817,11 @@ impl Trace {
         } else {
             egui::Color32::from_rgb(0x1f, 0x5f, 0xc0)
         };
+        let error_color = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(0xff, 0x6b, 0x6b)
+        } else {
+            egui::Color32::from_rgb(0xc0, 0x20, 0x20)
+        };
         let fixed_mode = self.mode == TraceMode::Fixed;
         let cols = self.visible_cols(fixed_mode);
         let now = Instant::now();
@@ -923,12 +952,16 @@ impl Trace {
                                 (seq, *ev, None, None)
                             };
                             let r = TraceRow::from_event(&ev, names);
-                            let decodable = message_def(names, &ev).is_some();
+                            let decodable = !ev.is_error() && message_def(names, &ev).is_some();
                             let open = match key {
                                 Some(k) => expand_all || expanded_fixed.contains(&k),
                                 None => expanded.contains(&seq),
                             };
-                            let tint = (r.dir == Direction::Rx).then_some(rx_color);
+                            let tint = if r.error.is_some() {
+                                Some(error_color)
+                            } else {
+                                (r.dir == Direction::Rx).then_some(rx_color)
+                            };
                             for col in &cols {
                                 row.col(|ui| {
                                     if let Some(c) = tint {
@@ -1443,7 +1476,33 @@ mod tests {
             frame_uid: 0,
             hop: u8::from(dir == Direction::Rx),
             frame: CanFrame::new(id, false, data).unwrap(),
+            kind: Default::default(),
         }
+    }
+
+    #[test]
+    fn error_rows_show_type_and_name_and_skip_data_filters() {
+        let mut e = ev(1, 0x100, Direction::Tx, 5, &[1, 2, 3]);
+        e.kind = operow_core::BusEventKind::Error {
+            error: CanErrorKind::Crc,
+            node: NodeId(1),
+        };
+        let r = TraceRow::from_event(&e, &names());
+        assert_eq!(cell_text(Col::Type, &r, None), "Error CRC");
+        assert_eq!(cell_text(Col::Name, &r, None), "ErrorFrame");
+        assert_eq!(cell_text(Col::Data, &r, None), "");
+        assert_eq!(cell_text(Col::Len, &r, None), "0");
+
+        let mut f = TraceFilters::default();
+        f.data.enabled = true;
+        f.data.text = "01 02".into();
+        let c = f.compile();
+        assert!(event_matches(&c, &e, &names()), "data filter ignored");
+        assert!(!event_matches(
+            &c,
+            &ev(1, 0x100, Direction::Tx, 5, &[9, 9]),
+            &names()
+        ));
     }
 
     fn names() -> NameLookup {

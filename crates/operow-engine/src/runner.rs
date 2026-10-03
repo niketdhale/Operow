@@ -6,7 +6,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
-use crate::sim::{BusStats, GeneratorId, SimError, Simulation};
+use crate::sim::{
+    BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
+};
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,33 @@ pub enum Command {
     GenStopAll {
         gen_id: GeneratorId,
     },
+    /// Add a fault-injection rule (see [`Simulation::inject_errors`]).
+    InjectErrors(InjectSpec),
+    /// Remove every fault-injection rule.
+    ClearInjections,
+    /// Force a node bus-off on a bus; it stays so until `RecoverBusOff`.
+    ForceBusOff(NodeId, BusId),
+    /// Bring a bus-off node back (see [`Simulation::recover_bus_off`]).
+    RecoverBusOff {
+        node: NodeId,
+        bus: BusId,
+    },
+    /// Reseed the random generator used by probabilistic injection.
+    SetSeed(u64),
+    /// Take a node offline or online (`bus: None` = every bus it is linked
+    /// to); see [`Simulation::set_node_online`].
+    SetNodeOnline {
+        node: NodeId,
+        bus: Option<BusId>,
+        online: bool,
+    },
+    /// Set the runtime control of frames with `id` (`(id, extended)`) sent
+    /// by `node`; see [`Simulation::set_msg_control`].
+    SetMsgControl {
+        node: NodeId,
+        id: (u32, bool),
+        control: MsgControl,
+    },
     Shutdown,
 }
 
@@ -62,6 +91,12 @@ pub enum EngineEvent {
     Stats {
         time: Timestamp,
         buses: Vec<(BusId, BusStats)>,
+    },
+    /// Fault-confinement state of every node on every bus it is linked to;
+    /// sent right after each `Stats`.
+    NodeStates {
+        time: Timestamp,
+        nodes: Vec<NodeErrorInfo>,
     },
     State(RunState),
     Log(String),
@@ -200,6 +235,10 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
                 time: Timestamp(state.virtual_ns),
                 buses,
             });
+            let _ = ev_tx.try_send(EngineEvent::NodeStates {
+                time: Timestamp(state.virtual_ns),
+                nodes: sim.node_states(),
+            });
             if dropped_batches > 0 {
                 let _ = ev_tx.try_send(EngineEvent::Log(format!(
                     "dropped {dropped_batches} frame batches (consumer too slow)"
@@ -292,6 +331,41 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
         Command::GenStopAll { gen_id } => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.gen_stop_all(gen_id);
+            }
+        }
+        Command::InjectErrors(spec) => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.inject_errors(spec);
+            }
+        }
+        Command::ClearInjections => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.clear_injections();
+            }
+        }
+        Command::ForceBusOff(node, bus) => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.force_bus_off(node, bus);
+            }
+        }
+        Command::RecoverBusOff { node, bus } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.recover_bus_off(node, bus);
+            }
+        }
+        Command::SetSeed(seed) => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_seed(seed);
+            }
+        }
+        Command::SetNodeOnline { node, bus, online } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_node_online(node, bus, online);
+            }
+        }
+        Command::SetMsgControl { node, id, control } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_msg_control(node, id, control);
             }
         }
         Command::Ecu(node, cmd) => {

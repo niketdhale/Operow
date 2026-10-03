@@ -235,6 +235,8 @@ pub struct RowFields<'a> {
     /// The 4-bit DLC code.
     pub dlc: u8,
     pub hop: u8,
+    /// An error frame: the data and DLC filters do not apply to it.
+    pub error: bool,
 }
 
 /// Parsed, ready-to-run form of [`TraceFilters`]. Filters that are
@@ -395,11 +397,13 @@ impl CompiledFilters {
         {
             return false;
         }
-        if self.data.as_ref().is_some_and(|p| !p.matches(r.data)) {
-            return false;
-        }
-        if self.dlc.is_some_and(|c| !c.matches(r.dlc as u32)) {
-            return false;
+        if !r.error {
+            if self.data.as_ref().is_some_and(|p| !p.matches(r.data)) {
+                return false;
+            }
+            if self.dlc.is_some_and(|c| !c.matches(r.dlc as u32)) {
+                return false;
+            }
         }
         if self.hop.is_some_and(|c| !c.matches(r.hop as u32)) {
             return false;
@@ -423,6 +427,7 @@ mod tests {
             data: &[0x01, 0xFF, 0x10],
             dlc: 3,
             hop: 0,
+            error: false,
         }
     }
 

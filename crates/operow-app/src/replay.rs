@@ -17,7 +17,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use operow_core::{BusEvent, BusId, CanFrame, Direction, NodeId, Timestamp};
+use operow_core::{
+    BusEvent, BusEventKind, BusId, CanErrorKind, CanFrame, Direction, NodeId, Timestamp,
+};
 use operow_log::{LogReader, RecordKind, open_log};
 
 /// First [`NodeId`] of the virtual "Log" senders; channel `n` sends as
@@ -40,6 +42,16 @@ pub fn log_channel(node: NodeId) -> Option<u8> {
 const PROBE_RECORDS: usize = 20_000;
 /// Frames per chunk sent by the reader thread.
 const CHUNK: usize = 1024;
+/// The frame carried by an error event that comes from an `ErrorFrame`
+/// record (the logs hold no frame for it).
+const ERROR_PLACEHOLDER: CanFrame = CanFrame {
+    id: 0,
+    extended: false,
+    fd: false,
+    brs: false,
+    dlc: 0,
+    data: [0; 64],
+};
 /// Chunks the reader may run ahead of playback.
 const AHEAD_CHUNKS: usize = 8;
 /// Most events one `advance` hands out, so fast speeds cannot stall the UI.
@@ -153,6 +165,8 @@ struct Rec {
     channel: u8,
     dir: Direction,
     frame: CanFrame,
+    /// An `ErrorFrame` record; `frame` is all zero then.
+    error: bool,
 }
 
 enum Msg {
@@ -205,8 +219,11 @@ impl Reader {
                 if rec.time < from {
                     continue;
                 }
-                let RecordKind::Frame(frame) = rec.kind else {
-                    continue;
+                let (frame, error) = match rec.kind {
+                    RecordKind::Frame(frame) => (frame, false),
+                    // The log does not say which error it was; it is shown
+                    // as a form error with a zero frame.
+                    RecordKind::ErrorFrame => (ERROR_PLACEHOLDER, true),
                 };
                 let Some(&bus) = map.get(&rec.channel) else {
                     continue;
@@ -217,6 +234,7 @@ impl Reader {
                     channel: rec.channel,
                     dir: rec.dir,
                     frame,
+                    error,
                 });
                 if chunk.len() >= CHUNK
                     && tx
@@ -347,6 +365,14 @@ impl ReplaySource {
             frame_uid: uid,
             hop: 0,
             frame: r.frame,
+            kind: if r.error {
+                BusEventKind::Error {
+                    error: CanErrorKind::Form,
+                    node: log_sender(r.channel),
+                }
+            } else {
+                BusEventKind::Frame
+            },
         }
     }
 
@@ -486,6 +512,25 @@ mod tests {
         assert_eq!(ms(&s.advance(Duration::from_millis(100))), [1000]);
         assert!(!s.playing, "stops at the end");
         assert_eq!(s.position(), Timestamp::from_ms(1000));
+    }
+
+    #[test]
+    fn error_frame_records_become_error_events() {
+        let path = write_log(&[(100, 1, 0x1)]);
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "End TriggerBlock",
+            "   0.200000 1  ErrorFrame\nEnd TriggerBlock",
+        );
+        std::fs::write(&path, text).unwrap();
+        let info = probe(&path).unwrap();
+        let mut s = ReplaySource::new(&path, &info, [(1, BusId(1))].into());
+        s.starve_wait = Duration::from_secs(5);
+        s.playing = true;
+        let evs = s.advance(Duration::from_millis(500)).events;
+        assert_eq!(evs.len(), 2);
+        assert!(!evs[0].is_error());
+        assert_eq!(evs[1].error_kind(), Some(CanErrorKind::Form));
+        assert_eq!(evs[1].frame.dlc, 0);
     }
 
     #[test]
