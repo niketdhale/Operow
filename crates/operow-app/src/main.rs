@@ -6,6 +6,7 @@
 mod app;
 mod dbcs;
 mod filters;
+mod generator_window;
 mod graph;
 mod graph_window;
 mod icons;
@@ -44,6 +45,7 @@ fn main() -> eframe::Result<()> {
             "--demo-filters" => opts.demo_filters = true,
             "--open-new-signal" => opts.open_new_signal = true,
             "--demo-graph" => opts.demo_graph = true,
+            "--demo-generator" => opts.demo_generator = true,
             _ => {}
         }
     }

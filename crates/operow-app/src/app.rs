@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use operow_core::{BusId, DbcRef, Timestamp, Topology};
 use operow_dbc::{BusTarget, Database};
-use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunState};
+use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, GeneratorId, RunState};
 
 use egui_flow::PulseStyle;
 
 use crate::dbcs;
+use crate::generator_window::{AutoChange, DbcRow, GenRow, GeneratorWindow, SendMode, SigEdit};
 use crate::graph::{Graph, PulseDir, PulseSpec, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
 use crate::icons;
@@ -62,6 +63,9 @@ pub struct StartupOptions {
     /// `--demo-graph`: open a Graph with EngineSpeed, Throttle (Y2) and
     /// Running and focus it.
     pub demo_graph: bool,
+    /// `--demo-generator`: open Generator 1 with four rows next to a Trace
+    /// and start its cyclic rows once the measurement runs.
+    pub demo_generator: bool,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -88,6 +92,13 @@ pub struct OperowApp {
     graphs: HashMap<WindowId, GraphWindow>,
     /// The Graph window that was focused last; "Add to graph" targets it.
     last_graph: Option<WindowId>,
+    /// Per-instance state of every open Generator window.
+    generators: HashMap<WindowId, GeneratorWindow>,
+    /// The Generator window that was focused last; "Copy as generator
+    /// frame" targets it.
+    last_generator: Option<WindowId>,
+    /// `--demo-generator`: start this window's cyclic rows when running.
+    demo_generator_pending: Option<WindowId>,
     /// Every bus event, shared by all windows.
     store: FrameStore,
     settings: AppSettings,
@@ -146,6 +157,9 @@ impl OperowApp {
             traces: HashMap::new(),
             graphs: HashMap::new(),
             last_graph: None,
+            generators: HashMap::new(),
+            last_generator: None,
+            demo_generator_pending: None,
             store: FrameStore::new(settings.frame_buffer_size),
             settings,
             show_settings: false,
@@ -191,6 +205,13 @@ impl OperowApp {
         if self.last_graph.is_some_and(|g| !open.contains(&g)) {
             self.last_graph = None;
         }
+        self.generators.retain(|id, _| open.contains(id));
+        for id in open.iter().filter(|w| w.kind == WindowKind::Generator) {
+            self.generators.entry(*id).or_default();
+        }
+        if self.last_generator.is_some_and(|g| !open.contains(&g)) {
+            self.last_generator = None;
+        }
         self.store.set_capacity(self.settings.frame_buffer_size);
         self.store
             .set_reject_when_full(self.settings.when_full == WhenFull::StopMeasurement);
@@ -201,6 +222,9 @@ impl OperowApp {
         self.layout_preset = None;
         if kind == WindowKind::Graph {
             self.last_graph = Some(id);
+        }
+        if kind == WindowKind::Generator {
+            self.last_generator = Some(id);
         }
         id
     }
@@ -235,6 +259,35 @@ impl OperowApp {
         id
     }
 
+    /// The Generator window "Copy as generator frame" targets: the one
+    /// focused last, else the newest open one, else a new "Generator 1".
+    fn target_generator(&mut self) -> WindowId {
+        if let Some(id) = self.last_generator {
+            return id;
+        }
+        let newest = workspace::open_windows(&self.dock)
+            .into_iter()
+            .filter(|w| w.kind == WindowKind::Generator)
+            .max_by_key(|w| w.n);
+        let id = match newest {
+            Some(id) => id,
+            None => self.open_window(WindowKind::Generator, true),
+        };
+        self.sync_instances();
+        id
+    }
+
+    /// Add a trace frame as a row of a Generator window and show it.
+    fn on_copy_as_generator(&mut self, bus: BusId, frame: operow_core::CanFrame) {
+        let id = self.target_generator();
+        if let Some(g) = self.generators.get_mut(&id) {
+            g.add_frame_row(bus, &frame);
+        }
+        workspace::focus(&mut self.dock, id);
+        self.last_generator = Some(id);
+        self.log(format!("copied frame 0x{:X} to {}", frame.id, id.title()));
+    }
+
     /// Put `sig` on a graph window and bring that window to the front.
     fn on_add_signal_to_graph(&mut self, sig: SignalRef) {
         let id = self.target_graph();
@@ -251,10 +304,7 @@ impl OperowApp {
         for a in actions {
             match a {
                 TraceAction::AddSignalToGraph(sig) => self.on_add_signal_to_graph(sig),
-                TraceAction::CopyAsGenerator(frame) => self.log(format!(
-                    "frame 0x{:X} copied as JSON (generator import comes later)",
-                    frame.id
-                )),
+                TraceAction::CopyAsGenerator(bus, frame) => self.on_copy_as_generator(bus, frame),
                 TraceAction::Log(msg) => {
                     if msg.starts_with("error") {
                         self.log_error(msg);
@@ -361,6 +411,9 @@ impl OperowApp {
         if opts.demo_graph {
             self.demo_graph();
         }
+        if opts.demo_generator {
+            self.demo_generator();
+        }
         for t in self.traces.values_mut() {
             if opts.fixed_trace {
                 t.mode = TraceMode::Fixed;
@@ -410,6 +463,110 @@ impl OperowApp {
         workspace::focus(&mut self.dock, id);
     }
 
+    /// `--demo-generator`: Generator 1 with a cyclic raw row, a cyclic DBC
+    /// row (EngineSpeed ramps), a Key row and a Once row, docked right of
+    /// the Trace (needs `dbc_demo.operow.json`).
+    fn demo_generator(&mut self) {
+        // Make room: no project tree, no Properties.
+        self.show_tree = false;
+        let id = WindowId::new(WindowKind::Generator, 1);
+        let trace = WindowId::new(WindowKind::Trace, 1);
+        self.dock = workspace::generator_demo_layout(id);
+        self.layout_preset = None;
+        workspace::focus(&mut self.dock, trace);
+        self.sync_instances();
+        if let Some(t) = self.traces.get_mut(&trace) {
+            use crate::trace::Col;
+            t.hidden.extend([
+                Col::Chn,
+                Col::Dir,
+                Col::Hop,
+                Col::Type,
+                Col::Count,
+                Col::Dt,
+                Col::Dlc,
+                Col::Len,
+            ]);
+        }
+        let bus = self
+            .names
+            .bus_names
+            .iter()
+            .find(|(_, n)| n.as_str() == "Powertrain")
+            .map(|(b, _)| *b)
+            .or_else(|| self.names.bus_names.keys().next().copied());
+        let Some(g) = self.generators.get_mut(&id) else {
+            return;
+        };
+        let signals = vec![
+            SigEdit {
+                name: "EngineSpeed".into(),
+                value: 1500.0,
+                auto: AutoChange::Ramp { period_s: 4.0 },
+            },
+            SigEdit {
+                name: "CoolantTemp".into(),
+                value: 90.0,
+                auto: AutoChange::None,
+            },
+            SigEdit {
+                name: "Throttle".into(),
+                value: 35.0,
+                auto: AutoChange::None,
+            },
+            SigEdit {
+                name: "Running".into(),
+                value: 1.0,
+                auto: AutoChange::None,
+            },
+        ];
+        g.rows = vec![
+            GenRow {
+                uid: 1,
+                bus,
+                id_text: "3A0".into(),
+                data_text: "DE AD BE EF 01 02 03 04".into(),
+                mode: SendMode::Cyclic,
+                period_ms: 100,
+                ..Default::default()
+            },
+            GenRow {
+                uid: 2,
+                bus,
+                mode: SendMode::Cyclic,
+                period_ms: 50,
+                dbc: Some(DbcRow {
+                    msg: "EngineData".into(),
+                    signals,
+                }),
+                ..Default::default()
+            },
+            GenRow {
+                uid: 3,
+                bus,
+                id_text: "3B0".into(),
+                data_text: "01 00 00 00 00 00 00 00".into(),
+                mode: SendMode::Key,
+                key: Some("F5".into()),
+                ..Default::default()
+            },
+            GenRow {
+                uid: 4,
+                bus: None,
+                id_text: "18FF1234".into(),
+                extended: true,
+                dlc: 4,
+                data_text: "CA FE 00 01".into(),
+                mode: SendMode::Once,
+                ..Default::default()
+            },
+        ];
+        let view = g.view();
+        g.apply_view(view);
+        self.demo_generator_pending = Some(id);
+        self.last_generator = Some(id);
+    }
+
     /// Replace the graph with `topo` loaded from `path` and load the
     /// databases it references.
     fn install_topology(&mut self, topo: &Topology, path: &std::path::Path) {
@@ -430,6 +587,8 @@ impl OperowApp {
         // Graphs refer to the previous project's buses; start from scratch.
         self.graphs.clear();
         self.last_graph = None;
+        self.generators.clear();
+        self.last_generator = None;
         self.sync_instances();
         if let Some(ws) = &topo.workspace {
             for (id, view) in workspace::traces_from_json(ws) {
@@ -439,6 +598,11 @@ impl OperowApp {
             }
             for (id, view) in workspace::graphs_from_json(ws) {
                 if let Some(g) = self.graphs.get_mut(&id) {
+                    g.apply_view(view);
+                }
+            }
+            for (id, view) in workspace::generators_from_json(ws) {
+                if let Some(g) = self.generators.get_mut(&id) {
                     g.apply_view(view);
                 }
             }
@@ -705,6 +869,8 @@ impl OperowApp {
         self.project_path = None;
         self.graphs.clear();
         self.last_graph = None;
+        self.generators.clear();
+        self.last_generator = None;
         self.store.clear();
     }
 
@@ -748,7 +914,12 @@ impl OperowApp {
             let mut topo = self.graph.to_topology();
             let views = self.traces.iter().map(|(id, t)| (*id, t.view())).collect();
             let graphs = self.graphs.iter().map(|(id, g)| (*id, g.view())).collect();
-            topo.workspace = workspace::layout_to_json_with(&self.dock, views, graphs);
+            let generators = self
+                .generators
+                .iter()
+                .map(|(id, g)| (*id, g.view()))
+                .collect();
+            topo.workspace = workspace::layout_to_json_with(&self.dock, views, graphs, generators);
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
                 self.last_error = Some(format!("write error: {e}"));
@@ -839,6 +1010,12 @@ impl OperowApp {
             }
             EngineEvent::State(s) => {
                 self.run_state = s;
+                if s == RunState::Stopped {
+                    // The engine dropped its generator timers.
+                    for g in self.generators.values_mut() {
+                        g.stop_local();
+                    }
+                }
                 self.log(format!("state -> {s:?}"));
             }
             EngineEvent::Log(msg) => self.log(msg),
@@ -846,6 +1023,35 @@ impl OperowApp {
                 self.last_error = Some(msg.clone());
                 self.log(format!("error: {msg}"));
             }
+        }
+    }
+
+    /// Sender names, demo start, key presses, auto-change and engine sync
+    /// of every Generator window.
+    fn update_generators(&mut self, ctx: &egui::Context) {
+        self.names.generator_names.clear();
+        for (id, g) in &self.generators {
+            self.names
+                .generator_names
+                .insert(GeneratorId(id.n).node(), g.sender_name(*id));
+        }
+        let running = self.run_state == RunState::Running;
+        if running
+            && let Some(id) = self.demo_generator_pending.take()
+            && let Some(g) = self.generators.get_mut(&id)
+        {
+            for i in 0..g.rows.len() {
+                if g.rows[i].mode == SendMode::Cyclic {
+                    g.start_row(i);
+                }
+            }
+        }
+        let mut cmds = Vec::new();
+        for (id, g) in self.generators.iter_mut() {
+            cmds.extend(g.update(ctx, *id, &self.names, running));
+        }
+        for cmd in cmds {
+            let _ = self.engine.cmd.send(cmd);
         }
     }
 
@@ -1275,11 +1481,14 @@ impl eframe::App for OperowApp {
         if graphs_pending {
             ctx.request_repaint();
         }
-        if let Some((_, tab)) = self.dock.find_active_focused()
-            && tab.kind == WindowKind::Graph
-        {
-            self.last_graph = Some(*tab);
+        if let Some((_, tab)) = self.dock.find_active_focused() {
+            match tab.kind {
+                WindowKind::Graph => self.last_graph = Some(*tab),
+                WindowKind::Generator => self.last_generator = Some(*tab),
+                _ => {}
+            }
         }
+        self.update_generators(ctx);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
@@ -1322,6 +1531,7 @@ impl eframe::App for OperowApp {
                     inspector: &mut self.inspector,
                     traces: &mut self.traces,
                     graphs: &mut self.graphs,
+                    generators: &mut self.generators,
                     store: &self.store,
                     names: &self.names,
                     status_log: &mut self.status_log,

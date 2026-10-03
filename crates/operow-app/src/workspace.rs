@@ -4,6 +4,7 @@
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
+use crate::generator_window::GeneratorView;
 use crate::graph_window::GraphView;
 use crate::trace::TraceView;
 
@@ -137,6 +138,24 @@ fn preset(right: f32, top: f32) -> Dock {
     dock
 }
 
+/// Network on top; Trace/Log/Statistics below with `generator` docked to
+/// the right of them (`--demo-generator`).
+pub fn generator_demo_layout(generator: WindowId) -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [_, bottom] = tree.split_below(
+        NodeIndex::root(),
+        0.35,
+        vec![
+            w(WindowKind::Trace),
+            w(WindowKind::Log),
+            w(WindowKind::Statistics),
+        ],
+    );
+    tree.split_right(bottom, 0.56, vec![generator]);
+    dock
+}
+
 pub fn default_layout() -> Dock {
     LayoutPreset::Default.build()
 }
@@ -198,22 +217,27 @@ struct SavedLayout {
     /// Per-window settings of the Graph windows (signals, mode, ...).
     #[serde(default)]
     graphs: Vec<(WindowId, GraphView)>,
+    /// Per-window settings of the Generator windows (rows, modes, ...).
+    #[serde(default)]
+    generators: Vec<(WindowId, GeneratorView)>,
 }
 
 #[cfg(test)]
 pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
-    layout_to_json_with(dock, Vec::new(), Vec::new())
+    layout_to_json_with(dock, Vec::new(), Vec::new(), Vec::new())
 }
 
-/// Like [`layout_to_json`], also saving the settings of Trace and Graph
-/// windows.
+/// Like [`layout_to_json`], also saving the settings of Trace, Graph and
+/// Generator windows.
 pub fn layout_to_json_with(
     dock: &Dock,
     mut traces: Vec<(WindowId, TraceView)>,
     mut graphs: Vec<(WindowId, GraphView)>,
+    mut generators: Vec<(WindowId, GeneratorView)>,
 ) -> Option<serde_json::Value> {
     traces.sort_by_key(|(id, _)| (id.kind, id.n));
     graphs.sort_by_key(|(id, _)| (id.kind, id.n));
+    generators.sort_by_key(|(id, _)| (id.kind, id.n));
     // Unlaid-out rects are infinite, which JSON cannot represent. Rects are
     // recomputed on the next frame, so store zeros.
     let mut dock = dock.clone();
@@ -228,6 +252,7 @@ pub fn layout_to_json_with(
         dock,
         traces,
         graphs,
+        generators,
     })
     .ok()
 }
@@ -243,6 +268,13 @@ pub fn traces_from_json(value: &serde_json::Value) -> Vec<(WindowId, TraceView)>
 pub fn graphs_from_json(value: &serde_json::Value) -> Vec<(WindowId, GraphView)> {
     serde_json::from_value::<SavedLayout>(value.clone())
         .map(|s| s.graphs)
+        .unwrap_or_default()
+}
+
+/// Saved Generator window settings; empty when absent or invalid.
+pub fn generators_from_json(value: &serde_json::Value) -> Vec<(WindowId, GeneratorView)> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .map(|s| s.generators)
         .unwrap_or_default()
 }
 
@@ -344,7 +376,7 @@ mod tests {
         };
         view.filters.id.enabled = true;
         view.filters.id.text = "100-2FF".into();
-        let json = layout_to_json_with(&dock, vec![(id, view)], Vec::new()).unwrap();
+        let json = layout_to_json_with(&dock, vec![(id, view)], Vec::new(), Vec::new()).unwrap();
         let back = traces_from_json(&json);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, id);
@@ -396,7 +428,7 @@ mod tests {
             layout: GraphLayout::Stacked,
         };
         let topo = Topology {
-            workspace: layout_to_json_with(&dock, Vec::new(), vec![(id, view.clone())]),
+            workspace: layout_to_json_with(&dock, Vec::new(), vec![(id, view.clone())], Vec::new()),
             ..Default::default()
         };
         let back = Topology::from_json(&topo.to_json()).unwrap();
@@ -408,6 +440,54 @@ mod tests {
         let old = layout_to_json(&dock).unwrap();
         assert!(graphs_from_json(&old).is_empty());
         assert!(graphs_from_json(&serde_json::json!("x")).is_empty());
+    }
+
+    #[test]
+    fn generator_config_persists_in_workspace_json() {
+        use crate::generator_window::{
+            AutoChange, DbcRow, GenRow, GeneratorView, SendMode, SigEdit,
+        };
+        let mut dock = default_layout();
+        let id = open_or_focus(&mut dock, WindowKind::Generator, true);
+        let view = GeneratorView {
+            title: Some("Bench".into()),
+            rows: vec![
+                GenRow {
+                    uid: 1,
+                    bus: Some(operow_core::BusId(2)),
+                    id_text: "1A0".into(),
+                    mode: SendMode::Cyclic,
+                    period_ms: 25,
+                    ..Default::default()
+                },
+                GenRow {
+                    uid: 2,
+                    mode: SendMode::Key,
+                    key: Some("F3".into()),
+                    dbc: Some(DbcRow {
+                        msg: "EngineData".into(),
+                        signals: vec![SigEdit {
+                            name: "Throttle".into(),
+                            value: 42.5,
+                            auto: AutoChange::Counter { step: 0.5 },
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            ],
+        };
+        let topo = Topology {
+            workspace: layout_to_json_with(&dock, Vec::new(), Vec::new(), vec![(id, view.clone())]),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let ws = back.workspace.as_ref().unwrap();
+        assert_eq!(generators_from_json(ws), vec![(id, view)]);
+        assert!(layout_from_json(ws).is_some());
+        // Layouts saved before generator settings existed still load.
+        let old = layout_to_json(&dock).unwrap();
+        assert!(generators_from_json(&old).is_empty());
+        assert!(generators_from_json(&serde_json::json!("x")).is_empty());
     }
 
     #[test]

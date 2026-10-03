@@ -8,6 +8,7 @@ use operow_core::BusId;
 use operow_engine::{Command, RunState};
 
 use crate::app::LiveBusStats;
+use crate::generator_window::GeneratorWindow;
 use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::graph_window::GraphWindow;
 use crate::icons;
@@ -25,6 +26,7 @@ pub struct WindowViewer<'a> {
     pub inspector: &'a mut Inspector,
     pub traces: &'a mut HashMap<WindowId, Trace>,
     pub graphs: &'a mut HashMap<WindowId, GraphWindow>,
+    pub generators: &'a mut HashMap<WindowId, GeneratorWindow>,
     pub store: &'a FrameStore,
     pub names: &'a NameLookup,
     pub status_log: &'a mut Vec<String>,
@@ -43,6 +45,11 @@ pub struct WindowViewer<'a> {
 impl WindowViewer<'_> {
     fn running(&self) -> bool {
         self.run_state != RunState::Stopped
+    }
+
+    /// Generator frames may only be sent while the measurement is running.
+    fn can_send(&self) -> bool {
+        self.run_state == RunState::Running
     }
 
     fn network_ui(&mut self, ui: &mut egui::Ui) {
@@ -223,6 +230,7 @@ impl TabViewer for WindowViewer<'_> {
         let title = match tab.kind {
             WindowKind::Trace => self.traces.get(tab).and_then(|t| t.title.as_deref()),
             WindowKind::Graph => self.graphs.get(tab).and_then(|g| g.title.as_deref()),
+            WindowKind::Generator => self.generators.get(tab).and_then(|g| g.title.as_deref()),
             _ => None,
         };
         match title {
@@ -232,7 +240,7 @@ impl TabViewer for WindowViewer<'_> {
     }
 
     fn on_tab_button(&mut self, tab: &mut WindowId, response: &egui::Response) {
-        // Double-click a Trace or Graph tab to rename it.
+        // Double-click a Trace, Graph or Generator tab to rename it.
         if !response.double_clicked() {
             return;
         }
@@ -244,6 +252,11 @@ impl TabViewer for WindowViewer<'_> {
             }
             WindowKind::Graph => {
                 if let Some(g) = self.graphs.get_mut(tab) {
+                    g.begin_rename();
+                }
+            }
+            WindowKind::Generator => {
+                if let Some(g) = self.generators.get_mut(tab) {
                     g.begin_rename();
                 }
             }
@@ -281,9 +294,11 @@ impl TabViewer for WindowViewer<'_> {
                 }
             }
             WindowKind::Generator => {
-                ui.add_space(8.0);
-                ui.heading(id.title());
-                ui.weak("Coming in a later step.");
+                let can_send = self.can_send();
+                if let Some(g) = self.generators.get_mut(&id) {
+                    let cmds = g.ui(ui, id, self.names, can_send);
+                    self.cmds.extend(cmds);
+                }
             }
         }
     }

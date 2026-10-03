@@ -428,8 +428,9 @@ pub struct TraceView {
 pub enum TraceAction {
     /// Hook for step 4 (graph wiring).
     AddSignalToGraph(SignalRef),
-    /// Hook for the generator window; the frame JSON is on the clipboard.
-    CopyAsGenerator(CanFrame),
+    /// Add the frame as a row of a Generator window; the frame JSON is also
+    /// put on the clipboard.
+    CopyAsGenerator(BusId, CanFrame),
     Log(String),
 }
 
@@ -1001,7 +1002,7 @@ impl Trace {
                                 }
                                 if ui.button("Copy as generator frame").clicked() {
                                     ctx_action = Some(CtxAction::Act(
-                                        TraceAction::CopyAsGenerator(r.frame()),
+                                        TraceAction::CopyAsGenerator(r.bus, r.frame()),
                                     ));
                                     ui.close();
                                 }
@@ -1023,11 +1024,11 @@ impl Trace {
                 self.filters.bus.enabled = true;
                 self.filters.bus.selected = BTreeSet::from([name]);
             }
-            Some(CtxAction::Act(TraceAction::CopyAsGenerator(frame))) => {
+            Some(CtxAction::Act(TraceAction::CopyAsGenerator(bus, frame))) => {
                 if let Ok(json) = serde_json::to_string(&frame) {
                     ui.ctx().copy_text(json);
                 }
-                actions.push(TraceAction::CopyAsGenerator(frame));
+                actions.push(TraceAction::CopyAsGenerator(bus, frame));
             }
             Some(CtxAction::Act(a)) => actions.push(a),
             None => {}
@@ -1352,6 +1353,8 @@ pub struct NameLookup {
     pub node_names: HashMap<NodeId, String>,
     pub bus_names: HashMap<BusId, String>,
     pub msg_names: HashMap<(NodeId, u32), String>,
+    /// Virtual sender ids of Generator windows; kept across `rebuild`.
+    pub generator_names: HashMap<NodeId, String>,
     /// DBC databases per bus; their message names take precedence.
     pub dbcs: DbcStore,
 }
@@ -1373,8 +1376,9 @@ impl NameLookup {
     }
 
     pub fn node_name(&self, id: NodeId) -> String {
-        self.node_names
+        self.generator_names
             .get(&id)
+            .or_else(|| self.node_names.get(&id))
             .cloned()
             .unwrap_or_else(|| format!("Node{}", id.0))
     }

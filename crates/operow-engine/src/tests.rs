@@ -9,7 +9,7 @@ use operow_core::{
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx};
 use crate::runner::{Command, Engine, EngineEvent};
-use crate::sim::{MAX_HOPS, Simulation};
+use crate::sim::{GENERATOR_NODE_BASE, GeneratorId, MAX_HOPS, Simulation};
 use crate::timing::{frame_bits, frame_duration_ns};
 
 fn topo_with_two_senders() -> Topology {
@@ -889,4 +889,143 @@ fn script_infinite_loop_is_stopped() {
     let out = run_to(&mut sim, 10);
     assert_eq!(out.len(), 1);
     assert!(sim.drain_logs().iter().any(|l| l.contains("script error")));
+}
+
+fn gen_events(out: &[operow_core::BusEvent]) -> Vec<&operow_core::BusEvent> {
+    out.iter().filter(|e| e.frame.id >= 0x500).collect()
+}
+
+fn gen_frame(id: u32, b: u8) -> CanFrame {
+    CanFrame::new(id, false, &[b]).unwrap()
+}
+
+#[test]
+fn generator_frame_hits_chosen_bus_only_and_gets_forwarded() {
+    let filter = IdFilter::Exact {
+        id: 0x500,
+        extended: false,
+    };
+    let topo = gateway_topo(vec![route(1, 2, filter, None, 0)]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+    sim.gen_send(GeneratorId(1), Some(BusId(1)), gen_frame(0x500, 1));
+    sim.gen_send(GeneratorId(1), Some(BusId(2)), gen_frame(0x501, 2));
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    let g = gen_events(&out);
+    // 0x500: Tx on bus 1 + forwarded to bus 2; 0x501: Tx on bus 2 only.
+    let ids: Vec<(u32, u32, Direction)> = g.iter().map(|e| (e.frame.id, e.bus.0, e.dir)).collect();
+    assert!(ids.contains(&(0x500, 1, Direction::Tx)));
+    assert!(ids.contains(&(0x500, 2, Direction::Rx)));
+    assert!(ids.contains(&(0x501, 2, Direction::Tx)));
+    assert_eq!(g.len(), 3);
+    let tx = g
+        .iter()
+        .find(|e| e.frame.id == 0x500 && e.hop == 0)
+        .unwrap();
+    assert_eq!(tx.sender, GeneratorId(1).node());
+    assert!(tx.sender.0 >= GENERATOR_NODE_BASE);
+    let fwd = g
+        .iter()
+        .find(|e| e.frame.id == 0x500 && e.hop == 1)
+        .unwrap();
+    assert_eq!(fwd.origin, GeneratorId(1).node());
+    assert_eq!(fwd.sender, NodeId(3));
+}
+
+#[test]
+fn generators_have_distinct_sender_ids() {
+    let topo = gateway_topo(vec![]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+    sim.gen_send(GeneratorId(1), None, gen_frame(0x510, 0));
+    sim.gen_send(GeneratorId(2), None, gen_frame(0x511, 0));
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    let a = out.iter().find(|e| e.frame.id == 0x510).unwrap().sender;
+    let b = out.iter().find(|e| e.frame.id == 0x511).unwrap().sender;
+    assert_ne!(a, b);
+    assert_eq!(GeneratorId::from_node(a), Some(GeneratorId(1)));
+    assert_eq!(GeneratorId::from_node(b), Some(GeneratorId(2)));
+    assert_eq!(GeneratorId::from_node(NodeId(3)), None);
+    // `None` fans out to both buses.
+    assert_eq!(out.iter().filter(|e| e.frame.id == 0x510).count(), 2);
+}
+
+#[test]
+fn generator_cyclic_period_is_exact_and_stops() {
+    let topo = gateway_topo(vec![]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+    let g = GeneratorId(1);
+    sim.gen_set_cyclic(g, 0, Some(BusId(1)), gen_frame(0x520, 0), Some(10_000_000));
+    sim.run_until(Timestamp::from_ms(55), &mut out);
+    // Completion times are exactly one period apart.
+    let ends: Vec<u64> = gen_events(&out).iter().map(|e| e.time.0).collect();
+    assert_eq!(ends.len(), 6);
+    // (The first frame waits behind ECU 1's own t=0 frame.)
+    assert!(ends[1..].windows(2).all(|w| w[1] - w[0] == 10_000_000));
+
+    // Restarting does not double the rate.
+    sim.gen_set_cyclic(g, 0, Some(BusId(1)), gen_frame(0x520, 0), Some(10_000_000));
+    out.clear();
+    sim.run_until(Timestamp::from_ms(106), &mut out);
+    assert_eq!(gen_events(&out).len(), 6);
+
+    sim.gen_set_cyclic(g, 0, Some(BusId(1)), gen_frame(0x520, 0), None);
+    out.clear();
+    sim.run_until(Timestamp::from_ms(300), &mut out);
+    assert!(gen_events(&out).is_empty());
+}
+
+#[test]
+fn generator_update_frame_and_stop_all() {
+    let topo = gateway_topo(vec![]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    let mut out = Vec::new();
+    let g = GeneratorId(1);
+    sim.gen_set_cyclic(g, 0, Some(BusId(1)), gen_frame(0x530, 1), Some(10_000_000));
+    sim.gen_set_cyclic(g, 1, Some(BusId(1)), gen_frame(0x531, 1), Some(10_000_000));
+    sim.run_until(Timestamp::from_ms(15), &mut out);
+    sim.gen_update_frame(g, 0, gen_frame(0x530, 9));
+    out.clear();
+    sim.run_until(Timestamp::from_ms(35), &mut out);
+    let v: Vec<u8> = out
+        .iter()
+        .filter(|e| e.frame.id == 0x530)
+        .map(|e| e.frame.data[0])
+        .collect();
+    assert_eq!(v, vec![9, 9]);
+    sim.gen_stop_all(g);
+    out.clear();
+    sim.run_until(Timestamp::from_ms(100), &mut out);
+    assert!(gen_events(&out).is_empty());
+}
+
+#[test]
+fn generator_commands_through_runner() {
+    let handle = Engine::spawn();
+    handle
+        .cmd
+        .send(Command::Load(gateway_topo(vec![])))
+        .unwrap();
+    handle.cmd.send(Command::SetSpeed(0.0)).unwrap();
+    handle.cmd.send(Command::Start).unwrap();
+    handle
+        .cmd
+        .send(Command::GenSetCyclic {
+            gen_id: GeneratorId(1),
+            row: 0,
+            bus: Some(BusId(1)),
+            frame: gen_frame(0x540, 0),
+            period_ns: Some(1_000_000),
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut n = 0;
+    while n < 5 && std::time::Instant::now() < deadline {
+        if let Ok(EngineEvent::Frames(f)) = handle.events.recv_timeout(Duration::from_millis(100)) {
+            n += f.iter().filter(|e| e.frame.id == 0x540).count();
+        }
+    }
+    assert!(n >= 5);
+    handle.shutdown();
 }

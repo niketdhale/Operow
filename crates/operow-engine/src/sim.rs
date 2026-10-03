@@ -15,6 +15,27 @@ use crate::timing::frame_duration_ns_any;
 /// dropped and counted in [`BusStats::routing_drops`].
 pub const MAX_HOPS: u8 = 8;
 
+/// First [`NodeId`] value reserved for interactive generators; topology
+/// nodes must stay below it.
+pub const GENERATOR_NODE_BASE: u32 = 0xF000_0000;
+
+/// Identifier of an interactive generator (a virtual sender that is linked
+/// to every bus and runs no ECU behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GeneratorId(pub u32);
+
+impl GeneratorId {
+    /// The virtual sender id shown in [`BusEvent::sender`] and `origin`.
+    pub fn node(self) -> NodeId {
+        NodeId(GENERATOR_NODE_BASE.saturating_add(self.0))
+    }
+
+    /// The generator behind `node`, if it is a virtual generator id.
+    pub fn from_node(node: NodeId) -> Option<GeneratorId> {
+        node.0.checked_sub(GENERATOR_NODE_BASE).map(GeneratorId)
+    }
+}
+
 /// Errors returned by [`Simulation::new`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SimError {
@@ -54,6 +75,12 @@ enum EventKind {
     },
     Arbitrate {
         bus: BusId,
+    },
+    /// A cyclic generator row is due; stale when `chain` no longer matches.
+    GenTimer {
+        gen_id: GeneratorId,
+        row: u32,
+        chain: u64,
     },
     TxComplete {
         bus: BusId,
@@ -98,6 +125,15 @@ fn arbitration_key(frame: &CanFrame) -> (u32, bool) {
     }
 }
 
+/// A running cyclic generator row.
+struct GenCyclic {
+    bus: Option<BusId>,
+    frame: CanFrame,
+    period_ns: u64,
+    /// Generation counter: timers of older chains are ignored.
+    chain: u64,
+}
+
 /// A discrete-event CAN bus simulation built from a [`Topology`].
 pub struct Simulation {
     node_buses: HashMap<NodeId, Vec<BusId>>,
@@ -112,6 +148,9 @@ pub struct Simulation {
     next_uid: u64,
     stats: HashMap<BusId, BusStats>,
     started: bool,
+    all_buses: Vec<BusId>,
+    gen_rows: HashMap<(GeneratorId, u32), GenCyclic>,
+    gen_chain: u64,
 }
 
 impl Simulation {
@@ -132,6 +171,7 @@ impl Simulation {
         let mut bus_busy = HashMap::new();
         let mut bus_pending = HashMap::new();
         let mut stats = HashMap::new();
+        let all_buses: Vec<BusId> = topology.buses.iter().map(|b| b.id).collect();
         for bus in &topology.buses {
             bus_configs.insert(bus.id, bus.clone());
             bus_busy.insert(bus.id, false);
@@ -168,6 +208,9 @@ impl Simulation {
             next_uid: 0,
             stats,
             started: false,
+            all_buses,
+            gen_rows: HashMap::new(),
+            gen_chain: 0,
         })
     }
 
@@ -211,6 +254,59 @@ impl Simulation {
         self.enqueue_origin(node, bus, frame);
     }
 
+    /// Send one frame from generator `gen_id` on `bus` (`None` = every bus).
+    /// The frame takes part in normal arbitration and gateway forwarding.
+    pub fn gen_send(&mut self, gen_id: GeneratorId, bus: Option<BusId>, frame: CanFrame) {
+        self.ensure_started();
+        self.enqueue_origin(gen_id.node(), bus, frame);
+    }
+
+    /// Start (`Some(period_ns)`, first frame immediately) or stop (`None`)
+    /// the cyclic row `row` of a generator. Restarting replaces the old
+    /// chain.
+    pub fn gen_set_cyclic(
+        &mut self,
+        gen_id: GeneratorId,
+        row: u32,
+        bus: Option<BusId>,
+        frame: CanFrame,
+        period_ns: Option<u64>,
+    ) {
+        self.ensure_started();
+        let Some(period_ns) = period_ns.filter(|p| *p > 0) else {
+            self.gen_rows.remove(&(gen_id, row));
+            return;
+        };
+        self.gen_chain += 1;
+        let chain = self.gen_chain;
+        self.gen_rows.insert(
+            (gen_id, row),
+            GenCyclic {
+                bus,
+                frame,
+                period_ns,
+                chain,
+            },
+        );
+        self.enqueue_origin(gen_id.node(), bus, frame);
+        self.schedule(
+            self.now + period_ns,
+            EventKind::GenTimer { gen_id, row, chain },
+        );
+    }
+
+    /// Change the payload of a running cyclic row; used from its next send.
+    pub fn gen_update_frame(&mut self, gen_id: GeneratorId, row: u32, frame: CanFrame) {
+        if let Some(r) = self.gen_rows.get_mut(&(gen_id, row)) {
+            r.frame = frame;
+        }
+    }
+
+    /// Stop every cyclic row of `gen_id`.
+    pub fn gen_stop_all(&mut self, gen_id: GeneratorId) {
+        self.gen_rows.retain(|(g, _), _| *g != gen_id);
+    }
+
     /// Deliver `cmd` to `node`'s ECU at the current virtual time.
     pub fn command(&mut self, node: NodeId, cmd: EcuCommand) {
         self.ensure_started();
@@ -232,7 +328,11 @@ impl Simulation {
     }
 
     fn enqueue(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame, meta: FrameMeta) {
-        let linked = self.node_buses.get(&node).cloned().unwrap_or_default();
+        let linked = if GeneratorId::from_node(node).is_some() {
+            self.all_buses.clone()
+        } else {
+            self.node_buses.get(&node).cloned().unwrap_or_default()
+        };
         let targets: Vec<BusId> = match bus {
             Some(b) if linked.contains(&b) => vec![b],
             Some(_) => Vec::new(),
@@ -377,6 +477,20 @@ impl Simulation {
             }
             EventKind::Arbitrate { bus } => {
                 self.try_arbitrate(bus);
+            }
+            EventKind::GenTimer { gen_id, row, chain } => {
+                let Some(r) = self.gen_rows.get(&(gen_id, row)) else {
+                    return;
+                };
+                if r.chain != chain {
+                    return;
+                }
+                let (bus, frame, period_ns) = (r.bus, r.frame, r.period_ns);
+                self.enqueue_origin(gen_id.node(), bus, frame);
+                self.schedule(
+                    self.now + period_ns,
+                    EventKind::GenTimer { gen_id, row, chain },
+                );
             }
             EventKind::TxComplete {
                 bus,

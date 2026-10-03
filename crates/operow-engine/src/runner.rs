@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
-use crate::sim::{BusStats, SimError, Simulation};
+use crate::sim::{BusStats, GeneratorId, SimError, Simulation};
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +28,31 @@ pub enum Command {
     SendOnce(NodeId, Option<BusId>, CanFrame),
     /// Deliver a command to an ECU.
     Ecu(NodeId, EcuCommand),
+    /// One frame from an interactive generator (`None` = every bus).
+    GenSend {
+        gen_id: GeneratorId,
+        bus: Option<BusId>,
+        frame: CanFrame,
+    },
+    /// Start (`Some(period)`) or stop (`None`) a cyclic generator row; the
+    /// engine's virtual clock drives it.
+    GenSetCyclic {
+        gen_id: GeneratorId,
+        row: u32,
+        bus: Option<BusId>,
+        frame: CanFrame,
+        period_ns: Option<u64>,
+    },
+    /// Change the payload of a running cyclic generator row.
+    GenUpdateFrame {
+        gen_id: GeneratorId,
+        row: u32,
+        frame: CanFrame,
+    },
+    /// Stop all cyclic rows of a generator.
+    GenStopAll {
+        gen_id: GeneratorId,
+    },
     Shutdown,
 }
 
@@ -241,6 +266,32 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 for line in sim.drain_logs() {
                     let _ = ev_tx.try_send(EngineEvent::Log(line));
                 }
+            }
+        }
+        Command::GenSend { gen_id, bus, frame } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.gen_send(gen_id, bus, frame);
+            }
+        }
+        Command::GenSetCyclic {
+            gen_id,
+            row,
+            bus,
+            frame,
+            period_ns,
+        } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.gen_set_cyclic(gen_id, row, bus, frame, period_ns);
+            }
+        }
+        Command::GenUpdateFrame { gen_id, row, frame } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.gen_update_frame(gen_id, row, frame);
+            }
+        }
+        Command::GenStopAll { gen_id } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.gen_stop_all(gen_id);
             }
         }
         Command::Ecu(node, cmd) => {
