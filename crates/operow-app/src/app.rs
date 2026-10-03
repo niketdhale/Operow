@@ -1,30 +1,35 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use operow_core::{BusId, DbcRef, Timestamp, Topology};
 use operow_dbc::{BusTarget, Database};
 use operow_engine::{BusStats, Command, Engine, EngineEvent, EngineHandle, RunState};
 
-use egui_flow::{Flow, FlowOptions, PulseStyle};
+use egui_flow::PulseStyle;
 
 use crate::dbcs;
-use crate::graph::{Graph, GraphNode, GraphViewer, PulseDir, PulseSpec, pulses_for_events};
+use crate::graph::{Graph, PulseDir, PulseSpec, pulses_for_events};
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::project_tree;
+use crate::settings::{self, AppSettings, WhenFull};
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceMode};
+use crate::windows::WindowViewer;
+use crate::workspace::{self, Dock, LayoutPreset, WindowId, WindowKind};
 
 const MAX_EVENTS_PER_FRAME: usize = 256;
 /// Minimum gap between pulses of one style on one wire.
 const PULSE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Per-bus live stats shown in the top bar.
+/// Per-bus live stats shown in the Statistics window and status bar.
 #[derive(Default, Clone, Copy)]
-struct LiveBusStats {
+pub struct LiveBusStats {
     prev: BusStats,
-    load_pct: f64,
-    frames_per_s: f64,
-    total_frames: u64,
-    error_frames: u64,
+    pub load_pct: f64,
+    pub frames_per_s: f64,
+    pub total_frames: u64,
+    pub error_frames: u64,
 }
 
 /// Options for headless runs / screenshots.
@@ -41,6 +46,10 @@ pub struct StartupOptions {
     pub dbc_bus: Option<String>,
     /// `--open-import-dialog <dbc path>`: open the import dialog.
     pub import_dialog: Option<PathBuf>,
+    /// `--open-settings`: open the settings dialog.
+    pub open_settings: bool,
+    /// `--layout-demo`: open extra windows (Trace 2, Graph 1, Generator 1).
+    pub layout_demo: bool,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -59,7 +68,15 @@ const BITRATES: [u32; 5] = [125_000, 250_000, 500_000, 800_000, 1_000_000];
 pub struct OperowApp {
     graph: Graph,
     inspector: Inspector,
-    trace: Trace,
+    dock: Dock,
+    layout_preset: Option<LayoutPreset>,
+    /// Per-instance state of every open Trace window.
+    traces: HashMap<WindowId, Trace>,
+    settings: AppSettings,
+    show_settings: bool,
+    show_tree: bool,
+    /// The "buffer full -> stop" action has already fired this run.
+    buffer_stop_sent: bool,
     names: NameLookup,
 
     engine: EngineHandle,
@@ -75,7 +92,6 @@ pub struct OperowApp {
     /// When each pulse kind last fired on a wire, for throttling.
     pulse_last: std::collections::HashMap<PulseSpec, std::time::Instant>,
     status_log: Vec<String>,
-    show_log: bool,
     last_error: Option<String>,
     /// File the current topology was opened from / saved to; DBC paths are
     /// stored relative to its folder.
@@ -85,11 +101,6 @@ pub struct OperowApp {
     /// "Add ECU"/"Add CAN Bus" place the new node.
     menu_pos: Option<egui::Pos2>,
 
-    // Interactive generator scratch state, stored per selected ECU via the
-    // inspector node id is out of scope here; kept minimal: a floating
-    // "send once" affordance lives in the top bar acting on the selected
-    // node.
-
     // --screenshot support
     screenshot_path: Option<PathBuf>,
     screenshot_start: Option<std::time::Instant>,
@@ -98,15 +109,26 @@ pub struct OperowApp {
 }
 
 impl OperowApp {
-    pub fn new(screenshot_path: Option<PathBuf>) -> Self {
+    pub fn new(screenshot_path: Option<PathBuf>, settings: AppSettings) -> Self {
         let graph = Graph::default_demo();
         let mut names = NameLookup::default();
         names.rebuild(&graph.to_topology());
 
-        OperowApp {
+        let theme = if settings.dark_theme {
+            AppTheme::Dark
+        } else {
+            AppTheme::Light
+        };
+        let mut app = OperowApp {
             graph,
             inspector: Inspector::default(),
-            trace: Trace::default(),
+            dock: workspace::default_layout(),
+            layout_preset: Some(LayoutPreset::Default),
+            traces: HashMap::new(),
+            settings,
+            show_settings: false,
+            show_tree: true,
+            buffer_stop_sent: false,
             names,
             engine: Engine::spawn(),
             run_state: RunState::Stopped,
@@ -114,11 +136,10 @@ impl OperowApp {
             sim_time: Timestamp::ZERO,
             prev_stats_time: Timestamp::ZERO,
             bus_stats: Default::default(),
-            theme: AppTheme::Light,
+            theme,
             animate_traffic: true,
             pulse_last: Default::default(),
             status_log: Vec::new(),
-            show_log: false,
             last_error: None,
             project_path: None,
             import_dialog: None,
@@ -127,17 +148,44 @@ impl OperowApp {
             screenshot_start: None,
             screenshot_taken: false,
             no_start: false,
+        };
+        app.sync_instances();
+        app
+    }
+
+    /// Keep one `Trace` per open Trace window (dropping closed ones) and
+    /// apply the buffer capacity from the settings.
+    fn sync_instances(&mut self) {
+        let open = workspace::open_windows(&self.dock);
+        self.traces.retain(|id, _| open.contains(id));
+        for id in open.iter().filter(|w| w.kind == WindowKind::Trace) {
+            self.traces.entry(*id).or_default();
+        }
+        for t in self.traces.values_mut() {
+            t.capacity = self.settings.frame_buffer_size;
+        }
+    }
+
+    fn open_window(&mut self, kind: WindowKind, force_new: bool) {
+        workspace::open_or_focus(&mut self.dock, kind, force_new);
+        self.layout_preset = None;
+    }
+
+    fn set_layout(&mut self, preset: LayoutPreset) {
+        self.dock = preset.build();
+        self.layout_preset = Some(preset);
+    }
+
+    fn clear_traces(&mut self) {
+        for t in self.traces.values_mut() {
+            t.clear();
         }
     }
 
     /// Startup options (mainly for headless screenshots).
     pub fn configure_startup(&mut self, opts: StartupOptions) {
         self.no_start = opts.no_start;
-        self.show_log = opts.show_log;
-        if opts.fixed_trace {
-            self.trace.mode = TraceMode::Fixed;
-        }
-        self.trace.expand_all = opts.expand_signals;
+        self.show_settings = opts.open_settings;
         if let Some(path) = opts.topology.as_deref() {
             match std::fs::read_to_string(path)
                 .map_err(|e| e.to_string())
@@ -158,6 +206,21 @@ impl OperowApp {
                 Err(e) => self.log_error(format!("DBC {}: {e}", path.display())),
             }
         }
+        if opts.layout_demo {
+            self.open_window(WindowKind::Trace, true);
+            self.open_window(WindowKind::Graph, true);
+            self.open_window(WindowKind::Generator, true);
+        }
+        self.sync_instances();
+        for t in self.traces.values_mut() {
+            if opts.fixed_trace {
+                t.mode = TraceMode::Fixed;
+            }
+            t.expand_all = opts.expand_signals;
+        }
+        if opts.show_log {
+            workspace::focus(&mut self.dock, WindowId::new(WindowKind::Log, 1));
+        }
         if let Some(path) = opts.import_dialog.as_deref() {
             self.begin_import(path);
         }
@@ -172,6 +235,18 @@ impl OperowApp {
         self.graph = Graph::from_topology(topo);
         self.names.rebuild(topo);
         self.project_path = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        // Restore the saved window layout; fall back to the default.
+        let saved = topo
+            .workspace
+            .as_ref()
+            .and_then(workspace::layout_from_json);
+        self.layout_preset = if saved.is_some() {
+            None
+        } else {
+            Some(LayoutPreset::Default)
+        };
+        self.dock = saved.unwrap_or_else(workspace::default_layout);
+        self.sync_instances();
         self.reload_dbcs();
     }
 
@@ -399,7 +474,8 @@ impl OperowApp {
             return;
         }
         self.names.rebuild(&topo);
-        self.trace.clear();
+        self.clear_traces();
+        self.buffer_stop_sent = false;
         self.bus_stats.clear();
         self.sim_time = Timestamp::ZERO;
         self.prev_stats_time = Timestamp::ZERO;
@@ -431,7 +507,7 @@ impl OperowApp {
         self.names.rebuild(&self.graph.to_topology());
         self.names.dbcs = Default::default();
         self.project_path = None;
-        self.trace.clear();
+        self.clear_traces();
     }
 
     fn open_topology(&mut self) {
@@ -471,7 +547,9 @@ impl OperowApp {
                 let abs = abs.canonicalize().unwrap_or(abs);
                 d.path = dbcs::stored_path(&abs, new_dir.as_deref());
             }
-            let json = self.graph.to_topology().to_json();
+            let mut topo = self.graph.to_topology();
+            topo.workspace = workspace::layout_to_json(&self.dock);
+            let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
                 self.last_error = Some(format!("write error: {e}"));
             } else {
@@ -543,8 +621,9 @@ impl OperowApp {
                     let msg_name =
                         self.names
                             .msg_name(f.bus, f.origin, f.frame.id, f.frame.extended);
-                    self.trace
-                        .push(f, &bus_name, &sender_name, &origin_name, &msg_name);
+                    for trace in self.traces.values_mut() {
+                        trace.push(f, &bus_name, &sender_name, &origin_name, &msg_name);
+                    }
                     self.sim_time = f.time;
                 }
                 if self.animate_traffic {
@@ -579,24 +658,118 @@ impl OperowApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if icons::icon_button(ui, icons::new(), "New topology").clicked() {
-                self.new_topology();
-            }
-            if icons::icon_button(ui, icons::open(), "Open topology...").clicked() {
-                self.open_topology();
-            }
-            if icons::icon_button(ui, icons::save(), "Save topology as...").clicked() {
-                self.save_topology();
-            }
+        egui::MenuBar::new().ui(ui, |ui| {
             let idle = self.run_state == RunState::Stopped;
-            if icons::icon_button_enabled(ui, idle, icons::import(), "Import DBC...").clicked() {
-                self.pick_dbc();
-            }
-            ui.separator();
-
             let running = self.run_state == RunState::Running;
             let paused = self.run_state == RunState::Paused;
+
+            if ui
+                .selectable_label(self.show_tree, "\u{2630}")
+                .on_hover_text("Toggle project tree")
+                .clicked()
+            {
+                self.show_tree = !self.show_tree;
+            }
+            ui.label(egui::RichText::new("Operow").strong());
+            ui.separator();
+
+            ui.menu_button("File", |ui| {
+                if ui.button("New").clicked() {
+                    self.new_topology();
+                    ui.close();
+                }
+                if ui.button("Open...").clicked() {
+                    self.open_topology();
+                    ui.close();
+                }
+                if ui.button("Save as...").clicked() {
+                    self.save_topology();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(idle, egui::Button::new("Import DBC..."))
+                    .clicked()
+                {
+                    self.pick_dbc();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(idle, egui::Button::new("Add ECU")).clicked() {
+                    self.graph.add_ecu(egui::pos2(40.0, 40.0), "NewEcu");
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(idle, egui::Button::new("Add Gateway"))
+                    .clicked()
+                {
+                    self.graph.add_gateway(egui::pos2(40.0, 120.0));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(idle, egui::Button::new("Add CAN Bus"))
+                    .clicked()
+                {
+                    self.graph.add_bus(egui::pos2(40.0, 200.0));
+                    ui.close();
+                }
+            });
+            ui.menu_button("Window", |ui| {
+                for kind in WindowKind::ALL {
+                    if ui.button(kind.label()).clicked() {
+                        self.open_window(kind, false);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.checkbox(&mut self.show_tree, "Project tree").clicked() {
+                    ui.close();
+                }
+                if ui.button("Reset layout").clicked() {
+                    self.set_layout(LayoutPreset::Default);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Simulation", |ui| {
+                if ui
+                    .add_enabled(!running && !paused, egui::Button::new("Start"))
+                    .clicked()
+                {
+                    self.start();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(running || paused, egui::Button::new("Stop"))
+                    .clicked()
+                {
+                    self.stop();
+                    ui.close();
+                }
+                let pr = if paused { "Resume" } else { "Pause" };
+                if ui
+                    .add_enabled(running || paused, egui::Button::new(pr))
+                    .clicked()
+                {
+                    self.pause_resume();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Clear traces").clicked() {
+                    self.clear_traces();
+                    ui.close();
+                }
+                if ui.button("Clear log").clicked() {
+                    self.status_log.clear();
+                    ui.close();
+                }
+                if ui.button("Settings...").clicked() {
+                    self.show_settings = true;
+                    ui.close();
+                }
+            });
+            ui.separator();
 
             if icons::icon_button_enabled(ui, !running && !paused, icons::play(), "Start").clicked()
             {
@@ -615,7 +788,6 @@ impl OperowApp {
             }
 
             ui.separator();
-            ui.label("Speed:");
             let mut speed_idx = if self.speed == 0.0 {
                 3
             } else if self.speed >= 10.0 {
@@ -648,78 +820,43 @@ impl OperowApp {
                 };
                 let _ = self.engine.cmd.send(Command::SetSpeed(self.speed));
             }
+            ui.checkbox(&mut self.animate_traffic, "Animate");
 
             ui.separator();
-            ui.label(format!("t = {:.3} s", self.sim_time.as_secs_f64()));
-
-            ui.separator();
-            let total_load: f64 = if self.bus_stats.is_empty() {
-                0.0
-            } else {
-                self.bus_stats.values().map(|s| s.load_pct).sum::<f64>()
-                    / self.bus_stats.len() as f64
-            };
-            ui.label(format!("avg load: {total_load:.1}%"));
-            ui.label(format!("trace: {} rows", self.trace.len()));
-
-            ui.separator();
-            ui.checkbox(&mut self.animate_traffic, "Animate traffic");
-            let theme_label = match self.theme {
-                AppTheme::Light => "🌙 Dark",
-                AppTheme::Dark => "☀ Light",
-            };
-            if ui.button(theme_label).clicked() {
-                self.theme = self.theme.toggled();
-                self.theme.apply(ui.ctx());
+            if ui.button("+ Trace").clicked() {
+                self.open_window(WindowKind::Trace, true);
             }
-        });
-
-        if !self.bus_stats.is_empty() {
-            ui.horizontal(|ui| {
-                for (bus, stats) in &self.bus_stats {
-                    let name = self.names.bus_name(*bus);
-                    if stats.error_frames > 0 {
-                        ui.label(format!(
-                            "{name}: {:.1}% load, {:.0} fps, {} total, {} errors",
-                            stats.load_pct,
-                            stats.frames_per_s,
-                            stats.total_frames,
-                            stats.error_frames
-                        ));
-                    } else {
-                        ui.label(format!(
-                            "{name}: {:.1}% load, {:.0} fps, {} total",
-                            stats.load_pct, stats.frames_per_s, stats.total_frames
-                        ));
-                    }
-                    ui.separator();
-                }
-            });
-        }
-    }
-
-    fn log_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Log");
-            if icons::icon_button(ui, icons::clear(), "Clear log").clicked() {
-                self.status_log.clear();
+            if ui.button("+ Graph").clicked() {
+                self.open_window(WindowKind::Graph, true);
             }
-            ui.label(format!("{} lines", self.status_log.len()));
-        });
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.status_log {
-                    let text = egui::RichText::new(line).monospace();
-                    if crate::script_editor::is_error_line(line) {
-                        ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), text);
-                    } else {
-                        ui.label(text);
-                    }
+            if ui.button("+ Generator").clicked() {
+                self.open_window(WindowKind::Generator, true);
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("\u{2699} Settings")
+                    .on_hover_text("Settings")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
                 }
+                let current = self.layout_preset.map_or("Custom", |p| p.label());
+                egui::ComboBox::from_id_salt("layout_combo")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for p in LayoutPreset::ALL {
+                            if ui
+                                .selectable_label(self.layout_preset == Some(p), p.label())
+                                .clicked()
+                            {
+                                self.set_layout(p);
+                            }
+                        }
+                    });
+                ui.label("Layout:");
             });
+        });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -733,48 +870,153 @@ impl OperowApp {
             ui.painter().circle_filled(rect.center(), 5.0, color);
             ui.label(label);
             ui.separator();
-            ui.label(format!(
-                "virtual time: {:.3} s",
-                self.sim_time.as_secs_f64()
-            ));
+            ui.label(format!("t = {:.3} s", self.sim_time.as_secs_f64()));
             ui.separator();
-            if let Some(err) = &self.last_error {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xd0, 0x30, 0x30),
-                    format!("last error: {err}"),
-                );
-            } else if let Some(last) = self.status_log.last() {
-                if crate::script_editor::is_error_line(last) {
-                    ui.colored_label(egui::Color32::from_rgb(0xd0, 0x30, 0x30), last);
-                } else {
-                    ui.weak(last);
-                }
+            let mut buses: Vec<(String, f64)> = self
+                .bus_stats
+                .iter()
+                .map(|(b, s)| (self.names.bus_name(*b), s.load_pct))
+                .collect();
+            buses.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, load) in buses {
+                ui.label(format!("{name}: {load:.1}%"));
+                ui.separator();
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let rows = self.traces.values().map(|t| t.len()).max().unwrap_or(0);
+                ui.label(format!(
+                    "Buffer: {} / {} frames",
+                    rows, self.settings.frame_buffer_size
+                ));
+                ui.separator();
+                let red = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
+                if let Some(err) = &self.last_error {
+                    ui.colored_label(red, format!("last error: {err}"));
+                } else if let Some(last) = self.status_log.last() {
+                    if crate::script_editor::is_error_line(last) {
+                        ui.colored_label(red, last);
+                    } else {
+                        ui.weak(last);
+                    }
+                }
+            });
         });
     }
 
-    fn send_once_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(sel) = self.graph.selected() else {
-            return;
-        };
-        let Some(GraphNode::Ecu(ecu)) = self.graph.node(sel) else {
-            return;
-        };
-        if ecu.tx.is_empty() {
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
             return;
         }
-        ui.separator();
-        ui.label(format!("Interactive generator ({}):", ecu.name));
-        let ecu_id = ecu.id;
-        for msg in ecu.tx.clone() {
-            if ui.button(format!("Send {}", msg.name)).clicked() {
-                // `msg.bus` of None means all linked buses.
-                let _ = self
-                    .engine
-                    .cmd
-                    .send(Command::SendOnce(ecu_id, msg.bus, msg.frame));
-            }
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let s = &mut self.settings;
+                ui.heading("Measurement");
+                ui.separator();
+                egui::Grid::new("settings_measurement")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Frame buffer size:");
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                for p in settings::BUFFER_PRESETS {
+                                    if ui
+                                        .selectable_label(
+                                            s.frame_buffer_size == p,
+                                            settings::format_frames(p),
+                                        )
+                                        .clicked()
+                                    {
+                                        s.frame_buffer_size = p;
+                                        changed = true;
+                                    }
+                                }
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut s.frame_buffer_size)
+                                            .range(1_000..=50_000_000)
+                                            .speed(10_000.0)
+                                            .suffix(" frames"),
+                                    )
+                                    .changed();
+                            });
+                            ui.weak(format!(
+                                "Estimated RAM \u{2248} {} per trace window ({} bytes/frame)",
+                                settings::format_bytes(s.estimated_ram_bytes()),
+                                settings::BYTES_PER_FRAME
+                            ));
+                        });
+                        ui.end_row();
+
+                        ui.label("When full:");
+                        ui.horizontal(|ui| {
+                            for w in [WhenFull::DropOldest, WhenFull::StopMeasurement] {
+                                changed |= ui
+                                    .selectable_value(&mut s.when_full, w, w.label())
+                                    .changed();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("UI refresh:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut s.ui_refresh_ms)
+                                    .range(10..=1000)
+                                    .suffix(" ms"),
+                            )
+                            .changed();
+                        ui.end_row();
+                    });
+                ui.add_space(10.0);
+                ui.heading("Appearance");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Theme:");
+                    changed |= ui
+                        .selectable_value(&mut s.dark_theme, true, "Dark")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut s.dark_theme, false, "Light")
+                        .changed();
+                });
+            });
+        if !open {
+            self.show_settings = false;
         }
+        if changed {
+            self.theme = if self.settings.dark_theme {
+                AppTheme::Dark
+            } else {
+                AppTheme::Light
+            };
+            self.theme.apply(ctx);
+            self.sync_instances();
+        }
+    }
+
+    /// Stop the measurement once a trace buffer is full, when so configured.
+    fn check_buffer_full(&mut self) {
+        if self.settings.when_full != WhenFull::StopMeasurement
+            || self.buffer_stop_sent
+            || self.run_state == RunState::Stopped
+            || !self.traces.values().any(|t| t.is_full())
+        {
+            return;
+        }
+        self.buffer_stop_sent = true;
+        self.log(format!(
+            "frame buffer full ({} frames): measurement stopped",
+            self.settings.frame_buffer_size
+        ));
+        self.stop();
     }
 
     fn take_screenshot_if_needed(&mut self, ctx: &egui::Context) {
@@ -801,11 +1043,19 @@ impl OperowApp {
 }
 
 impl eframe::App for OperowApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.save(storage);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        self.check_buffer_full();
+
         if self.run_state == RunState::Running {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                self.settings.ui_refresh_ms as u64,
+            ));
         }
 
         if self.screenshot_path.is_some() && self.screenshot_start.is_none() {
@@ -817,6 +1067,8 @@ impl eframe::App for OperowApp {
             self.screenshot_start = Some(std::time::Instant::now());
         }
 
+        self.sync_instances();
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
         });
@@ -825,102 +1077,54 @@ impl eframe::App for OperowApp {
             self.status_bar(ui);
         });
 
-        egui::TopBottomPanel::bottom("trace_panel")
-            .resizable(true)
-            .default_height(260.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // The default selected-text colour is blue on the blue
-                    // selection fill; use a high-contrast one in both themes.
-                    ui.visuals_mut().selection.stroke.color = if ui.visuals().dark_mode {
-                        egui::Color32::from_rgb(0x10, 0x14, 0x1c)
-                    } else {
-                        egui::Color32::WHITE
-                    };
-                    ui.selectable_value(&mut self.show_log, false, "Trace");
-                    ui.selectable_value(&mut self.show_log, true, "Log");
+        let mut picked = None;
+        if self.show_tree {
+            egui::SidePanel::left("project_tree")
+                .resizable(true)
+                .default_width(240.0)
+                .show(ctx, |ui| {
+                    ui.heading("Project");
+                    ui.separator();
+                    picked = project_tree::ui(ui, &self.graph, &self.names.dbcs);
                 });
-                if self.show_log {
-                    self.log_ui(ui);
-                } else {
-                    self.trace.ui(ui, &self.names);
-                }
-            });
-
-        egui::SidePanel::left("left_panel")
-            .resizable(true)
-            .default_width(660.0)
-            .show(ctx, |ui| {
-                let running = self.run_state != RunState::Stopped;
-                for cmd in self
-                    .inspector
-                    .ui(ui, &mut self.graph, running, &self.names.dbcs)
-                {
-                    let _ = self.engine.cmd.send(cmd);
-                }
-                self.send_once_ui(ui);
-            });
+        }
+        if let Some(id) = picked {
+            self.graph.select(id);
+            self.open_window(WindowKind::Properties, false);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                let running = self.run_state != RunState::Stopped;
-                let opts = FlowOptions {
-                    nodes_connectable: !running,
-                    delete_key: !running,
-                    ..Default::default()
+                let mut viewer = WindowViewer {
+                    graph: &mut self.graph,
+                    inspector: &mut self.inspector,
+                    traces: &mut self.traces,
+                    names: &self.names,
+                    status_log: &mut self.status_log,
+                    bus_stats: &self.bus_stats,
+                    run_state: self.run_state,
+                    theme: self.theme,
+                    menu_pos: &mut self.menu_pos,
+                    cmds: Vec::new(),
+                    graph_changed: false,
                 };
-                let mut viewer = GraphViewer { theme: self.theme };
-                let out =
-                    Flow::new("graph")
-                        .options(opts)
-                        .show(ui, &mut self.graph.state, &mut viewer);
-
-                if running {
-                    return;
+                let style = egui_dock::Style::from_egui(ui.style().as_ref());
+                egui_dock::DockArea::new(&mut self.dock)
+                    .style(style)
+                    .show_add_buttons(false)
+                    .show_close_buttons(true)
+                    .show_inside(ui, &mut viewer);
+                let (cmds, changed) = (viewer.cmds, viewer.graph_changed);
+                for cmd in cmds {
+                    let _ = self.engine.cmd.send(cmd);
                 }
-                if out.pane.secondary_clicked() {
-                    self.menu_pos = out.pane.interact_pointer_pos();
-                }
-                let pos = self.menu_pos.unwrap_or(egui::pos2(40.0, 40.0));
-                out.pane.context_menu(|ui| {
-                    ui.set_min_width(160.0);
-                    if ui.button("Add ECU").clicked() {
-                        let id = self.graph.add_ecu(pos, "NewEcu");
-                        self.graph.select(id);
-                        ui.close();
-                    }
-                    if ui.button("Add Gateway").clicked() {
-                        let id = self.graph.add_gateway(pos);
-                        self.graph.select(id);
-                        ui.close();
-                    }
-                    if ui.button("Add CAN Bus").clicked() {
-                        let id = self.graph.add_bus(pos);
-                        self.graph.select(id);
-                        ui.close();
-                    }
-                });
-                let mut delete = None;
-                for (id, resp) in &out.nodes {
-                    resp.context_menu(|ui| {
-                        ui.set_min_width(120.0);
-                        if ui.button("Properties").clicked() {
-                            self.graph.select(*id);
-                            ui.close();
-                        }
-                        if ui.button("Delete").clicked() {
-                            delete = Some(*id);
-                            ui.close();
-                        }
-                    });
-                }
-                if let Some(id) = delete {
-                    self.graph.remove(id);
+                if changed {
                     self.sync_dbcs();
                 }
             });
 
+        self.settings_ui(ctx);
         self.import_dialog_ui(ctx);
         self.take_screenshot_if_needed(ctx);
 

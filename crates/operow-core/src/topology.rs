@@ -157,6 +157,10 @@ pub struct Topology {
     /// DBC files attached to buses; used for trace decoding only.
     #[serde(default)]
     pub databases: Vec<DbcRef>,
+    /// Opaque UI workspace (window layout) saved with the project. The core
+    /// crate does not interpret it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<serde_json::Value>,
 }
 
 /// Errors returned by [`Topology::validate`].

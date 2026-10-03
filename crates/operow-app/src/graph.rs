@@ -213,6 +213,7 @@ impl Graph {
             buses,
             links,
             databases: self.databases.clone(),
+            workspace: None,
         }
     }
 

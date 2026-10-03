@@ -11,7 +11,6 @@ use operow_core::{BusEvent, BusId, Direction, NodeId};
 use crate::dbcs::{self, DbcStore};
 use crate::icons;
 
-const MAX_ROWS: usize = 100_000;
 /// How long a changed data byte stays highlighted in fixed-position mode.
 const HIGHLIGHT: Duration = Duration::from_secs(1);
 
@@ -170,6 +169,8 @@ pub struct Trace {
     /// Show the signals of every fixed-mode row.
     pub expand_all: bool,
     next_seq: u64,
+    /// Row capacity of the chronological buffer (from the app settings).
+    pub capacity: usize,
 }
 
 impl Default for Trace {
@@ -186,6 +187,7 @@ impl Default for Trace {
             expanded_fixed: HashSet::new(),
             expand_all: false,
             next_seq: 0,
+            capacity: crate::settings::DEFAULT_BUFFER_FRAMES,
         }
     }
 }
@@ -200,6 +202,11 @@ impl Trace {
 
     pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Whether the chronological buffer has reached its capacity.
+    pub fn is_full(&self) -> bool {
+        self.rows.len() >= self.capacity
     }
 
     /// Push one bus event, resolving names via lookup closures. No-op while
@@ -287,9 +294,10 @@ impl Trace {
             }
         }
 
-        if self.rows.len() >= MAX_ROWS
-            && let Some(old) = self.rows.pop_front()
-        {
+        while self.rows.len() >= self.capacity.max(1) {
+            let Some(old) = self.rows.pop_front() else {
+                break;
+            };
             self.expanded.remove(&old.seq);
         }
         self.rows.push_back(row);
@@ -304,8 +312,6 @@ impl Trace {
         let fixed_mode = self.mode == TraceMode::Fixed;
 
         ui.horizontal(|ui| {
-            ui.heading("Trace");
-            ui.separator();
             ui.checkbox(&mut self.paused, "Pause");
             if icons::icon_button(ui, icons::clear(), "Clear trace").clicked() {
                 self.clear();

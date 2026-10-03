@@ -9,13 +9,6 @@ pub enum AppTheme {
 }
 
 impl AppTheme {
-    pub fn toggled(self) -> Self {
-        match self {
-            AppTheme::Light => AppTheme::Dark,
-            AppTheme::Dark => AppTheme::Light,
-        }
-    }
-
     pub fn apply(self, ctx: &egui::Context) {
         let visuals = match self {
             AppTheme::Light => light_visuals(),

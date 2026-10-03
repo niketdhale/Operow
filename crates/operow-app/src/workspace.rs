@@ -1,0 +1,313 @@
+//! The docked workspace: window kinds, instance ids, default layouts and
+//! (de)serialization into the project file.
+
+use egui_dock::{DockState, NodeIndex};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WindowKind {
+    Network,
+    Properties,
+    Trace,
+    Log,
+    Statistics,
+    Graph,
+    Generator,
+}
+
+impl WindowKind {
+    pub const ALL: [WindowKind; 7] = [
+        WindowKind::Network,
+        WindowKind::Properties,
+        WindowKind::Trace,
+        WindowKind::Log,
+        WindowKind::Statistics,
+        WindowKind::Graph,
+        WindowKind::Generator,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowKind::Network => "Network",
+            WindowKind::Properties => "Properties",
+            WindowKind::Trace => "Trace",
+            WindowKind::Log => "Log",
+            WindowKind::Statistics => "Statistics",
+            WindowKind::Graph => "Graph",
+            WindowKind::Generator => "Generator",
+        }
+    }
+
+    /// Whether several instances of this kind may be open at once.
+    pub fn multi(self) -> bool {
+        matches!(
+            self,
+            WindowKind::Trace | WindowKind::Graph | WindowKind::Generator
+        )
+    }
+}
+
+/// One open window: a kind plus an instance number (starting at 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WindowId {
+    pub kind: WindowKind,
+    pub n: u32,
+}
+
+impl WindowId {
+    pub fn new(kind: WindowKind, n: u32) -> Self {
+        WindowId { kind, n }
+    }
+
+    /// Tab title: "Trace", "Trace 2", "Graph 1".
+    pub fn title(&self) -> String {
+        match self.kind {
+            WindowKind::Graph | WindowKind::Generator => {
+                format!("{} {}", self.kind.label(), self.n)
+            }
+            _ if self.n <= 1 => self.kind.label().to_string(),
+            _ => format!("{} {}", self.kind.label(), self.n),
+        }
+    }
+}
+
+pub type Dock = DockState<WindowId>;
+
+fn w(kind: WindowKind) -> WindowId {
+    WindowId::new(kind, 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutPreset {
+    Default,
+    TraceFocus,
+    NetworkOnly,
+}
+
+impl LayoutPreset {
+    pub const ALL: [LayoutPreset; 3] = [
+        LayoutPreset::Default,
+        LayoutPreset::TraceFocus,
+        LayoutPreset::NetworkOnly,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutPreset::Default => "Default",
+            LayoutPreset::TraceFocus => "Trace focus",
+            LayoutPreset::NetworkOnly => "Network only",
+        }
+    }
+
+    pub fn build(self) -> Dock {
+        match self {
+            LayoutPreset::Default => preset(0.78, 0.62),
+            LayoutPreset::TraceFocus => preset(0.78, 0.35),
+            LayoutPreset::NetworkOnly => {
+                let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+                dock.main_surface_mut().split_right(
+                    NodeIndex::root(),
+                    0.78,
+                    vec![w(WindowKind::Properties)],
+                );
+                dock
+            }
+        }
+    }
+}
+
+/// Network centre-top, Properties right, Trace/Log/Statistics tabbed below.
+fn preset(right: f32, top: f32) -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [network, _props] =
+        tree.split_right(NodeIndex::root(), right, vec![w(WindowKind::Properties)]);
+    tree.split_below(
+        network,
+        top,
+        vec![
+            w(WindowKind::Trace),
+            w(WindowKind::Log),
+            w(WindowKind::Statistics),
+        ],
+    );
+    dock
+}
+
+pub fn default_layout() -> Dock {
+    LayoutPreset::Default.build()
+}
+
+/// All open windows.
+pub fn open_windows(dock: &Dock) -> Vec<WindowId> {
+    dock.iter_all_tabs().map(|(_, t)| *t).collect()
+}
+
+/// Instance number for a new window of `kind`: one past the highest open.
+pub fn next_instance(dock: &Dock, kind: WindowKind) -> u32 {
+    open_windows(dock)
+        .iter()
+        .filter(|t| t.kind == kind)
+        .map(|t| t.n)
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
+/// Open a window of `kind`, or focus it when it is a singleton that is
+/// already open. `force_new` always creates a new instance (multi kinds).
+/// Returns the window shown.
+pub fn open_or_focus(dock: &mut Dock, kind: WindowKind, force_new: bool) -> WindowId {
+    if (!kind.multi() || !force_new)
+        && let Some(id) = open_windows(dock).into_iter().find(|t| t.kind == kind)
+    {
+        focus(dock, id);
+        return id;
+    }
+    let id = WindowId::new(kind, next_instance(dock, kind));
+    // Prefer the leaf that already holds windows of this kind.
+    let sibling = open_windows(dock).into_iter().find(|t| t.kind == kind);
+    match sibling.and_then(|s| dock.find_tab(&s)) {
+        Some((surface, node, _)) => {
+            dock.set_focused_node_and_surface((surface, node));
+            dock.push_to_focused_leaf(id);
+        }
+        None => dock.push_to_focused_leaf(id),
+    }
+    id
+}
+
+pub fn focus(dock: &mut Dock, id: WindowId) {
+    if let Some((surface, node, tab)) = dock.find_tab(&id) {
+        dock.set_active_tab((surface, node, tab));
+        dock.set_focused_node_and_surface((surface, node));
+    }
+}
+
+const LAYOUT_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SavedLayout {
+    version: u32,
+    dock: Dock,
+}
+
+pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
+    // Unlaid-out rects are infinite, which JSON cannot represent. Rects are
+    // recomputed on the next frame, so store zeros.
+    let mut dock = dock.clone();
+    for (_, node) in dock.iter_all_nodes_mut() {
+        node.set_rect(egui::Rect::ZERO);
+    }
+    for (_, leaf) in dock.iter_leaves_mut() {
+        leaf.viewport = egui::Rect::ZERO;
+    }
+    serde_json::to_value(SavedLayout {
+        version: LAYOUT_VERSION,
+        dock,
+    })
+    .ok()
+}
+
+/// Parse a saved layout; `None` when invalid, an unknown version or empty.
+pub fn layout_from_json(value: &serde_json::Value) -> Option<Dock> {
+    let saved: SavedLayout = serde_json::from_value(value.clone()).ok()?;
+    if saved.version != LAYOUT_VERSION || open_windows(&saved.dock).is_empty() {
+        return None;
+    }
+    Some(saved.dock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use operow_core::Topology;
+
+    fn kinds(dock: &Dock) -> Vec<WindowKind> {
+        open_windows(dock).iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn default_layout_has_expected_tabs() {
+        let dock = default_layout();
+        let k = kinds(&dock);
+        for kind in [
+            WindowKind::Network,
+            WindowKind::Properties,
+            WindowKind::Trace,
+            WindowKind::Log,
+            WindowKind::Statistics,
+        ] {
+            assert!(k.contains(&kind), "missing {kind:?}");
+        }
+        assert_eq!(k.len(), 5);
+    }
+
+    #[test]
+    fn instance_naming() {
+        assert_eq!(WindowId::new(WindowKind::Trace, 1).title(), "Trace");
+        assert_eq!(WindowId::new(WindowKind::Trace, 2).title(), "Trace 2");
+        assert_eq!(WindowId::new(WindowKind::Graph, 1).title(), "Graph 1");
+        assert_eq!(WindowId::new(WindowKind::Network, 1).title(), "Network");
+    }
+
+    #[test]
+    fn open_new_trace_gets_next_number() {
+        let mut dock = default_layout();
+        let id = open_or_focus(&mut dock, WindowKind::Trace, true);
+        assert_eq!(id.title(), "Trace 2");
+        assert_eq!(
+            open_or_focus(&mut dock, WindowKind::Trace, true).title(),
+            "Trace 3"
+        );
+        // Singletons are focused, not duplicated.
+        open_or_focus(&mut dock, WindowKind::Log, true);
+        assert_eq!(
+            kinds(&dock)
+                .iter()
+                .filter(|k| **k == WindowKind::Log)
+                .count(),
+            1
+        );
+        // Non-forced open of a multi kind focuses the existing one.
+        let n = open_windows(&dock).len();
+        open_or_focus(&mut dock, WindowKind::Trace, false);
+        assert_eq!(open_windows(&dock).len(), n);
+    }
+
+    #[test]
+    fn closed_window_can_be_reopened() {
+        let mut dock = default_layout();
+        dock.retain_tabs(|t| t.kind != WindowKind::Properties);
+        assert!(!kinds(&dock).contains(&WindowKind::Properties));
+        open_or_focus(&mut dock, WindowKind::Properties, false);
+        assert!(kinds(&dock).contains(&WindowKind::Properties));
+    }
+
+    #[test]
+    fn workspace_round_trips_through_topology() {
+        let mut dock = default_layout();
+        open_or_focus(&mut dock, WindowKind::Trace, true);
+        let topo = Topology {
+            workspace: layout_to_json(&dock),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let restored = layout_from_json(back.workspace.as_ref().unwrap()).unwrap();
+        assert_eq!(open_windows(&restored), open_windows(&dock));
+    }
+
+    #[test]
+    fn invalid_layout_falls_back() {
+        assert!(layout_from_json(&serde_json::json!({"nope": 1})).is_none());
+        assert!(layout_from_json(&serde_json::json!("x")).is_none());
+        assert!(layout_from_json(&serde_json::json!({"version": 99, "dock": null})).is_none());
+        let empty = layout_to_json(&DockState::new(vec![])).unwrap();
+        assert!(layout_from_json(&empty).is_none());
+    }
+
+    #[test]
+    fn missing_workspace_is_none() {
+        let topo = Topology::from_json("{}").unwrap();
+        assert!(topo.workspace.is_none());
+    }
+}

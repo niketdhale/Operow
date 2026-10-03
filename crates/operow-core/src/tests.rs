@@ -33,6 +33,7 @@ fn topology_json_roundtrip() {
             bus: BusId(1),
         }],
         databases: vec![],
+        workspace: None,
     };
 
     let json = topo.to_json();
@@ -241,6 +242,7 @@ fn validate_rejects_bad_bus_references() {
             bus: BusId(1),
         }],
         databases: vec![],
+        workspace: None,
     };
     assert_eq!(
         topo.validate(),

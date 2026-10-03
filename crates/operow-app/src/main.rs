@@ -8,9 +8,13 @@ mod dbcs;
 mod graph;
 mod icons;
 mod inspector;
+mod project_tree;
 mod script_editor;
+mod settings;
 mod theme;
 mod trace;
+mod windows;
+mod workspace;
 
 use std::path::PathBuf;
 
@@ -30,6 +34,8 @@ fn main() -> eframe::Result<()> {
             "--dbc" => opts.dbc = args.next().map(PathBuf::from),
             "--dbc-bus" => opts.dbc_bus = args.next(),
             "--open-import-dialog" => opts.import_dialog = args.next().map(PathBuf::from),
+            "--open-settings" => opts.open_settings = true,
+            "--layout-demo" => opts.layout_demo = true,
             _ => {}
         }
     }
@@ -46,8 +52,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            theme::AppTheme::Light.apply(&cc.egui_ctx);
-            let mut app = app::OperowApp::new(screenshot_path);
+            let settings = settings::AppSettings::load(cc.storage);
+            if settings.dark_theme {
+                theme::AppTheme::Dark.apply(&cc.egui_ctx);
+            } else {
+                theme::AppTheme::Light.apply(&cc.egui_ctx);
+            }
+            let mut app = app::OperowApp::new(screenshot_path, settings);
             app.configure_startup(opts);
             Ok(Box::new(app))
         }),

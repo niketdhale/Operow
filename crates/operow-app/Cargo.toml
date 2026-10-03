@@ -9,7 +9,7 @@ name = "operow"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["svg"] }
 egui-flow = { git = "https://github.com/niketdhale/egui-flow", rev = "57f39cb9db68b3d4a7016f61ee3f2d9e5e42fdb9" }
@@ -19,3 +19,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 operow-core = { workspace = true }
 operow-engine = { path = "../operow-engine" }
 operow-dbc = { path = "../operow-dbc" }
+egui_dock = { version = "0.18", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }

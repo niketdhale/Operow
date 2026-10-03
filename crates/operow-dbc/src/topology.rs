@@ -239,6 +239,7 @@ impl Database {
             }],
             links,
             databases: Vec::new(),
+            workspace: None,
         }
     }
 }
