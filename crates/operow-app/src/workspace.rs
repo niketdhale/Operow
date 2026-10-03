@@ -19,10 +19,11 @@ pub enum WindowKind {
     Statistics,
     Graph,
     Generator,
+    Faults,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 7] = [
+    pub const ALL: [WindowKind; 8] = [
         WindowKind::Network,
         WindowKind::Properties,
         WindowKind::Trace,
@@ -30,6 +31,7 @@ impl WindowKind {
         WindowKind::Statistics,
         WindowKind::Graph,
         WindowKind::Generator,
+        WindowKind::Faults,
     ];
 
     pub fn label(self) -> &'static str {
@@ -41,6 +43,7 @@ impl WindowKind {
             WindowKind::Statistics => "Statistics",
             WindowKind::Graph => "Graph",
             WindowKind::Generator => "Generator",
+            WindowKind::Faults => "Faults",
         }
     }
 
@@ -171,6 +174,25 @@ pub fn errors_demo_layout() -> Dock {
     dock
 }
 
+/// Network on top; Trace and Log below with Faults to the right of them
+/// (`--demo-faults`, `--demo-busoff`).
+pub fn faults_demo_layout() -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [left, _props] = tree.split_right(NodeIndex::root(), 0.7, vec![w(WindowKind::Properties)]);
+    let [_, bottom] = tree.split_below(
+        left,
+        0.5,
+        vec![
+            w(WindowKind::Statistics),
+            w(WindowKind::Trace),
+            w(WindowKind::Log),
+        ],
+    );
+    tree.split_right(bottom, 0.56, vec![w(WindowKind::Faults)]);
+    dock
+}
+
 pub fn default_layout() -> Dock {
     LayoutPreset::Default.build()
 }
@@ -202,7 +224,17 @@ pub fn open_or_focus(dock: &mut Dock, kind: WindowKind, force_new: bool) -> Wind
     }
     let id = WindowId::new(kind, next_instance(dock, kind));
     // Prefer the leaf that already holds windows of this kind.
-    let sibling = open_windows(dock).into_iter().find(|t| t.kind == kind);
+    let open = open_windows(dock);
+    let mut sibling = open.iter().copied().find(|t| t.kind == kind);
+    if sibling.is_none() && kind == WindowKind::Faults {
+        // Next to the bottom windows, not on top of the Network.
+        sibling = open.iter().copied().find(|t| {
+            matches!(
+                t.kind,
+                WindowKind::Statistics | WindowKind::Log | WindowKind::Trace
+            )
+        });
+    }
     match sibling.and_then(|s| dock.find_tab(&s)) {
         Some((surface, node, _)) => {
             dock.set_focused_node_and_surface((surface, node));

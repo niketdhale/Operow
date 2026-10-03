@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use operow_core::{
     BusEvent, BusEventKind, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, NodeErrorState,
@@ -141,11 +141,57 @@ pub struct InjectSpec {
     pub remaining: Option<u32>,
 }
 
+/// Runtime control of the frames with one identifier sent by one node; see
+/// [`Simulation::set_msg_control`]. The default does nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MsgControl {
+    /// Drop every frame.
+    pub paused: bool,
+    /// Percentage (0..=100) of frames to drop, drawn from the seeded generator.
+    pub drop_pct: f32,
+    /// Fixed delay before the frame is queued on the bus, in milliseconds.
+    pub delay_ms: f32,
+    /// Extra uniform random delay of +-`jitter_ms` (the total never goes
+    /// below zero).
+    pub jitter_ms: f32,
+}
+
+/// Largest accepted `delay_ms` / `jitter_ms`.
+pub const MAX_MSG_DELAY_MS: f32 = 10_000.0;
+
+impl MsgControl {
+    /// Clamp every field to its valid range (NaN becomes 0).
+    pub fn sanitized(self) -> MsgControl {
+        let clamp = |v: f32, max: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, max) };
+        MsgControl {
+            paused: self.paused,
+            drop_pct: clamp(self.drop_pct, 100.0),
+            delay_ms: clamp(self.delay_ms, MAX_MSG_DELAY_MS),
+            jitter_ms: clamp(self.jitter_ms, MAX_MSG_DELAY_MS),
+        }
+    }
+
+    /// Whether the control has no effect.
+    pub fn is_noop(&self) -> bool {
+        !self.paused && self.drop_pct <= 0.0 && self.delay_ms <= 0.0 && self.jitter_ms <= 0.0
+    }
+}
+
 struct ActiveInject {
     spec: InjectSpec,
     /// Matching transmissions seen so far (for `EveryNth`).
     matched: u64,
     left: Option<u32>,
+}
+
+/// How a bus-off node comes back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BusOffRecovery {
+    /// After 128 * 11 bit times (what injected errors use).
+    #[default]
+    Auto,
+    /// Stays bus-off until [`Simulation::recover_bus_off`].
+    Manual,
 }
 
 /// Fault-confinement counters and state of one node on one bus.
@@ -156,10 +202,17 @@ pub struct NodeErrorInfo {
     pub state: NodeErrorState,
     pub tec: u16,
     pub rec: u16,
+    /// How many times the node has entered bus-off on this bus.
+    pub bus_off_events: u32,
+    /// Virtual time of the last entry into bus-off (0 if none).
+    pub last_bus_off_ns: u64,
 }
 
 #[derive(Default, Clone, Copy)]
 struct NodeErr {
+    bus_off_events: u32,
+    last_bus_off_ns: u64,
+    manual: bool,
     tec: u16,
     rec: u16,
     state: NodeErrorState,
@@ -249,6 +302,11 @@ pub struct BusStats {
     pub dropped_bus_off: u64,
     /// Forwarded frames dropped because they exceeded [`MAX_HOPS`].
     pub routing_drops: u64,
+    /// Frames dropped because their sender was offline (see
+    /// [`Simulation::set_node_online`]).
+    pub dropped_offline: u64,
+    /// Frames dropped by a [`MsgControl`] (paused or `drop_pct`).
+    pub dropped_msg_control: u64,
 }
 
 impl BusStats {
@@ -303,6 +361,12 @@ enum EventKind {
     Recover {
         node: NodeId,
         bus: BusId,
+    },
+    /// A frame held back by a [`MsgControl`] delay is queued now.
+    DelayedEnqueue {
+        bus: BusId,
+        meta: FrameMeta,
+        frame: CanFrame,
     },
 }
 
@@ -370,6 +434,8 @@ pub struct Simulation {
     node_err: HashMap<(NodeId, BusId), NodeErr>,
     injections: Vec<ActiveInject>,
     rng: Rng,
+    offline: HashSet<(NodeId, BusId)>,
+    msg_controls: HashMap<(NodeId, u32, bool), MsgControl>,
 }
 
 impl Simulation {
@@ -439,6 +505,8 @@ impl Simulation {
             node_err: HashMap::new(),
             injections: Vec::new(),
             rng: Rng::new(DEFAULT_SEED),
+            offline: HashSet::new(),
+            msg_controls: HashMap::new(),
         })
     }
 
@@ -522,12 +590,15 @@ impl Simulation {
             .flat_map(|(node, buses)| buses.iter().map(move |bus| (*node, *bus)))
             .map(|(node, bus)| {
                 let (state, tec, rec) = self.node_state(node, bus);
+                let e = self.node_err.get(&(node, bus));
                 NodeErrorInfo {
                     node,
                     bus,
                     state,
                     tec,
                     rec,
+                    bus_off_events: e.map_or(0, |e| e.bus_off_events),
+                    last_bus_off_ns: e.map_or(0, |e| e.last_bus_off_ns),
                 }
             })
             .collect();
@@ -535,10 +606,32 @@ impl Simulation {
         v
     }
 
-    /// Force `node` bus-off on `bus` now; it recovers after the usual
-    /// 1408 bit times. Does nothing for a node that is not linked to `bus`
-    /// (generators count as linked to every bus) or is already bus-off.
+    /// Force `node` bus-off on `bus` until [`Simulation::recover_bus_off`]
+    /// ([`BusOffRecovery::Manual`]).
     pub fn force_bus_off(&mut self, node: NodeId, bus: BusId) {
+        self.force_bus_off_with(node, bus, BusOffRecovery::Manual);
+    }
+
+    /// Bring a bus-off node back error active with cleared counters now
+    /// (the event counters are kept).
+    pub fn recover_bus_off(&mut self, node: NodeId, bus: BusId) {
+        if let Some(e) = self.node_err.get_mut(&(node, bus))
+            && e.state == NodeErrorState::BusOff
+        {
+            *e = NodeErr {
+                bus_off_events: e.bus_off_events,
+                last_bus_off_ns: e.last_bus_off_ns,
+                ..NodeErr::default()
+            };
+            self.schedule(self.now, EventKind::Arbitrate { bus });
+        }
+    }
+
+    /// Force `node` bus-off on `bus` now. With `Auto` it recovers after the
+    /// usual 1408 bit times. Does nothing for a node that is not linked to
+    /// `bus` (generators count as linked to every bus) or is already
+    /// bus-off.
+    pub fn force_bus_off_with(&mut self, node: NodeId, bus: BusId, mode: BusOffRecovery) {
         self.ensure_started();
         let linked = GeneratorId::from_node(node).is_some()
             || self.node_buses.get(&node).is_some_and(|b| b.contains(&bus));
@@ -548,6 +641,7 @@ impl Simulation {
         let e = self.node_err.entry((node, bus)).or_default();
         e.tec = BUS_OFF_LIMIT + 1;
         e.state = NodeErrorState::BusOff;
+        e.manual = mode == BusOffRecovery::Manual;
         self.enter_bus_off(node, bus);
     }
 
@@ -555,6 +649,59 @@ impl Simulation {
         self.node_err
             .get(&(node, bus))
             .is_some_and(|e| e.state == NodeErrorState::BusOff)
+    }
+
+    fn is_offline(&self, node: NodeId, bus: BusId) -> bool {
+        self.offline.contains(&(node, bus))
+    }
+
+    /// Whether `node` is online on `bus`.
+    pub fn node_online(&self, node: NodeId, bus: BusId) -> bool {
+        !self.is_offline(node, bus)
+    }
+
+    /// Take `node` offline or back online, on `bus` or (`None`) on every
+    /// bus it is linked to. An offline node neither transmits (its queued
+    /// and new frames are dropped and counted in
+    /// [`BusStats::dropped_offline`]) nor receives nor acknowledges, so an
+    /// offline gateway forwards nothing. Going back online resumes normal
+    /// behavior; timers kept running meanwhile.
+    pub fn set_node_online(&mut self, node: NodeId, bus: Option<BusId>, online: bool) {
+        let linked: Vec<BusId> = if GeneratorId::from_node(node).is_some() {
+            self.all_buses.clone()
+        } else {
+            self.node_buses.get(&node).cloned().unwrap_or_default()
+        };
+        for b in linked {
+            if bus.is_some_and(|x| x != b) {
+                continue;
+            }
+            if online {
+                self.offline.remove(&(node, b));
+                continue;
+            }
+            self.offline.insert((node, b));
+            let mut dropped = 0;
+            if let Some(pending) = self.bus_pending.get_mut(&b) {
+                let before = pending.len();
+                pending.retain(|(_, m)| m.sender != node);
+                dropped = (before - pending.len()) as u64;
+            }
+            self.stats.entry(b).or_default().dropped_offline += dropped;
+        }
+    }
+
+    /// Set the runtime control for frames with identifier `id` (and
+    /// extended flag) sent by `node` on any bus: whatever the node kind,
+    /// including script and gateway output. A no-op control removes it.
+    /// Values are clamped with [`MsgControl::sanitized`].
+    pub fn set_msg_control(&mut self, node: NodeId, id: (u32, bool), control: MsgControl) {
+        let control = control.sanitized();
+        if control.is_noop() {
+            self.msg_controls.remove(&(node, id.0, id.1));
+        } else {
+            self.msg_controls.insert((node, id.0, id.1), control);
+        }
     }
 
     fn err_state(&self, node: NodeId, bus: BusId) -> NodeErrorState {
@@ -568,7 +715,7 @@ impl Simulation {
     }
 
     /// Nodes that see a frame sent by `sender` on `bus`: every other linked
-    /// node that is not bus-off.
+    /// node that is neither bus-off nor offline.
     fn receivers(&self, bus: BusId, sender: NodeId) -> Vec<NodeId> {
         self.bus_nodes
             .get(&bus)
@@ -576,7 +723,9 @@ impl Simulation {
                 nodes
                     .iter()
                     .copied()
-                    .filter(|n| *n != sender && !self.is_bus_off(*n, bus))
+                    .filter(|n| {
+                        *n != sender && !self.is_bus_off(*n, bus) && !self.is_offline(*n, bus)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -586,8 +735,12 @@ impl Simulation {
     /// schedule its recovery. The caller has set the state.
     fn enter_bus_off(&mut self, node: NodeId, bus: BusId) {
         let recover_at = self.now + BUS_OFF_RECOVERY_BITS * self.bit_ns(bus);
+        let mut manual = false;
         if let Some(e) = self.node_err.get_mut(&(node, bus)) {
             e.recover_at = recover_at;
+            e.bus_off_events += 1;
+            e.last_bus_off_ns = self.now;
+            manual = e.manual;
         }
         let mut dropped = 0;
         if let Some(pending) = self.bus_pending.get_mut(&bus) {
@@ -596,7 +749,9 @@ impl Simulation {
             dropped = (before - pending.len()) as u64;
         }
         self.stats.entry(bus).or_default().dropped_bus_off += dropped;
-        self.schedule(recover_at, EventKind::Recover { node, bus });
+        if !manual {
+            self.schedule(recover_at, EventKind::Recover { node, bus });
+        }
     }
 
     fn count_tx_ok(&mut self, node: NodeId, bus: BusId) {
@@ -779,13 +934,42 @@ impl Simulation {
             None => linked,
         };
         for bus in targets {
+            if self.is_offline(node, bus) {
+                self.stats.entry(bus).or_default().dropped_offline += 1;
+                continue;
+            }
             if self.is_bus_off(node, bus) {
                 self.stats.entry(bus).or_default().dropped_bus_off += 1;
                 continue;
             }
-            self.bus_pending.entry(bus).or_default().push((frame, meta));
-            self.schedule(self.now, EventKind::Arbitrate { bus });
+            if let Some(ctl) = self
+                .msg_controls
+                .get(&(meta.sender, frame.id, frame.extended))
+                .copied()
+            {
+                if ctl.paused
+                    || (ctl.drop_pct > 0.0 && self.rng.next_f64() * 100.0 < f64::from(ctl.drop_pct))
+                {
+                    self.stats.entry(bus).or_default().dropped_msg_control += 1;
+                    continue;
+                }
+                let mut delay_ms = f64::from(ctl.delay_ms);
+                if ctl.jitter_ms > 0.0 {
+                    delay_ms += (self.rng.next_f64() * 2.0 - 1.0) * f64::from(ctl.jitter_ms);
+                }
+                if delay_ms > 0.0 {
+                    let at = self.now + (delay_ms * 1_000_000.0) as u64;
+                    self.schedule(at, EventKind::DelayedEnqueue { bus, meta, frame });
+                    continue;
+                }
+            }
+            self.push_pending(bus, frame, meta);
         }
+    }
+
+    fn push_pending(&mut self, bus: BusId, frame: CanFrame, meta: FrameMeta) {
+        self.bus_pending.entry(bus).or_default().push((frame, meta));
+        self.schedule(self.now, EventKind::Arbitrate { bus });
     }
 
     /// Advance the simulation, processing all events up to and including
@@ -994,6 +1178,12 @@ impl Simulation {
                     self.try_arbitrate(bus);
                     return;
                 }
+                if self.is_offline(meta.sender, bus) {
+                    // The sender went offline mid-frame: the frame is lost.
+                    self.stats.entry(bus).or_default().dropped_offline += 1;
+                    self.try_arbitrate(bus);
+                    return;
+                }
                 self.stats.entry(bus).or_default().frames += 1;
 
                 out.push(BusEvent {
@@ -1079,7 +1269,9 @@ impl Simulation {
             } => {
                 self.bus_busy.insert(bus, false);
                 self.stats.entry(bus).or_default().busy_ns += busy_ns;
-                if self.is_bus_off(meta.sender, bus) {
+                if self.is_offline(meta.sender, bus) {
+                    self.stats.entry(bus).or_default().dropped_offline += 1;
+                } else if self.is_bus_off(meta.sender, bus) {
                     self.stats.entry(bus).or_default().dropped_bus_off += 1;
                 } else {
                     // Retransmit: the frame takes part in arbitration again.
@@ -1087,13 +1279,26 @@ impl Simulation {
                 }
                 self.try_arbitrate(bus);
             }
+            EventKind::DelayedEnqueue { bus, meta, frame } => {
+                if self.is_offline(meta.sender, bus) {
+                    self.stats.entry(bus).or_default().dropped_offline += 1;
+                } else if self.is_bus_off(meta.sender, bus) {
+                    self.stats.entry(bus).or_default().dropped_bus_off += 1;
+                } else {
+                    self.push_pending(bus, frame, meta);
+                }
+            }
             EventKind::Recover { node, bus } => {
                 let now = self.now;
                 if let Some(e) = self.node_err.get_mut(&(node, bus))
                     && e.state == NodeErrorState::BusOff
                     && e.recover_at == now
                 {
-                    *e = NodeErr::default();
+                    *e = NodeErr {
+                        bus_off_events: e.bus_off_events,
+                        last_bus_off_ns: e.last_bus_off_ns,
+                        ..NodeErr::default()
+                    };
                 }
             }
         }

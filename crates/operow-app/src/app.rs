@@ -23,6 +23,7 @@ use crate::logging_window::{self, LoggingInput};
 use crate::network_view::NetworkView;
 use crate::project_tree;
 use crate::replay::{self, LogInfo, ReplaySource};
+use crate::runtime::{FaultRule, FaultsState, RuntimeState};
 use crate::settings::{self, AppSettings, WhenFull};
 use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
 use crate::signals::{RawKind, SignalRef};
@@ -50,6 +51,8 @@ pub struct LiveBusStats {
     pub error_frames: u64,
     pub can_errors: CanErrorCounts,
     pub dropped_bus_off: u64,
+    pub dropped_offline: u64,
+    pub dropped_msg_control: u64,
 }
 
 /// Options for headless runs / screenshots.
@@ -89,6 +92,11 @@ pub struct StartupOptions {
     /// `--demo-errors`: on every start, corrupt the first 20 transmissions of
     /// the `Engine` node's 0x100 frame with CRC errors.
     pub demo_errors: bool,
+    /// `--demo-faults`: open the Faults window with a 10% CRC rule on the
+    /// first bus (any node) and take the `Body` node offline.
+    pub demo_faults: bool,
+    /// `--demo-busoff`: force the `Engine` node bus-off once running.
+    pub demo_busoff: bool,
     /// `--open-log <path>`: open an offline session (channels mapped to the
     /// buses in order) and play it at x1.
     pub open_log: Option<PathBuf>,
@@ -198,6 +206,10 @@ pub struct OperowApp {
     bus_stats: std::collections::HashMap<BusId, LiveBusStats>,
     /// Fault-confinement state of every node, from the live engine.
     node_states: Vec<NodeErrorInfo>,
+    /// Run-time node/message controls sent to the engine (not saved).
+    runtime: RuntimeState,
+    /// Fault-injection rules and seed (not saved).
+    faults: FaultsState,
 
     theme: AppTheme,
     /// Show pulses on the wires for live traffic.
@@ -225,6 +237,10 @@ pub struct OperowApp {
     no_start: bool,
     /// `--demo-errors`: inject CRC errors on every start.
     demo_errors: bool,
+    /// `--demo-faults`: take `Body` offline on every start.
+    demo_faults: bool,
+    /// `--demo-busoff`: force `Engine` bus-off on every start.
+    demo_busoff: bool,
 }
 
 impl OperowApp {
@@ -265,6 +281,8 @@ impl OperowApp {
             prev_stats_time: Timestamp::ZERO,
             bus_stats: Default::default(),
             node_states: Vec::new(),
+            runtime: RuntimeState::default(),
+            faults: FaultsState::default(),
             theme,
             animate_traffic: true,
             pulse_last: Default::default(),
@@ -281,6 +299,8 @@ impl OperowApp {
             screenshot_taken: false,
             no_start: false,
             demo_errors: false,
+            demo_faults: false,
+            demo_busoff: false,
         };
         app.sync_instances();
         app
@@ -452,6 +472,8 @@ impl OperowApp {
     pub fn configure_startup(&mut self, opts: StartupOptions) {
         self.no_start = opts.no_start;
         self.demo_errors = opts.demo_errors;
+        self.demo_faults = opts.demo_faults;
+        self.demo_busoff = opts.demo_busoff;
         self.show_settings = opts.open_settings;
         if let Some(path) = opts.topology.as_deref() {
             match std::fs::read_to_string(path)
@@ -487,6 +509,20 @@ impl OperowApp {
         if opts.demo_errors {
             self.dock = workspace::errors_demo_layout();
             self.layout_preset = None;
+        }
+        if opts.demo_faults || opts.demo_busoff {
+            self.dock = workspace::faults_demo_layout();
+            self.layout_preset = None;
+        }
+        if opts.demo_faults {
+            let topo = self.graph.to_topology();
+            self.faults.rules.push(FaultRule {
+                bus: topo.buses.first().map(|b| b.id),
+                kind: CanErrorKind::Crc,
+                mode: crate::runtime::RuleMode::Probability,
+                pct: 10.0,
+                ..Default::default()
+            });
         }
         let demo_trace = opts.demo_filters.then(|| {
             let id = workspace::open_or_focus(&mut self.dock, WindowKind::Trace, true);
@@ -1393,10 +1429,29 @@ impl OperowApp {
         self.sim_time = Timestamp::ZERO;
         self.prev_stats_time = Timestamp::ZERO;
         let demo_errors = self.demo_errors.then(|| demo_error_spec(&topo)).flatten();
+        self.runtime.reset();
+        let by_name = |name: &str| topo.nodes.iter().find(|n| n.name == name).map(|n| n.id);
+        let demo_offline = self.demo_faults.then(|| by_name("Body")).flatten();
+        let demo_bus_off = self.demo_busoff.then(|| by_name("Engine")).flatten();
+        let buses_of = |node| crate::runtime::buses_of(&topo.links, node);
+        let demo_offline = demo_offline.map(|n| (n, buses_of(n)));
+        let demo_bus_off = demo_bus_off.map(|n| (n, buses_of(n)));
         let _ = self.engine.cmd.send(Command::Load(topo));
         let _ = self.engine.cmd.send(Command::SetSpeed(self.speed));
         if let Some(spec) = demo_errors {
             let _ = self.engine.cmd.send(Command::InjectErrors(spec));
+        }
+        for cmd in self.faults.sync_commands(false) {
+            let _ = self.engine.cmd.send(cmd);
+        }
+        if let Some((node, buses)) = demo_offline {
+            let cmd = self.runtime.set_online(node, None, &buses, false);
+            let _ = self.engine.cmd.send(cmd);
+        }
+        if let Some((node, buses)) = demo_bus_off {
+            for bus in buses {
+                let _ = self.engine.cmd.send(Command::ForceBusOff(node, bus));
+            }
         }
         let _ = self.engine.cmd.send(Command::Start);
     }
@@ -1597,15 +1652,26 @@ impl OperowApp {
                     entry.error_frames = stats.error_frames;
                     entry.can_errors = stats.can_errors;
                     entry.dropped_bus_off = stats.dropped_bus_off;
+                    entry.dropped_offline = stats.dropped_offline;
+                    entry.dropped_msg_control = stats.dropped_msg_control;
                     entry.prev = stats;
                 }
                 self.prev_stats_time = time;
                 self.sim_time = time;
             }
-            EngineEvent::NodeStates { nodes, .. } => self.node_states = nodes,
+            EngineEvent::NodeStates { nodes, .. } => {
+                self.runtime.observe(&nodes, std::time::Instant::now());
+                self.node_states = nodes;
+            }
             EngineEvent::State(s) => {
+                let was_stopped = self.run_state == RunState::Stopped;
                 self.run_state = s;
                 if s == RunState::Stopped {
+                    // The engine forgot its node and message controls (a
+                    // Load also reports Stopped, but then none exist yet).
+                    if !was_stopped {
+                        self.runtime.reset();
+                    }
                     // The engine dropped its generator timers.
                     for g in self.generators.values_mut() {
                         g.stop_local();
@@ -2343,6 +2409,8 @@ impl eframe::App for OperowApp {
                     bus_stats: &self.bus_stats,
                     node_states: &self.node_states,
                     run_state: self.run_state,
+                    faults: &mut self.faults,
+                    runtime: &mut self.runtime,
                     theme: self.theme,
                     menu_pos: &mut self.menu_pos,
                     project_dir: self
@@ -2352,6 +2420,7 @@ impl eframe::App for OperowApp {
                         .map(|p| p.to_path_buf()),
                     cmds: Vec::new(),
                     trace_actions: Vec::new(),
+                    open_request: None,
                 };
                 let style = egui_dock::Style::from_egui(ui.style().as_ref());
                 egui_dock::DockArea::new(&mut self.dock)
@@ -2360,6 +2429,9 @@ impl eframe::App for OperowApp {
                     .show_close_buttons(true)
                     .show_inside(ui, &mut viewer);
                 let (cmds, actions) = (viewer.cmds, viewer.trace_actions);
+                if let Some(kind) = viewer.open_request {
+                    self.open_window(kind, false);
+                }
                 self.handle_trace_actions(actions);
                 for cmd in cmds {
                     let _ = self.engine.cmd.send(cmd);

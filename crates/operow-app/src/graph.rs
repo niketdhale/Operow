@@ -20,6 +20,7 @@ use crate::network_view::{
     self, BUS_DEFAULT_WIDTH, BUS_HEIGHT, BUS_MAX_WIDTH, BUS_MIN_WIDTH, EdgeLook, HandlePlan,
     NetworkLayout, NetworkView, NodeKey, Place,
 };
+use crate::runtime::NodeBadge;
 use crate::theme::AppTheme;
 
 /// Most pulses in flight on one wire; the oldest is replaced beyond this.
@@ -1010,6 +1011,10 @@ pub struct GraphViewer {
     loads: HashMap<BusId, f64>,
     /// ECU/bus pairs that already have a wire.
     wired: HashSet<(FlowId, FlowId)>,
+    /// Live state badge of every node (empty when not running).
+    badges: HashMap<NodeId, NodeBadge>,
+    /// CAN error frames seen per bus, shown in the bus label when above 0.
+    bus_errors: HashMap<BusId, u64>,
 }
 
 impl GraphViewer {
@@ -1030,12 +1035,33 @@ impl GraphViewer {
                 .iter()
                 .map(|e| (e.source, e.target))
                 .collect(),
+            badges: HashMap::new(),
+            bus_errors: HashMap::new(),
+        }
+    }
+
+    /// Show node state badges and per-bus error counts.
+    pub fn with_runtime(
+        mut self,
+        badges: HashMap<NodeId, NodeBadge>,
+        bus_errors: HashMap<BusId, u64>,
+    ) -> Self {
+        self.badges = badges;
+        self.bus_errors = bus_errors;
+        self
+    }
+
+    fn badge_of(&self, data: &GraphNode) -> Option<NodeBadge> {
+        match data {
+            GraphNode::Ecu(e) => self.badges.get(&e.id).copied(),
+            GraphNode::Bus(_) => None,
         }
     }
 }
 
-/// Text inside a bus bar: `CAN1 · 500k · 12.3%`.
-pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>) -> String {
+/// Text inside a bus bar: `CAN1 · 500k · 12.3%`, with ` · 20 err` appended
+/// when `errors > 0`.
+pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String {
     let rate = if b.fd_enabled {
         format!(
             "FD {}/{}",
@@ -1046,7 +1072,12 @@ pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>) -> String {
         format_bitrate(b.bitrate)
     };
     let load = load.map_or("0%".to_string(), |l| format!("{l:.1}%"));
-    format!("{} \u{b7} {rate} \u{b7} {load}", b.name)
+    let err = if errors > 0 {
+        format!(" \u{b7} {errors} err")
+    } else {
+        String::new()
+    };
+    format!("{} \u{b7} {rate} \u{b7} {load}{err}", b.name)
 }
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
@@ -1055,7 +1086,8 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
             ui.horizontal(|ui| {
                 ui.add(icons::icon_image(ui, icons::bus()));
                 let load = self.loads.get(&b.id).copied();
-                ui.label(egui::RichText::new(bus_bar_label(b, load)).strong());
+                let errors = self.bus_errors.get(&b.id).copied().unwrap_or(0);
+                ui.label(egui::RichText::new(bus_bar_label(b, load, errors)).strong());
             });
             return;
         }
@@ -1070,17 +1102,27 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
             GraphNode::Bus(b) if b.fd_enabled => (
                 icons::bus(),
                 format!(
-                    "{} (CAN FD {}/{})",
+                    "{} (CAN FD {}/{}){}",
                     node.data.name(),
                     format_bitrate(b.bitrate),
-                    format_bitrate(b.data_bitrate)
+                    format_bitrate(b.data_bitrate),
+                    self.err_suffix(b.id)
                 ),
             ),
             GraphNode::Bus(b) => (
                 icons::bus(),
-                format!("{} ({})", node.data.name(), format_bitrate(b.bitrate)),
+                format!(
+                    "{} ({}){}",
+                    node.data.name(),
+                    format_bitrate(b.bitrate),
+                    self.err_suffix(b.id)
+                ),
             ),
         };
+        let badge = self.badge_of(&node.data);
+        if badge == Some(NodeBadge::Offline) {
+            ui.set_opacity(0.45);
+        }
         ui.horizontal(|ui| {
             ui.add(icons::icon_image(ui, icon));
             ui.label(egui::RichText::new(title).strong());
@@ -1088,6 +1130,11 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
                 && e.script.is_some()
             {
                 ui.add(icons::icon_image(ui, icons::script()));
+            }
+            if let Some(b) = badge {
+                // Keep the badge readable on a dimmed (offline) node.
+                ui.set_opacity(1.0);
+                badge_ui(ui, b);
             }
         });
         if let GraphNode::Ecu(e) = &node.data
@@ -1120,9 +1167,15 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
                 .corner_radius(CornerRadius::same(4))
                 .inner_margin(Margin::symmetric(8, 3));
         }
+        let stroke = match self.badge_of(&node.data) {
+            Some(b @ (NodeBadge::Passive | NodeBadge::BusOff | NodeBadge::Offline)) => {
+                Stroke::new(2.5_f32, b.color())
+            }
+            _ => Stroke::new(1.5_f32, accent),
+        };
         Frame::new()
             .fill(ui.visuals().window_fill)
-            .stroke(Stroke::new(1.5_f32, accent))
+            .stroke(stroke)
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::same(8))
     }
@@ -1132,7 +1185,31 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
     }
 }
 
+/// Small state badge: a dot for an active node, a coloured word otherwise.
+fn badge_ui(ui: &mut egui::Ui, badge: NodeBadge) {
+    let color = badge.color();
+    if badge == NodeBadge::Active {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        resp.on_hover_text("Error active");
+    } else {
+        ui.label(
+            egui::RichText::new(badge.label())
+                .size(11.0)
+                .strong()
+                .color(color),
+        );
+    }
+}
+
 impl GraphViewer {
+    fn err_suffix(&self, bus: BusId) -> String {
+        match self.bus_errors.get(&bus) {
+            Some(n) if *n > 0 => format!(" \u{b7} {n} err"),
+            _ => String::new(),
+        }
+    }
+
     fn accent(&self, data: &GraphNode) -> egui::Color32 {
         match data {
             GraphNode::Ecu(e) if matches!(e.kind, NodeKind::Gateway { .. }) => {
@@ -1371,14 +1448,26 @@ mod tests {
             simulate_ack: false,
         };
         assert_eq!(
-            bus_bar_label(&b, Some(12.34)),
+            bus_bar_label(&b, Some(12.34), 0),
             "CAN1 \u{b7} 500k \u{b7} 12.3%"
         );
         let fd = CanBusConfig {
             fd_enabled: true,
             ..b
         };
-        assert_eq!(bus_bar_label(&fd, None), "CAN1 \u{b7} FD 500k/2M \u{b7} 0%");
+        assert_eq!(
+            bus_bar_label(&fd, None, 0),
+            "CAN1 \u{b7} FD 500k/2M \u{b7} 0%"
+        );
+        assert_eq!(
+            bus_bar_label(&fd, Some(1.0), 20),
+            "CAN1 \u{b7} FD 500k/2M \u{b7} 1.0% \u{b7} 20 err"
+        );
+        assert_eq!(
+            bus_bar_label(&fd, None, 0),
+            bus_bar_label(&fd, None, 0),
+            "no suffix without errors"
+        );
     }
 
     #[test]

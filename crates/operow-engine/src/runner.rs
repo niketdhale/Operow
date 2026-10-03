@@ -6,7 +6,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
-use crate::sim::{BusStats, GeneratorId, InjectSpec, NodeErrorInfo, SimError, Simulation};
+use crate::sim::{
+    BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
+};
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +59,29 @@ pub enum Command {
     InjectErrors(InjectSpec),
     /// Remove every fault-injection rule.
     ClearInjections,
-    /// Force a node bus-off on a bus.
+    /// Force a node bus-off on a bus; it stays so until `RecoverBusOff`.
     ForceBusOff(NodeId, BusId),
+    /// Bring a bus-off node back (see [`Simulation::recover_bus_off`]).
+    RecoverBusOff {
+        node: NodeId,
+        bus: BusId,
+    },
     /// Reseed the random generator used by probabilistic injection.
     SetSeed(u64),
+    /// Take a node offline or online (`bus: None` = every bus it is linked
+    /// to); see [`Simulation::set_node_online`].
+    SetNodeOnline {
+        node: NodeId,
+        bus: Option<BusId>,
+        online: bool,
+    },
+    /// Set the runtime control of frames with `id` (`(id, extended)`) sent
+    /// by `node`; see [`Simulation::set_msg_control`].
+    SetMsgControl {
+        node: NodeId,
+        id: (u32, bool),
+        control: MsgControl,
+    },
     Shutdown,
 }
 
@@ -327,9 +348,24 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 sim.force_bus_off(node, bus);
             }
         }
+        Command::RecoverBusOff { node, bus } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.recover_bus_off(node, bus);
+            }
+        }
         Command::SetSeed(seed) => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.set_seed(seed);
+            }
+        }
+        Command::SetNodeOnline { node, bus, online } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_node_online(node, bus, online);
+            }
+        }
+        Command::SetMsgControl { node, id, control } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_msg_control(node, id, control);
             }
         }
         Command::Ecu(node, cmd) => {

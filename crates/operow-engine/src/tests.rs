@@ -9,7 +9,9 @@ use operow_core::{
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx};
 use crate::runner::{Command, Engine, EngineEvent};
-use crate::sim::{GENERATOR_NODE_BASE, GeneratorId, InjectMode, InjectSpec, MAX_HOPS, Simulation};
+use crate::sim::{
+    GENERATOR_NODE_BASE, GeneratorId, InjectMode, InjectSpec, MAX_HOPS, MsgControl, Simulation,
+};
 use crate::timing::{frame_bits, frame_duration_ns};
 
 fn topo_with_two_senders() -> Topology {
@@ -1514,7 +1516,7 @@ fn bus_off_node_drops_transmissions_and_receives_nothing() {
         }),
     );
     let frame = CanFrame::new(0x123, false, &[7]).unwrap();
-    sim.force_bus_off(N1, BUS1);
+    sim.force_bus_off_with(N1, BUS1, crate::sim::BusOffRecovery::Auto);
     assert_eq!(sim.node_state(N1, BUS1).0, NodeErrorState::BusOff);
     let mut out = Vec::new();
     sim.send_once(N1, None, frame);
@@ -1699,4 +1701,283 @@ fn runner_reports_node_states_and_accepts_error_commands() {
     }
     assert!(saw_bus_off, "no NodeStates event");
     h.shutdown();
+}
+
+// ---- runtime node / message controls ----
+
+/// Node 1 sends 0x100 every 10 ms on bus 1; node 2 listens on bus 1.
+fn ctl_topo() -> Topology {
+    Topology {
+        nodes: vec![
+            node(1, vec![periodic(0x100, 10, None)], NodeKind::Ecu),
+            node(2, vec![], NodeKind::Ecu),
+        ],
+        buses: vec![bus(1, "A")],
+        links: vec![link(1, 1), link(2, 1)],
+        databases: vec![],
+        user_signals: vec![],
+        workspace: None,
+    }
+}
+
+/// Events produced up to `to_ms` since the previous call.
+fn run_span(sim: &mut Simulation, to_ms: u64) -> Vec<BusEvent> {
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(to_ms), &mut out);
+    out
+}
+
+fn counting_sim(topo: &Topology) -> (Simulation, Arc<AtomicU32>) {
+    let mut sim = Simulation::new(topo).unwrap();
+    let counter = Arc::new(AtomicU32::new(0));
+    sim.set_ecu(
+        NodeId(2),
+        Box::new(CountingEcu {
+            counter: counter.clone(),
+        }),
+    );
+    (sim, counter)
+}
+
+#[test]
+fn offline_transmitter_stops_and_resumes() {
+    let mut sim = Simulation::new(&ctl_topo()).unwrap();
+    assert_eq!(run_span(&mut sim, 100).len(), 10);
+    sim.set_node_online(NodeId(1), None, false);
+    assert!(!sim.node_online(NodeId(1), BusId(1)));
+    assert!(run_span(&mut sim, 200).is_empty());
+    assert!(sim.stats()[&BusId(1)].dropped_offline >= 9);
+    sim.set_node_online(NodeId(1), Some(BusId(1)), true);
+    assert!(run_span(&mut sim, 300).len() >= 9);
+}
+
+#[test]
+fn offline_receiver_gets_nothing_and_resumes() {
+    let (mut sim, counter) = counting_sim(&ctl_topo());
+    run_span(&mut sim, 50);
+    let before = counter.load(Ordering::SeqCst);
+    assert!(before >= 4);
+    sim.set_node_online(NodeId(2), None, false);
+    run_span(&mut sim, 150);
+    assert_eq!(counter.load(Ordering::SeqCst), before);
+    sim.set_node_online(NodeId(2), None, true);
+    run_span(&mut sim, 250);
+    assert!(counter.load(Ordering::SeqCst) >= before + 9);
+}
+
+#[test]
+fn offline_node_does_not_ack() {
+    let mut topo = ctl_topo();
+    topo.buses[0].simulate_ack = true;
+    let mut sim = Simulation::new(&topo).unwrap();
+    assert_eq!(sim.stats().get(&BusId(1)).unwrap().can_errors.ack, 0);
+    sim.set_node_online(NodeId(2), None, false);
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(5), &mut out);
+    assert!(sim.stats()[&BusId(1)].can_errors.ack > 0, "no ACK expected");
+}
+
+#[test]
+fn offline_gateway_does_not_forward_then_resumes() {
+    let topo = gateway_topo(vec![route(1, 2, IdFilter::Any, None, 0)]);
+    let mut topo = topo;
+    topo.nodes[0].tx[0].period_ms = 10;
+    let mut sim = Simulation::new(&topo).unwrap();
+    let on_b = |ev: &[BusEvent]| ev.iter().filter(|e| e.bus == BusId(2)).count();
+    assert!(on_b(&run_span(&mut sim, 50)) >= 4);
+    sim.set_node_online(NodeId(3), None, false);
+    let ev = run_span(&mut sim, 150);
+    assert_eq!(on_b(&ev), 0);
+    assert!(ev.iter().any(|e| e.bus == BusId(1)), "source keeps sending");
+    sim.set_node_online(NodeId(3), None, true);
+    assert!(on_b(&run_span(&mut sim, 250)) >= 8);
+}
+
+#[test]
+fn offline_on_one_bus_keeps_the_other() {
+    let topo = gateway_topo(vec![route(1, 2, IdFilter::Any, None, 0)]);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_node_online(NodeId(3), Some(BusId(2)), false);
+    assert!(sim.node_online(NodeId(3), BusId(1)));
+    assert!(!sim.node_online(NodeId(3), BusId(2)));
+}
+
+#[test]
+fn msg_control_pause_and_resume() {
+    let mut sim = Simulation::new(&ctl_topo()).unwrap();
+    let ctl = MsgControl {
+        paused: true,
+        ..Default::default()
+    };
+    sim.set_msg_control(NodeId(1), (0x100, false), ctl);
+    assert!(run_span(&mut sim, 100).is_empty());
+    assert!(sim.stats()[&BusId(1)].dropped_msg_control >= 9);
+    sim.set_msg_control(NodeId(1), (0x100, false), MsgControl::default());
+    assert!(run_span(&mut sim, 200).len() >= 9);
+}
+
+fn drop_count(seed: u64, pct: f32) -> usize {
+    let mut topo = ctl_topo();
+    topo.nodes[0].tx[0].period_ms = 1;
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.set_seed(seed);
+    sim.set_msg_control(
+        NodeId(1),
+        (0x100, false),
+        MsgControl {
+            drop_pct: pct,
+            ..Default::default()
+        },
+    );
+    run_span(&mut sim, 2000).len()
+}
+
+#[test]
+fn msg_control_drop_pct_is_seeded_and_bounded() {
+    let sent = drop_count(7, 0.0) as f64;
+    let kept = drop_count(7, 30.0) as f64;
+    let frac = 1.0 - kept / sent;
+    assert!((0.25..0.35).contains(&frac), "dropped {frac}");
+    assert_eq!(drop_count(7, 30.0) as f64, kept, "same seed, same result");
+    assert_eq!(drop_count(7, 100.0), 0);
+}
+
+#[test]
+fn msg_control_delay_and_jitter_bounds() {
+    let first_time = |ctl: MsgControl| {
+        let mut sim = Simulation::new(&ctl_topo()).unwrap();
+        sim.set_msg_control(NodeId(1), (0x100, false), ctl);
+        let ev = run_span(&mut sim, 5);
+        ev.first().map(|e| e.time.0)
+    };
+    let dur = frame_duration_ns(&CanFrame::new(0x100, false, &[1]).unwrap(), 500_000);
+    assert_eq!(first_time(MsgControl::default()), Some(dur));
+    // 3 ms delay: nothing before 3 ms, the first frame completes at 3 ms + dur.
+    let d = first_time(MsgControl {
+        delay_ms: 3.0,
+        ..Default::default()
+    });
+    assert_eq!(d, Some(3_000_000 + dur));
+    // Jitter only: queued within +-2 ms (negative clamps to now).
+    for seed in 1..30u64 {
+        let mut sim = Simulation::new(&ctl_topo()).unwrap();
+        sim.set_seed(seed);
+        sim.set_msg_control(
+            NodeId(1),
+            (0x100, false),
+            MsgControl {
+                delay_ms: 1.0,
+                jitter_ms: 2.0,
+                ..Default::default()
+            },
+        );
+        let ev = run_span(&mut sim, 5);
+        let t = ev.first().expect("frame within 5ms").time.0;
+        assert!(t >= dur && t <= 3_000_000 + dur, "t = {t}");
+    }
+}
+
+#[test]
+fn msg_control_applies_to_script_output_by_id() {
+    let script = r#"
+        fn on_message(msg) {
+            if msg.id == 0x100 {
+                output(#{ id: 0x200, data: msg.data, bus: msg.bus });
+            }
+        }
+    "#;
+    let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
+    sim.set_msg_control(
+        NodeId(1),
+        (0x200, false),
+        MsgControl {
+            paused: true,
+            ..Default::default()
+        },
+    );
+    let ev = run_span(&mut sim, 20);
+    assert!(ev.iter().any(|e| e.frame.id == 0x100));
+    assert!(!ev.iter().any(|e| e.frame.id == 0x200));
+    assert!(sim.stats()[&BusId(1)].dropped_msg_control >= 1);
+}
+
+#[test]
+fn msg_control_sanitizes_values() {
+    let c = MsgControl {
+        paused: false,
+        drop_pct: 250.0,
+        delay_ms: -4.0,
+        jitter_ms: f32::NAN,
+    }
+    .sanitized();
+    assert_eq!(c.drop_pct, 100.0);
+    assert_eq!(c.delay_ms, 0.0);
+    assert_eq!(c.jitter_ms, 0.0);
+    assert!(MsgControl::default().is_noop());
+}
+
+#[test]
+fn runtime_controls_reset_on_stop() {
+    let h = Engine::spawn();
+    h.cmd.send(Command::Load(ctl_topo())).unwrap();
+    h.cmd
+        .send(Command::SetNodeOnline {
+            node: NodeId(1),
+            bus: None,
+            online: false,
+        })
+        .unwrap();
+    h.cmd.send(Command::Stop).unwrap();
+    h.cmd.send(Command::SetSpeed(0.0)).unwrap();
+    h.cmd.send(Command::Start).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw = false;
+    while std::time::Instant::now() < deadline && !saw {
+        if let Ok(EngineEvent::Frames(f)) = h.events.recv_timeout(Duration::from_millis(100)) {
+            saw = !f.is_empty();
+        }
+    }
+    assert!(saw, "node should be online again after Stop");
+    h.shutdown();
+}
+
+#[test]
+fn manual_bus_off_holds_until_recovered_and_counts_events() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 10)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.force_bus_off(N1, BUS1);
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(50), &mut out);
+    let info = |sim: &Simulation| {
+        sim.node_states()
+            .into_iter()
+            .find(|i| i.node == N1)
+            .unwrap()
+    };
+    assert_eq!(info(&sim).state, NodeErrorState::BusOff, "no auto recovery");
+    assert_eq!(info(&sim).bus_off_events, 1);
+    assert!(out.iter().all(|e| e.sender != N1));
+    sim.recover_bus_off(N1, BUS1);
+    assert_eq!(info(&sim).state, NodeErrorState::ErrorActive);
+    assert_eq!(info(&sim).bus_off_events, 1, "counter survives recovery");
+    out.clear();
+    sim.run_until(Timestamp::from_ms(100), &mut out);
+    assert!(out.iter().any(|e| e.sender == N1));
+}
+
+#[test]
+fn injected_bus_off_recovers_automatically_and_is_counted() {
+    let topo = err_topo(&[(1, 0x100, 10), (2, 0x200, 1000)], 500_000, false);
+    let mut sim = Simulation::new(&topo).unwrap();
+    sim.inject_errors(inject_spec(1, CanErrorKind::Bit, InjectMode::Count(40)));
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(200), &mut out);
+    let i = sim
+        .node_states()
+        .into_iter()
+        .find(|i| i.node == N1)
+        .unwrap();
+    assert!(i.bus_off_events >= 1);
+    assert!(i.last_bus_off_ns > 0);
+    assert_ne!(i.state, NodeErrorState::BusOff, "auto recovery");
 }
