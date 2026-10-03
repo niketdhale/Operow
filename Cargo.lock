@@ -2431,6 +2431,7 @@ dependencies = [
  "operow-core",
  "operow-dbc",
  "operow-engine",
+ "operow-log",
  "rfd",
  "serde",
  "serde_json",
@@ -2461,6 +2462,15 @@ dependencies = [
  "crossbeam-channel",
  "operow-core",
  "rhai",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "operow-log"
+version = "0.1.0"
+dependencies = [
+ "operow-core",
+ "operow-engine",
  "thiserror 2.0.21",
 ]
 

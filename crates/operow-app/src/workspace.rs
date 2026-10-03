@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::generator_window::GeneratorView;
 use crate::graph_window::GraphView;
+use crate::logging::LoggingConfig;
 use crate::network_view::NetworkLayout;
 use crate::trace::TraceView;
 
@@ -225,6 +226,10 @@ struct SavedLayout {
     /// before it existed have none and open in the default bus-line view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     network: Option<NetworkLayout>,
+    /// ASC logging settings. Projects saved before logging existed have
+    /// none and get the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logging: Option<LoggingConfig>,
 }
 
 #[cfg(test)]
@@ -260,8 +265,28 @@ pub fn layout_to_json_with(
         graphs,
         generators,
         network,
+        logging: None,
     })
     .ok()
+}
+
+/// Add the logging settings to a layout produced by [`layout_to_json_with`].
+pub fn with_logging(
+    layout: Option<serde_json::Value>,
+    logging: &LoggingConfig,
+) -> Option<serde_json::Value> {
+    let mut layout = layout?;
+    layout
+        .as_object_mut()?
+        .insert("logging".into(), serde_json::to_value(logging).ok()?);
+    Some(layout)
+}
+
+/// Saved logging settings; `None` when absent or invalid.
+pub fn logging_from_json(value: &serde_json::Value) -> Option<LoggingConfig> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .ok()
+        .and_then(|s| s.logging)
 }
 
 /// Saved Network view and positions; `None` when absent or invalid.
@@ -515,6 +540,32 @@ mod tests {
         let old = layout_to_json(&dock).unwrap();
         assert!(generators_from_json(&old).is_empty());
         assert!(generators_from_json(&serde_json::json!("x")).is_empty());
+    }
+
+    #[test]
+    fn logging_config_persists_in_workspace_json() {
+        use crate::logging::{Condition, StartTrigger, StopTrigger};
+        let dock = default_layout();
+        let mut cfg = LoggingConfig {
+            enabled: true,
+            split_minutes: Some(5),
+            ..Default::default()
+        };
+        cfg.trigger.start = StartTrigger::OnCondition(Condition::Key('x'));
+        cfg.trigger.stop = StopTrigger::AfterSeconds(3.0);
+        let json = with_logging(layout_to_json(&dock), &cfg).unwrap();
+        let topo = Topology {
+            workspace: Some(json),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let ws = back.workspace.as_ref().unwrap();
+        assert_eq!(logging_from_json(ws), Some(cfg));
+        assert!(layout_from_json(ws).is_some());
+        // Projects saved before logging existed have none.
+        let old = layout_to_json(&dock).unwrap();
+        assert_eq!(logging_from_json(&old), None);
+        assert_eq!(logging_from_json(&serde_json::json!("x")), None);
     }
 
     #[test]

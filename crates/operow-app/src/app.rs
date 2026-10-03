@@ -13,11 +13,15 @@ use crate::graph::{Graph, PulseDir, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
 use crate::icons;
 use crate::inspector::Inspector;
+use crate::logging::{
+    CmpOp, Condition, LogContext, LogRuntime, LogState, LoggingConfig, SigCmp, StartTrigger,
+};
+use crate::logging_window::{self, LoggingInput};
 use crate::network_view::NetworkView;
 use crate::project_tree;
 use crate::settings::{self, AppSettings, WhenFull};
 use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
-use crate::signals::SignalRef;
+use crate::signals::{RawKind, SignalRef};
 use crate::store::FrameStore;
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceAction, TraceMode};
@@ -73,6 +77,9 @@ pub struct StartupOptions {
     pub demo_generator: bool,
     /// `--network-view freeform|busline`: the Network window layout.
     pub network_view: Option<NetworkView>,
+    /// `--demo-logging`: open the Logging window with a signal trigger and
+    /// log into the temp folder while the measurement runs.
+    pub demo_logging: bool,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -108,6 +115,10 @@ pub struct OperowApp {
     demo_generator_pending: Option<WindowId>,
     /// Every bus event, shared by all windows.
     store: FrameStore,
+    /// ASC logging settings (saved with the project) and its task.
+    logging: LoggingConfig,
+    log_rt: LogRuntime,
+    show_logging: bool,
     settings: AppSettings,
     show_settings: bool,
     show_tree: bool,
@@ -168,6 +179,9 @@ impl OperowApp {
             last_generator: None,
             demo_generator_pending: None,
             store: FrameStore::new(settings.frame_buffer_size),
+            logging: LoggingConfig::default(),
+            log_rt: LogRuntime::default(),
+            show_logging: false,
             settings,
             show_settings: false,
             show_tree: true,
@@ -424,6 +438,9 @@ impl OperowApp {
         if opts.demo_generator {
             self.demo_generator();
         }
+        if opts.demo_logging {
+            self.demo_logging();
+        }
         for t in self.traces.values_mut() {
             if opts.fixed_trace {
                 t.mode = TraceMode::Fixed;
@@ -439,6 +456,39 @@ impl OperowApp {
         if let Some(name) = opts.select.as_deref() {
             self.select_by_name(name);
         }
+    }
+
+    /// `--demo-logging`: start recording once the Body bus's DoorStatus
+    /// (0x200) byte 0 equals 0, with 0.5 s of history and 1 s after the end.
+    fn demo_logging(&mut self) {
+        let bus = self
+            .names
+            .bus_names
+            .iter()
+            .find(|(_, n)| n.as_str() == "Body")
+            .map(|(b, _)| *b)
+            .or_else(|| self.names.bus_names.keys().min().copied());
+        let Some(bus) = bus else { return };
+        self.logging = LoggingConfig {
+            enabled: true,
+            folder: Some(std::env::temp_dir().join("operow-logs")),
+            ..Default::default()
+        };
+        self.logging.trigger.start = StartTrigger::OnCondition(Condition::Signal {
+            signal: SignalRef::Raw {
+                bus,
+                id: 0x200,
+                extended: false,
+                kind: RawKind::Byte(0),
+            },
+            cmp: SigCmp {
+                op: CmpOp::Eq,
+                value: 0.0,
+            },
+        });
+        self.logging.trigger.pre_trigger_s = 0.5;
+        self.logging.trigger.post_trigger_s = 1.0;
+        self.show_logging = true;
     }
 
     /// `--demo-graph`: EngineSpeed on Y1, Throttle on Y2 and Running as a
@@ -608,6 +658,11 @@ impl OperowApp {
         self.last_graph = None;
         self.generators.clear();
         self.last_generator = None;
+        self.logging = topo
+            .workspace
+            .as_ref()
+            .and_then(workspace::logging_from_json)
+            .unwrap_or_default();
         self.sync_instances();
         if let Some(ws) = &topo.workspace {
             for (id, view) in workspace::traces_from_json(ws) {
@@ -627,6 +682,20 @@ impl OperowApp {
             }
         }
         self.reload_dbcs();
+    }
+
+    /// Project file name without `.operow.json`, for log file names.
+    fn project_name(&self) -> String {
+        self.project_path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| {
+                let n = n.strip_suffix(".json").unwrap_or(&n);
+                n.strip_suffix(".operow").unwrap_or(n).to_string()
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "operow".into())
     }
 
     fn project_dir(&self) -> Option<PathBuf> {
@@ -886,6 +955,7 @@ impl OperowApp {
         self.names.rebuild(&self.graph.to_topology());
         self.names.dbcs = Default::default();
         self.project_path = None;
+        self.logging = LoggingConfig::default();
         self.graphs.clear();
         self.last_graph = None;
         self.generators.clear();
@@ -938,12 +1008,15 @@ impl OperowApp {
                 .iter()
                 .map(|(id, g)| (*id, g.view()))
                 .collect();
-            topo.workspace = workspace::layout_to_json_with(
-                &self.dock,
-                views,
-                graphs,
-                generators,
-                Some(self.graph.network_layout()),
+            topo.workspace = workspace::with_logging(
+                workspace::layout_to_json_with(
+                    &self.dock,
+                    views,
+                    graphs,
+                    generators,
+                    Some(self.graph.network_layout()),
+                ),
+                &self.logging,
             );
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
@@ -1068,6 +1141,72 @@ impl OperowApp {
                 self.log(format!("error: {msg}"));
             }
         }
+    }
+
+    /// Feed the logging task: pressed keys, new frames, measurement state.
+    fn run_logging(&mut self, ctx: &egui::Context) {
+        let keys: Vec<char> = if ctx.wants_keyboard_input() {
+            Vec::new()
+        } else {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => t.chars().next(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        };
+        let mut buses: Vec<BusId> = self.names.bus_names.keys().copied().collect();
+        buses.sort();
+        let project = self.project_name();
+        let dir = self.project_dir();
+        let lctx = LogContext {
+            store: &self.store,
+            buses: &buses,
+            project: &project,
+            project_dir: dir.as_deref(),
+            dbcs: &self.names.dbcs,
+            users: &self.graph.user_signals,
+        };
+        let running = self.run_state != RunState::Stopped;
+        let msgs = self.log_rt.update(&self.logging, running, &keys, &lctx);
+        for m in msgs {
+            match m.strip_prefix("error: ") {
+                Some(e) => self.log_error(e.to_string()),
+                None => self.log(m),
+            }
+        }
+    }
+
+    fn logging_window_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_logging {
+            return;
+        }
+        let mut buses: Vec<(BusId, String)> = self
+            .graph
+            .to_topology()
+            .buses
+            .iter()
+            .map(|b| (b.id, b.name.clone()))
+            .collect();
+        buses.sort_by_key(|(id, _)| *id);
+        let project = self.project_name();
+        let dir = self.project_dir();
+        let input = LoggingInput {
+            buses: &buses,
+            dbcs: &self.names.dbcs,
+            users: &self.graph.user_signals,
+            names: &self.names,
+            status: self.log_rt.status(),
+            files: &self.log_rt.files,
+            project: &project,
+            project_dir: dir.as_deref(),
+        };
+        let mut open = true;
+        logging_window::show(ctx, &mut open, &mut self.logging, &input);
+        self.show_logging = open;
     }
 
     /// Sender names, demo start, key presses, auto-change and engine sync
@@ -1198,6 +1337,10 @@ impl OperowApp {
                         ui.close();
                     }
                 }
+                if ui.button("Logging...").clicked() {
+                    self.show_logging = true;
+                    ui.close();
+                }
                 ui.separator();
                 if ui.checkbox(&mut self.show_tree, "Project tree").clicked() {
                     ui.close();
@@ -1299,6 +1442,9 @@ impl OperowApp {
             ui.checkbox(&mut self.animate_traffic, "Animate");
 
             ui.separator();
+            self.log_button(ui);
+
+            ui.separator();
             if ui.button("+ Trace").clicked() {
                 self.open_window(WindowKind::Trace, true);
             }
@@ -1335,6 +1481,37 @@ impl OperowApp {
         });
     }
 
+    /// The "Log" toggle: a dot that is red while recording and amber while
+    /// armed. Right-click or long-press opens the Logging window.
+    fn log_button(&mut self, ui: &mut egui::Ui) {
+        let state = self.log_rt.status().state;
+        let dot = if self.logging.enabled && state == LogState::Idle {
+            egui::Color32::from_rgb(0xa0, 0x50, 0x50)
+        } else {
+            logging_window::state_color(state)
+        };
+        let mut button = egui::Button::new("       Log");
+        if self.logging.enabled {
+            button = button.fill(if self.theme == AppTheme::Dark {
+                egui::Color32::from_rgb(0x4a, 0x2a, 0x2a)
+            } else {
+                egui::Color32::from_rgb(0xf4, 0xd4, 0xd4)
+            });
+        }
+        let resp = ui.add(button).on_hover_text(
+            "Log bus traffic to an ASC file while the measurement runs\n\
+             Right-click or long-press for the logging settings",
+        );
+        let c = egui::pos2(resp.rect.left() + 13.0, resp.rect.center().y);
+        ui.painter().circle_filled(c, 5.0, dot);
+        if resp.clicked() {
+            self.logging.enabled = !self.logging.enabled;
+        }
+        if resp.secondary_clicked() || resp.long_touched() {
+            self.show_logging = true;
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (color, label) = match self.run_state {
@@ -1348,6 +1525,26 @@ impl OperowApp {
             ui.separator();
             ui.label(format!("t = {:.3} s", self.sim_time.as_secs_f64()));
             ui.separator();
+            let log = self.log_rt.status();
+            if log.state != LogState::Idle {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    rect.center(),
+                    5.0,
+                    logging_window::state_color(log.state),
+                );
+                if log.state == LogState::Armed {
+                    ui.label("Log armed");
+                } else {
+                    ui.label(format!(
+                        "REC {} \u{b7} {}",
+                        logging_window::format_elapsed(log.elapsed_s),
+                        logging_window::format_size(log.bytes)
+                    ));
+                }
+                ui.separator();
+            }
             let mut buses: Vec<(String, f64)> = self
                 .bus_stats
                 .iter()
@@ -1548,6 +1745,7 @@ impl eframe::App for OperowApp {
         }
 
         self.sync_instances();
+        self.run_logging(ctx);
         let now = std::time::Instant::now();
         for t in self.traces.values_mut() {
             t.update(&self.store, &self.names, now);
@@ -1636,6 +1834,7 @@ impl eframe::App for OperowApp {
             });
 
         self.settings_ui(ctx);
+        self.logging_window_ui(ctx);
         self.import_dialog_ui(ctx);
         self.new_signal_dialog_ui(ctx);
         self.take_screenshot_if_needed(ctx);
