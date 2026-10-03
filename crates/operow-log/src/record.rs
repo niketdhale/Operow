@@ -24,6 +24,8 @@ pub struct LogRecord {
 pub enum LogError {
     #[error("line {line}: {msg}")]
     Parse { line: usize, msg: String },
+    #[error("BLF: {0}")]
+    Blf(String),
     #[error("read error: {0}")]
     Io(#[from] io::Error),
 }

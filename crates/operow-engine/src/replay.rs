@@ -1,12 +1,11 @@
-//! [`ReplayEcu`]: injects the records of an ASC log onto the simulated
+//! [`ReplayEcu`]: injects the records of a log (ASC or BLF) onto the simulated
 //! buses at their log times.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::BufReader;
+use std::path::Path;
 
 use operow_core::{BusId, CanFrame, EcuConfig, IdExpr, NodeKind};
-use operow_log::{AscReader, RecordKind};
+use operow_log::{LogReader, RecordKind, open_log};
 
 use crate::ecu::{Ecu, EcuCtx};
 
@@ -18,7 +17,7 @@ pub const LARGE_LOG_RECORDS: u64 = 1_000_000;
 /// The single timer a replay node uses: "the next record is due".
 const PUMP_TIMER: u32 = 0;
 
-type Reader = AscReader<BufReader<File>>;
+type Reader = Box<dyn LogReader + Send>;
 
 /// Totals found by the validating pass over the file.
 struct Scan {
@@ -116,8 +115,7 @@ impl ReplayEcu {
     }
 
     fn open(&self) -> Result<Reader, String> {
-        let file = File::open(&self.path).map_err(|e| format!("{}: {e}", self.path))?;
-        Ok(AscReader::new(BufReader::new(file)))
+        open_log(Path::new(&self.path)).map_err(|e| format!("{}: {e}", self.path))
     }
 
     /// The bus and frame of `rec` when it is mapped, not an error frame and

@@ -8,7 +8,7 @@ use operow_core::{BusId, UserSignalDef};
 
 use crate::dbcs::DbcStore;
 use crate::logging::{
-    CmpOp, Condition, LogFile, LogState, LogStatus, LoggingConfig, SigCmp, StartTrigger,
+    CmpOp, Condition, LogFile, LogFormat, LogState, LogStatus, LoggingConfig, SigCmp, StartTrigger,
     StopTrigger, expand_pattern, output_dir,
 };
 use crate::signals::{RawKind, SignalRef};
@@ -122,6 +122,16 @@ fn contents(ui: &mut egui::Ui, cfg: &mut LoggingConfig, input: &LoggingInput<'_>
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
+                ui.label("Format:");
+                egui::ComboBox::from_id_salt("log_format")
+                    .selected_text(cfg.format.label())
+                    .show_ui(ui, |ui| {
+                        for f in LogFormat::ALL {
+                            changed |= ui.selectable_value(&mut cfg.format, f, f.label()).changed();
+                        }
+                    });
+                ui.end_row();
+
                 ui.label("File name:");
                 ui.vertical(|ui| {
                     changed |= ui
@@ -131,8 +141,13 @@ fn contents(ui: &mut egui::Ui, cfg: &mut LoggingConfig, input: &LoggingInput<'_>
                                 .hint_text(crate::logging::DEFAULT_PATTERN),
                         )
                         .changed();
-                    let next =
-                        expand_pattern(&cfg.pattern, input.project, &operow_log::AscDate::now(), 1);
+                    let next = expand_pattern(
+                        &cfg.pattern,
+                        input.project,
+                        &operow_log::AscDate::now(),
+                        1,
+                        cfg.format,
+                    );
                     ui.weak("Tokens: {project} {date} {time} {n}");
                     ui.weak(format!("Next file: {next}"));
                 });

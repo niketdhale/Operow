@@ -496,12 +496,12 @@ impl Inspector {
             ui.label("Log file:");
             ui.add(
                 egui::TextEdit::singleline(path)
-                    .hint_text("*.asc")
+                    .hint_text("*.asc;*.blf")
                     .desired_width(260.0),
             );
             if ui.button("Browse...").clicked()
                 && let Some(file) = rfd::FileDialog::new()
-                    .add_filter("Vector ASCII log", &["asc"])
+                    .add_filter("Vector logs", &["asc", "blf"])
                     .pick_file()
             {
                 let abs = file.canonicalize().unwrap_or(file);

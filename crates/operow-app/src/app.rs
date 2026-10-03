@@ -945,10 +945,10 @@ impl OperowApp {
 
     // ---- offline replay --------------------------------------------------
 
-    /// Ask for an ASC file, then open the channel mapping dialog for it.
+    /// Ask for an ASC or BLF file, then open the channel mapping dialog for it.
     fn pick_log(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Vector ASCII log", &["asc"])
+            .add_filter("Vector logs", &["asc", "blf"])
             .pick_file()
         {
             self.begin_open_log(&path);

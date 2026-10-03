@@ -1,9 +1,9 @@
-//! ASC logging: configuration, the trigger state machine and the task that
+//! ASC/BLF logging: configuration, the trigger state machine and the task that
 //! feeds a background writer thread from the shared frame store.
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use operow_core::{BusEvent, BusId, Timestamp, UserSignalDef};
-use operow_log::{AscDate, AscWriter, LogRecord, LogWriter, RecordKind};
+use operow_log::{AscDate, AscWriter, BlfWriter, LogRecord, LogWriter, RecordKind};
 use serde::{Deserialize, Serialize};
 
 use crate::dbcs::DbcStore;
@@ -19,6 +19,33 @@ use crate::signals::SignalRef;
 use crate::store::FrameStore;
 
 pub const DEFAULT_PATTERN: &str = "{project}_{date}_{n}.asc";
+
+/// On-disk format of a recording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogFormat {
+    #[default]
+    Asc,
+    Blf,
+}
+
+impl LogFormat {
+    pub const ALL: [LogFormat; 2] = [LogFormat::Asc, LogFormat::Blf];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFormat::Asc => "ASC",
+            LogFormat::Blf => "BLF",
+        }
+    }
+
+    /// File extension including the dot.
+    pub fn ext(self) -> &'static str {
+        match self {
+            LogFormat::Asc => ".asc",
+            LogFormat::Blf => ".blf",
+        }
+    }
+}
 
 /// Comparison operator of a signal condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +150,7 @@ pub struct TriggerConfig {
 #[serde(default)]
 pub struct LoggingConfig {
     pub enabled: bool,
+    pub format: LogFormat,
     /// File name with `{project}`, `{date}`, `{time}` and `{n}` tokens.
     pub pattern: String,
     /// Output folder; `None` is the project folder, else the home folder.
@@ -140,6 +168,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         LoggingConfig {
             enabled: false,
+            format: LogFormat::default(),
             pattern: DEFAULT_PATTERN.into(),
             folder: None,
             buses: None,
@@ -188,9 +217,15 @@ fn sanitize(s: &str) -> String {
 }
 
 /// Expand `{project}`, `{date}` (`2026-10-03`), `{time}` (`14-15-30`) and
-/// `{n}` in `pattern`; the result always ends in `.asc` and is a valid
-/// file name.
-pub fn expand_pattern(pattern: &str, project: &str, date: &AscDate, n: u32) -> String {
+/// `{n}` in `pattern`; the result always ends in the extension of `fmt`
+/// (replacing the other format's) and is a valid file name.
+pub fn expand_pattern(
+    pattern: &str,
+    project: &str,
+    date: &AscDate,
+    n: u32,
+    fmt: LogFormat,
+) -> String {
     let name = pattern
         .replace("{project}", project)
         .replace("{date}", &date.date_string())
@@ -200,8 +235,14 @@ pub fn expand_pattern(pattern: &str, project: &str, date: &AscDate, n: u32) -> S
     if name.is_empty() {
         name = "log".into();
     }
-    if !name.to_ascii_lowercase().ends_with(".asc") {
-        name.push_str(".asc");
+    let ext = fmt.ext();
+    let lower = name.to_ascii_lowercase();
+    if !lower.ends_with(ext) {
+        let other = LogFormat::ALL.iter().find(|f| lower.ends_with(f.ext()));
+        if let Some(o) = other {
+            name.truncate(name.len() - o.ext().len());
+        }
+        name.push_str(ext);
     }
     name
 }
@@ -215,14 +256,15 @@ pub fn next_path(
     project: &str,
     date: &AscDate,
     start_n: u32,
+    fmt: LogFormat,
     exists: &dyn Fn(&Path) -> bool,
 ) -> (PathBuf, u32) {
     let has_n = pattern.contains("{n}");
     let mut n = start_n.max(1);
     loop {
-        let mut name = expand_pattern(pattern, project, date, n);
+        let mut name = expand_pattern(pattern, project, date, n, fmt);
         if !has_n && n > 1 {
-            let stem = name.strip_suffix(".asc").unwrap_or(&name).to_string();
+            let stem = name.strip_suffix(fmt.ext()).unwrap_or(&name).to_string();
             let ext = &name[stem.len()..];
             name = format!("{stem}_{n}{ext}");
         }
@@ -490,6 +532,7 @@ enum Msg {
         path: PathBuf,
         bytes: Arc<AtomicU64>,
         date: AscDate,
+        format: LogFormat,
     },
     Records(Vec<LogRecord>),
     Finish,
@@ -498,6 +541,12 @@ enum Msg {
 struct CountingWriter {
     inner: BufWriter<File>,
     bytes: Arc<AtomicU64>,
+}
+
+impl Seek for CountingWriter {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
 }
 
 impl Write for CountingWriter {
@@ -512,6 +561,35 @@ impl Write for CountingWriter {
     }
 }
 
+/// The open file of the writer thread, in either format.
+enum OutFile {
+    Asc(AscWriter<CountingWriter>),
+    Blf(BlfWriter<CountingWriter>),
+}
+
+impl OutFile {
+    fn write(&mut self, r: &LogRecord) -> io::Result<()> {
+        match self {
+            OutFile::Asc(w) => w.write(r),
+            OutFile::Blf(w) => w.write(r),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutFile::Asc(w) => w.flush(),
+            OutFile::Blf(w) => w.flush(),
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        match self {
+            OutFile::Asc(w) => w.finish(),
+            OutFile::Blf(w) => w.finish(),
+        }
+    }
+}
+
 type Errors = Arc<Mutex<Vec<String>>>;
 
 fn report(errors: &Errors, e: impl std::fmt::Display) {
@@ -522,10 +600,15 @@ fn report(errors: &Errors, e: impl std::fmt::Display) {
 
 /// The writer thread: owns the file, so file IO never blocks the UI.
 fn writer_thread(rx: Receiver<Msg>, errors: Errors) {
-    let mut w: Option<AscWriter<CountingWriter>> = None;
+    let mut w: Option<OutFile> = None;
     for msg in rx {
         match msg {
-            Msg::Open { path, bytes, date } => {
+            Msg::Open {
+                path,
+                bytes,
+                date,
+                format,
+            } => {
                 if let Some(old) = w.take()
                     && let Err(e) = old.finish()
                 {
@@ -536,7 +619,10 @@ fn writer_thread(rx: Receiver<Msg>, errors: Errors) {
                         inner: BufWriter::new(f),
                         bytes,
                     };
-                    AscWriter::new(out, date)
+                    match format {
+                        LogFormat::Asc => AscWriter::new(out, date).map(OutFile::Asc),
+                        LogFormat::Blf => BlfWriter::new(out, date).map(OutFile::Blf),
+                    }
                 });
                 match opened {
                     Ok(x) => w = Some(x),
@@ -788,7 +874,7 @@ impl LogRuntime {
         by_size || by_time
     }
 
-    /// Finish the writer thread (its file gets `End TriggerBlock`).
+    /// Finish the writer thread (its file gets its footer).
     fn close_thread(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Msg::Finish);
@@ -816,6 +902,7 @@ impl LogRuntime {
             ctx.project,
             &date,
             self.file_n + 1,
+            cfg.format,
             &|p| p.exists(),
         );
         self.file_n = n;
@@ -833,7 +920,12 @@ impl LogRuntime {
             self.tx = Some(tx);
         }
         msgs.push(format!("logging: writing {}", file_name(&path)));
-        self.send(Msg::Open { path, bytes, date });
+        self.send(Msg::Open {
+            path,
+            bytes,
+            date,
+            format: cfg.format,
+        });
     }
 }
 
@@ -908,19 +1000,27 @@ mod tests {
     fn pattern_expansion() {
         let d = date();
         assert_eq!(
-            expand_pattern(DEFAULT_PATTERN, "gateway", &d, 3),
+            expand_pattern(DEFAULT_PATTERN, "gateway", &d, 3, LogFormat::Asc),
             "gateway_2026-10-03_3.asc"
         );
         assert_eq!(
-            expand_pattern("{project}-{time}", "p", &d, 1),
+            expand_pattern("{project}-{time}", "p", &d, 1, LogFormat::Asc),
             "p-14-15-30.asc"
         );
         assert_eq!(
-            expand_pattern("x/{project}:{n}.ASC", "a", &d, 2),
+            expand_pattern("x/{project}:{n}.ASC", "a", &d, 2, LogFormat::Asc),
             "x_a_2.ASC"
         );
-        assert_eq!(expand_pattern("", "a", &d, 1), "log.asc");
-        assert_eq!(expand_pattern("{foo}", "a", &d, 1), "{foo}.asc");
+        assert_eq!(expand_pattern("", "a", &d, 1, LogFormat::Asc), "log.asc");
+        assert_eq!(
+            expand_pattern(DEFAULT_PATTERN, "g", &d, 2, LogFormat::Blf),
+            "g_2026-10-03_2.blf"
+        );
+        assert_eq!(expand_pattern("a.BLF", "g", &d, 2, LogFormat::Asc), "a.asc");
+        assert_eq!(
+            expand_pattern("{foo}", "a", &d, 1, LogFormat::Asc),
+            "{foo}.asc"
+        );
     }
 
     #[test]
@@ -930,25 +1030,33 @@ mod tests {
         let taken: Vec<PathBuf> = vec![dir.join("p_2026-10-03_1.asc")];
         let exists = |p: &Path| taken.contains(&p.to_path_buf());
         // {n} skips existing files and counts up for each split file.
-        let (p1, n1) = next_path(dir, DEFAULT_PATTERN, "p", &d, 1, &exists);
+        let (p1, n1) = next_path(dir, DEFAULT_PATTERN, "p", &d, 1, LogFormat::Asc, &exists);
         assert_eq!(
             (p1.file_name().unwrap().to_str().unwrap(), n1),
             ("p_2026-10-03_2.asc", 2)
         );
-        let (p2, n2) = next_path(dir, DEFAULT_PATTERN, "p", &d, n1 + 1, &exists);
+        let (p2, n2) = next_path(
+            dir,
+            DEFAULT_PATTERN,
+            "p",
+            &d,
+            n1 + 1,
+            LogFormat::Asc,
+            &exists,
+        );
         assert_eq!(
             (p2.file_name().unwrap().to_str().unwrap(), n2),
             ("p_2026-10-03_3.asc", 3)
         );
         // Without {n}: plain first name, `_<n>` for later parts.
         let none = |_: &Path| false;
-        let (a, n) = next_path(dir, "run.asc", "p", &d, 1, &none);
+        let (a, n) = next_path(dir, "run.asc", "p", &d, 1, LogFormat::Asc, &none);
         assert_eq!((a, n), (dir.join("run.asc"), 1));
-        let (b, n) = next_path(dir, "run.asc", "p", &d, 2, &none);
+        let (b, n) = next_path(dir, "run.asc", "p", &d, 2, LogFormat::Asc, &none);
         assert_eq!((b, n), (dir.join("run_2.asc"), 2));
         // ... and when the plain name is taken.
         let taken_plain = |p: &Path| p == dir.join("run.asc");
-        let (c, _) = next_path(dir, "run", "p", &d, 1, &taken_plain);
+        let (c, _) = next_path(dir, "run", "p", &d, 1, LogFormat::Asc, &taken_plain);
         assert_eq!(c, dir.join("run_2.asc"));
     }
 
@@ -1188,9 +1296,27 @@ mod tests {
 
     #[test]
     fn runtime_writes_a_triggered_file() {
-        let dir = std::env::temp_dir().join(format!("operow-log-test-{}", std::process::id()));
+        let (ids, text) = run_triggered(LogFormat::Asc);
+        assert_eq!(ids, [2, 3, 4]);
+        assert!(text.trim_end().ends_with("End TriggerBlock"));
+    }
+
+    #[test]
+    fn runtime_writes_a_triggered_blf_file() {
+        let (ids, _) = run_triggered(LogFormat::Blf);
+        assert_eq!(ids, [2, 3, 4]);
+    }
+
+    /// Log a triggered recording; the frame ids read back and the raw text.
+    fn run_triggered(format: LogFormat) -> (Vec<u32>, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "operow-log-test-{}-{}",
+            format.label(),
+            std::process::id()
+        ));
         let cfg = LoggingConfig {
             enabled: true,
+            format,
             pattern: "t_{n}.asc".into(),
             folder: Some(dir.clone()),
             trigger: TriggerConfig {
@@ -1225,17 +1351,30 @@ mod tests {
         assert_eq!(rt.status().state, LogState::Idle);
         let path = rt.files[0].path.clone();
         drop(rt);
-        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            path.extension().unwrap(),
+            format.ext().trim_start_matches('.')
+        );
+        let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let ids: Vec<u32> = operow_log::AscReader::new(text.as_bytes())
-            .map(|r| match r.unwrap().kind {
+        let recs: Vec<LogRecord> = match format {
+            LogFormat::Asc => operow_log::AscReader::new(bytes.as_slice())
+                .collect::<Result<_, _>>()
+                .unwrap(),
+            LogFormat::Blf => operow_log::BlfReader::new(bytes.as_slice())
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        };
+        let ids = recs
+            .iter()
+            .map(|r| match r.kind {
                 RecordKind::Frame(f) => f.id,
                 RecordKind::ErrorFrame => 0,
             })
             .collect();
         // 50 ms of history before id 3 (at 100 ms): 80 ms is in, 0 is out.
-        assert_eq!(ids, [2, 3, 4]);
-        assert!(text.trim_end().ends_with("End TriggerBlock"));
+        (ids, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     #[test]

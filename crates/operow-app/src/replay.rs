@@ -1,4 +1,4 @@
-//! Offline replay: stream an ASC log into the shared frame store by
+//! Offline replay: stream an ASC or BLF log into the shared frame store by
 //! virtual time, without running the simulation.
 //!
 //! A background thread parses the file and sends chunks of already-mapped
@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use operow_core::{BusEvent, BusId, CanFrame, Direction, NodeId, Timestamp};
-use operow_log::{AscReader, RecordKind};
+use operow_log::{LogReader, RecordKind, open_log};
 
 /// First [`NodeId`] of the virtual "Log" senders; channel `n` sends as
 /// `LOG_NODE_BASE + n`. Below the generator range, above any topology node.
@@ -70,7 +70,8 @@ pub fn probe_channels(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// Channels plus the time span of `path`. The last time comes from the end
-/// of the file; a log with relative timestamps needs a full pass instead.
+/// of an ASC file; a BLF (compressed) or relative-timestamp log needs a full
+/// pass instead.
 pub fn probe(path: &Path) -> Result<LogInfo, String> {
     let mut first = None;
     let mut channels = Vec::new();
@@ -85,7 +86,7 @@ pub fn probe(path: &Path) -> Result<LogInfo, String> {
     let Some(first) = first else {
         return Err("the log has no records".into());
     };
-    let last = if has_relative_timestamps(path) {
+    let last = if is_blf(path) || has_relative_timestamps(path) {
         let mut last = first;
         for rec in reader(path)?.flatten() {
             last = rec.time;
@@ -101,9 +102,16 @@ pub fn probe(path: &Path) -> Result<LogInfo, String> {
     })
 }
 
-fn reader(path: &Path) -> Result<AscReader<BufReader<File>>, String> {
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(AscReader::new(BufReader::new(file)))
+fn reader(path: &Path) -> Result<Box<dyn LogReader + Send>, String> {
+    open_log(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn is_blf(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"LOGG"
 }
 
 fn has_relative_timestamps(path: &Path) -> bool {
@@ -132,7 +140,7 @@ fn tail_last_time(path: &Path) -> Option<Timestamp> {
     } else {
         &text
     };
-    AscReader::new(text.as_bytes())
+    operow_log::AscReader::new(text.as_bytes())
         .flatten()
         .last()
         .map(|r| r.time)
@@ -239,7 +247,7 @@ pub struct Advance {
 /// Playback speed; `None` is "as fast as possible".
 pub type Speed = Option<f64>;
 
-/// Streams an ASC log as [`BusEvent`]s on a virtual clock.
+/// Streams a log as [`BusEvent`]s on a virtual clock.
 pub struct ReplaySource {
     path: PathBuf,
     map: HashMap<u8, BusId>,
