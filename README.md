@@ -1,6 +1,6 @@
 # Operow
 
-A CANoe-inspired ECU network simulator for automotive CAN bus design and testing, written in Rust with a native egui UI and an in-process deterministic simulation engine.
+A ECU network simulator for automotive CAN bus design and testing, written in Rust with a native egui UI and an in-process deterministic simulation engine.
 
 ## Features
 
