@@ -5,7 +5,9 @@
 
 mod app;
 mod dbcs;
+mod diag_group;
 mod diag_props;
+mod diag_window;
 mod filters;
 mod generator_window;
 mod graph;
@@ -52,6 +54,11 @@ fn main() -> eframe::Result<()> {
             "--open-new-signal" => opts.open_new_signal = true,
             "--demo-graph" => opts.demo_graph = true,
             "--demo-generator" => opts.demo_generator = true,
+            "--demo-diag" => opts.demo_diag = true,
+            "--demo-diag-dtcs" => {
+                opts.demo_diag = true;
+                opts.demo_diag_dtcs = true;
+            }
             "--open-log" => opts.open_log = args.next().map(PathBuf::from),
             "--demo-logging" => opts.demo_logging = true,
             "--demo-errors" => opts.demo_errors = true,

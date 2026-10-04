@@ -20,7 +20,7 @@ pub use sim::{
     BusOffRecovery, BusStats, CanErrorCounts, GENERATOR_NODE_BASE, GeneratorId, InjectMode,
     InjectSpec, MAX_HOPS, MAX_MSG_DELAY_MS, MsgControl, NodeErrorInfo, SimError, Simulation,
 };
-pub use tester::{DiagRequestSpec, DiagResult, TESTER_NODE_BASE};
+pub use tester::{DiagRequestSpec, DiagResult, TESTER_NODE_BASE, TesterPresentSpec};
 pub use timing::{
     fd_frame_phase_bits, frame_bits, frame_duration_ns, frame_duration_ns_any, frame_duration_ns_fd,
 };

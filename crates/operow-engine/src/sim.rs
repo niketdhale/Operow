@@ -11,7 +11,7 @@ use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 use crate::gateway::GatewayEcu;
 use crate::replay::ReplayEcu;
 use crate::script::ScriptEcu;
-use crate::tester::{DiagRequestSpec, DiagResult, TESTER_NODE_BASE, TesterEcu};
+use crate::tester::{DiagRequestSpec, DiagResult, TESTER_NODE_BASE, TesterEcu, TesterPresentSpec};
 use crate::timing::frame_duration_ns_any;
 
 /// Maximum number of gateway hops a frame may take; forwards beyond it are
@@ -22,9 +22,9 @@ pub const MAX_HOPS: u8 = 8;
 /// nodes must stay below it.
 pub const GENERATOR_NODE_BASE: u32 = 0xF000_0000;
 
-/// Generator id used for periodic TesterPresent frames; far above the ids
-/// the application hands out.
-const TESTER_PRESENT_GENERATOR: u32 = 0x0FFF_FF00;
+/// Virtual sender of periodic TesterPresent frames, at the top of the
+/// tester range so it never collides with one-shot testers.
+pub const TESTER_PRESENT_NODE: NodeId = NodeId(TESTER_NODE_BASE + 0x0FFF_0000);
 
 /// Identifier of an interactive generator (a virtual sender that is linked
 /// to every bus and runs no ECU behavior).
@@ -336,6 +336,10 @@ enum EventKind {
     Arbitrate {
         bus: BusId,
     },
+    /// The periodic TesterPresent is due; stale when `chain` no longer matches.
+    TpTimer {
+        chain: u64,
+    },
     /// A cyclic generator row is due; stale when `chain` no longer matches.
     GenTimer {
         gen_id: GeneratorId,
@@ -438,6 +442,8 @@ pub struct Simulation {
     started: bool,
     all_buses: Vec<BusId>,
     gen_rows: HashMap<(GeneratorId, u32), GenCyclic>,
+    /// Running periodic TesterPresent: bus, frame, period, chain.
+    tester_present: Option<(BusId, CanFrame, u64, u64)>,
     gen_chain: u64,
     node_err: HashMap<(NodeId, BusId), NodeErr>,
     injections: Vec<ActiveInject>,
@@ -523,6 +529,7 @@ impl Simulation {
             started: false,
             all_buses,
             gen_rows: HashMap::new(),
+            tester_present: None,
             gen_chain: 0,
             node_err: HashMap::new(),
             injections: Vec::new(),
@@ -960,15 +967,38 @@ impl Simulation {
         results
     }
 
-    /// Start or stop a periodic functional/physical TesterPresent
-    /// (`3E 80`, single frame) on `bus`, sent from a virtual generator.
-    pub fn set_tester_present(&mut self, enable: bool, bus: BusId, req_id: u32, period_ms: u32) {
-        let gen_id = GeneratorId(TESTER_PRESENT_GENERATOR);
-        let row = bus.0;
-        let period = (enable && period_ms > 0).then_some(u64::from(period_ms) * 1_000_000);
-        let frame = CanFrame::new(req_id, req_id > 0x7FF, &[0x02, 0x3E, 0x80])
-            .unwrap_or_else(|_| CanFrame::new(0x7DF, false, &[0x02, 0x3E, 0x80]).expect("valid"));
-        self.gen_set_cyclic(gen_id, row, Some(bus), frame, period);
+    /// Start or stop the periodic TesterPresent (`3E 80`, single frame)
+    /// sent by the virtual tester on `spec.bus`, on the functional id when
+    /// `spec.functional`, as a CAN FD frame when `spec.fd`.
+    pub fn set_tester_present(&mut self, spec: TesterPresentSpec) {
+        self.ensure_started();
+        self.gen_chain += 1;
+        let chain = self.gen_chain;
+        let period = u64::from(spec.period_ms) * 1_000_000;
+        if !spec.enable || period == 0 || !self.bus_configs.contains_key(&spec.bus) {
+            self.tester_present = None;
+            return;
+        }
+        let id = if spec.functional {
+            spec.functional_id
+        } else {
+            spec.req_id
+        };
+        let ext = spec.extended || id > 0x7FF;
+        let data = [0x02, 0x3E, 0x80];
+        let frame = if spec.fd {
+            CanFrame::new_fd(id, ext, true, &data)
+        } else {
+            CanFrame::new(id, ext, &data)
+        };
+        let Ok(frame) = frame else {
+            self.tester_present = None;
+            return;
+        };
+        self.node_buses.insert(TESTER_PRESENT_NODE, vec![spec.bus]);
+        self.tester_present = Some((spec.bus, frame, period, chain));
+        self.enqueue_origin(TESTER_PRESENT_NODE, Some(spec.bus), frame);
+        self.schedule(self.now + period, EventKind::TpTimer { chain });
     }
 
     /// Deliver `cmd` to `node`'s ECU at the current virtual time.
@@ -1218,6 +1248,16 @@ impl Simulation {
             }
             EventKind::Arbitrate { bus } => {
                 self.try_arbitrate(bus);
+            }
+            EventKind::TpTimer { chain } => {
+                let Some((bus, frame, period_ns, c)) = self.tester_present else {
+                    return;
+                };
+                if c != chain {
+                    return;
+                }
+                self.enqueue_origin(TESTER_PRESENT_NODE, Some(bus), frame);
+                self.schedule(self.now + period_ns, EventKind::TpTimer { chain });
             }
             EventKind::GenTimer { gen_id, row, chain } => {
                 let Some(r) = self.gen_rows.get(&(gen_id, row)) else {

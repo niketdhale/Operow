@@ -12,6 +12,7 @@ use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::dbcs::{self, DbcStore};
+use crate::diag_group::{self, DiagChannel, Grouper, Item, Message};
 use crate::filters::{CompiledFilters, RowFields, TextFilter, TraceFilters};
 use crate::icons;
 use crate::signals::{RawKind, SignalRef};
@@ -158,10 +159,12 @@ pub enum Col {
     Len,
     Data,
     Sender,
+    /// Decoded UDS text of a grouped ISO-TP message.
+    Info,
 }
 
 impl Col {
-    pub const ALL: [Col; 13] = [
+    pub const ALL: [Col; 14] = [
         Col::Time,
         Col::Chn,
         Col::Id,
@@ -175,6 +178,7 @@ impl Col {
         Col::Len,
         Col::Data,
         Col::Sender,
+        Col::Info,
     ];
 
     fn label(self) -> &'static str {
@@ -192,11 +196,30 @@ impl Col {
             Col::Len => "Len",
             Col::Data => "Data",
             Col::Sender => "Sender",
+            Col::Info => "Info",
         }
     }
 
     fn fixed_only(self) -> bool {
         matches!(self, Col::Count | Col::Dt)
+    }
+
+    /// Narrower widths of the grouped ISO-TP view, which adds a column.
+    fn grouped_width(self) -> f32 {
+        match self {
+            Col::Time => 100.0,
+            Col::Chn => 64.0,
+            Col::Id => 76.0,
+            Col::Name => 130.0,
+            Col::Data => 170.0,
+            Col::Sender => 90.0,
+            c => c.width(),
+        }
+    }
+
+    /// Only shown while "Group ISO-TP" is on.
+    fn group_only(self) -> bool {
+        self == Col::Info
     }
 
     fn width(self) -> f32 {
@@ -214,6 +237,7 @@ impl Col {
             Col::Len => 40.0,
             Col::Data => 220.0,
             Col::Sender => 170.0,
+            Col::Info => 300.0,
         }
     }
 }
@@ -237,6 +261,7 @@ fn cell_text(col: Col, r: &TraceRow, agg: Option<(u64, Option<f64>)>) -> String 
         Col::Len => r.dlc.to_string(),
         Col::Data => r.data_hex(),
         Col::Sender => r.sender_text(),
+        Col::Info => String::new(),
     }
 }
 
@@ -406,6 +431,31 @@ struct Expansion {
     /// Index of the frame among the frame rows.
     pos: usize,
     lines: Vec<String>,
+    /// For a grouped ISO-TP message: its CAN frames, one row each.
+    frames: Vec<SubFrame>,
+}
+
+impl Expansion {
+    fn signals(pos: usize, lines: Vec<String>) -> Self {
+        Expansion {
+            pos,
+            lines,
+            frames: Vec::new(),
+        }
+    }
+
+    fn rows(&self) -> usize {
+        self.lines.len().max(self.frames.len())
+    }
+}
+
+/// One CAN frame under a grouped message, resolved to cell texts.
+struct SubFrame {
+    time: String,
+    id: String,
+    pci: String,
+    data: String,
+    sender: String,
 }
 
 /// What a display row shows.
@@ -446,6 +496,8 @@ pub struct TraceView {
     pub mode: TraceMode,
     pub hidden: BTreeSet<Col>,
     pub filters: TraceFilters,
+    /// Show each ISO-TP message of a diagnostic channel as one row.
+    pub group_isotp: bool,
 }
 
 /// Something a trace asks the application to do.
@@ -466,6 +518,11 @@ pub struct Trace {
     pub autoscroll: bool,
     pub mode: TraceMode,
     pub hidden: BTreeSet<Col>,
+    /// Group the ISO-TP frames of diagnostic ECUs into UDS message rows
+    /// (chronological mode).
+    pub group_isotp: bool,
+    /// Show the frames of grouped messages that span several frames.
+    pub expand_multiframe: bool,
     /// Show the signals of every fixed-mode row.
     pub expand_all: bool,
     /// The title is being edited.
@@ -489,6 +546,16 @@ pub struct Trace {
     /// Chronological rows (by seq) whose signals are shown.
     expanded: HashSet<u64>,
     expanded_fixed: HashSet<FixedKey>,
+    /// Grouped ISO-TP rows built from `index`, and what they were built from.
+    grouper: Grouper,
+    group_channels: Vec<DiagChannel>,
+    /// Next store seq to feed to `grouper`.
+    group_next: u64,
+    /// Bumped whenever `index` is rebuilt from scratch.
+    index_gen: u64,
+    group_gen: u64,
+    /// Grouped messages (by first seq) whose frames are shown.
+    expanded_groups: HashSet<u64>,
 }
 
 impl Default for Trace {
@@ -503,6 +570,8 @@ impl Default for Trace {
             autoscroll: true,
             mode: TraceMode::default(),
             hidden: BTreeSet::new(),
+            group_isotp: false,
+            expand_multiframe: false,
             expand_all: false,
             renaming: false,
             rename_buf: String::new(),
@@ -515,6 +584,12 @@ impl Default for Trace {
             epoch: 0,
             expanded: HashSet::new(),
             expanded_fixed: HashSet::new(),
+            grouper: Grouper::default(),
+            group_channels: Vec::new(),
+            group_next: 0,
+            index_gen: 0,
+            group_gen: 0,
+            expanded_groups: HashSet::new(),
         }
     }
 }
@@ -532,6 +607,7 @@ impl Trace {
             mode: self.mode,
             hidden: self.hidden.clone(),
             filters: self.filters.clone(),
+            group_isotp: self.group_isotp,
         }
     }
 
@@ -540,6 +616,7 @@ impl Trace {
         self.mode = v.mode;
         self.hidden = v.hidden;
         self.filters = v.filters;
+        self.group_isotp = v.group_isotp;
     }
 
     /// Start editing the window title.
@@ -556,7 +633,11 @@ impl Trace {
     fn visible_cols(&self, fixed_mode: bool) -> Vec<Col> {
         let mut v: Vec<Col> = Col::ALL
             .into_iter()
-            .filter(|c| !self.hidden.contains(c) && (fixed_mode || !c.fixed_only()))
+            .filter(|c| {
+                !self.hidden.contains(c)
+                    && (fixed_mode || !c.fixed_only())
+                    && (self.group_isotp && !fixed_mode || !c.group_only())
+            })
             .collect();
         if v.is_empty() {
             v.push(Col::Id);
@@ -569,8 +650,10 @@ impl Trace {
         self.cursor = seq;
         self.fixed_cursor = seq;
         self.index.clear();
+        self.index_gen += 1;
         self.fixed.clear();
         self.expanded.clear();
+        self.expanded_groups.clear();
         self.expanded_fixed.clear();
     }
 
@@ -591,6 +674,7 @@ impl Trace {
             self.applied = self.filters.clone();
             self.compiled = self.applied.compile();
             self.index.clear();
+            self.index_gen += 1;
             self.cursor = self.start_seq;
         }
         if self.paused {
@@ -631,6 +715,37 @@ impl Trace {
         }
         if !self.expanded.is_empty() {
             self.expanded.retain(|s| *s >= first);
+        }
+        self.update_groups(store, names);
+    }
+
+    /// Feed the filtered index to the ISO-TP grouper.
+    fn update_groups(&mut self, store: &FrameStore, names: &NameLookup) {
+        if !self.group_isotp || self.mode == TraceMode::Fixed {
+            if self.group_next != 0 || self.grouper.len() != 0 {
+                self.grouper.clear();
+                self.group_next = 0;
+            }
+            return;
+        }
+        if self.group_channels != names.diag_channels || self.group_gen != self.index_gen {
+            self.group_channels = names.diag_channels.clone();
+            self.group_gen = self.index_gen;
+            self.grouper = Grouper::new(self.group_channels.clone());
+            self.group_next = 0;
+            self.expanded_groups.clear();
+        }
+        let start = self.index.partition_point(|s| *s < self.group_next);
+        for &seq in self.index.range(start..) {
+            if let Some(ev) = store.get(seq) {
+                self.grouper.feed(seq, ev);
+            }
+            self.group_next = seq + 1;
+        }
+        let first = store.first_seq();
+        self.grouper.evict_before(first);
+        if !self.expanded_groups.is_empty() {
+            self.expanded_groups.retain(|s| *s >= first);
         }
     }
 
@@ -696,6 +811,13 @@ impl Trace {
                 egui::Checkbox::new(&mut self.expand_all, "Expand signals"),
             )
             .on_hover_text("Fixed mode: show decoded DBC signals for every row");
+            ui.add_enabled(
+                !fixed_mode,
+                egui::Checkbox::new(&mut self.group_isotp, "Group ISO-TP"),
+            )
+            .on_hover_text(
+                "Show each UDS message of a diagnostic ECU as one row (flow control hidden); expand a row for its CAN frames",
+            );
             ui.separator();
 
             let n = self.filters.active_count();
@@ -734,6 +856,8 @@ impl Trace {
                     let mut shown = !self.hidden.contains(&col);
                     let text = if col.fixed_only() {
                         format!("{} (fixed mode)", col.label())
+                    } else if col.group_only() {
+                        format!("{} (grouped ISO-TP)", col.label())
                     } else {
                         col.label().to_string()
                     };
@@ -822,6 +946,7 @@ impl Trace {
         } else {
             egui::Color32::from_rgb(0xc0, 0x20, 0x20)
         };
+        let weak_color = ui.visuals().weak_text_color();
         let fixed_mode = self.mode == TraceMode::Fixed;
         let cols = self.visible_cols(fixed_mode);
         let now = Instant::now();
@@ -832,6 +957,7 @@ impl Trace {
             v
         };
 
+        let grouped = self.group_isotp && !fixed_mode;
         let items = if fixed_mode {
             fixed_items(&self.fixed, &self.compiled, names)
         } else {
@@ -842,6 +968,8 @@ impl Trace {
         }
         let n_frames = if fixed_mode {
             items.len()
+        } else if grouped {
+            self.grouper.len()
         } else {
             self.index.len()
         };
@@ -853,26 +981,44 @@ impl Trace {
                 if (self.expand_all || self.expanded_fixed.contains(k))
                     && let Some(def) = message_def(names, &f.ev)
                 {
+                    exps.push(Expansion::signals(i, dbcs::decode_lines(def, &f.ev.frame)));
+                }
+            }
+        } else if grouped {
+            let open: Vec<usize> = if self.expand_multiframe {
+                self.grouper
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| matches!(i, Item::Message(m) if m.frames.len() > 1))
+                    .map(|(p, _)| p)
+                    .collect()
+            } else {
+                self.expanded_groups
+                    .iter()
+                    .filter_map(|s| self.grouper.position(*s))
+                    .collect()
+            };
+            for pos in open {
+                if let Some(Item::Message(m)) = self.grouper.get(pos) {
                     exps.push(Expansion {
-                        pos: i,
-                        lines: dbcs::decode_lines(def, &f.ev.frame),
+                        pos,
+                        lines: Vec::new(),
+                        frames: group_frames(m, store, names),
                     });
                 }
             }
+            exps.sort_by_key(|e| e.pos);
         } else {
             for seq in &self.expanded {
                 if let (Ok(pos), Some(ev)) = (self.index.binary_search(seq), store.get(*seq))
                     && let Some(def) = message_def(names, ev)
                 {
-                    exps.push(Expansion {
-                        pos,
-                        lines: dbcs::decode_lines(def, &ev.frame),
-                    });
+                    exps.push(Expansion::signals(pos, dbcs::decode_lines(def, &ev.frame)));
                 }
             }
             exps.sort_by_key(|e| e.pos);
         }
-        let exp_pos: Vec<(usize, usize)> = exps.iter().map(|e| (e.pos, e.lines.len())).collect();
+        let exp_pos: Vec<(usize, usize)> = exps.iter().map(|e| (e.pos, e.rows())).collect();
         let total_rows = n_frames + exp_pos.iter().map(|e| e.1).sum::<usize>();
 
         let filters = &mut self.filters;
@@ -881,6 +1027,9 @@ impl Trace {
         let (expanded, expanded_fixed, expand_all) =
             (&self.expanded, &self.expanded_fixed, self.expand_all);
         let index = &self.index;
+        let grouper = &self.grouper;
+        let (expanded_groups, expand_multiframe) = (&self.expanded_groups, self.expand_multiframe);
+        let mut toggled_group: Option<u64> = None;
         let sig_col = if cols.contains(&Col::Name) {
             Col::Name
         } else {
@@ -898,7 +1047,9 @@ impl Trace {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
                 for col in &cols {
                     table = table.column(match col {
-                        Col::Name => Column::remainder().at_least(col.width()),
+                        Col::Name if !grouped => Column::remainder().at_least(col.width()),
+                        Col::Info => Column::remainder().at_least(160.0),
+                        c if grouped => Column::exact(c.grouped_width()),
                         c => Column::exact(c.width()),
                     });
                 }
@@ -921,6 +1072,40 @@ impl Trace {
                         body.rows(text_height, total_rows, |mut row| {
                             let frame_idx = match locate(row.index(), &exp_pos) {
                                 Loc::Frame(i) => i,
+                                Loc::Signal { exp, line } if !exps[exp].frames.is_empty() => {
+                                    let f = &exps[exp].frames[line];
+                                    for col in &cols {
+                                        row.col(|ui| {
+                                            ui.visuals_mut().override_text_color = Some(weak_color);
+                                            match col {
+                                                Col::Time => {
+                                                    ui.monospace(&f.time);
+                                                }
+                                                Col::Id => {
+                                                    ui.monospace(&f.id);
+                                                }
+                                                Col::Name => {
+                                                    ui.add_space(22.0);
+                                                    ui.label(&f.pci);
+                                                }
+                                                Col::Data => {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&f.data)
+                                                                .monospace(),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                }
+                                                Col::Sender => {
+                                                    ui.label(&f.sender);
+                                                }
+                                                _ => {}
+                                            }
+                                        });
+                                    }
+                                    return;
+                                }
                                 Loc::Signal { exp, line } => {
                                     for col in &cols {
                                         row.col(|ui| {
@@ -944,6 +1129,28 @@ impl Trace {
                                     return;
                                 };
                                 (f.seq, f.ev, Some(*f), Some(**k))
+                            } else if grouped {
+                                match grouper.get(frame_idx) {
+                                    Some(Item::Frame(s)) => {
+                                        let Some(ev) = store.get(*s) else { return };
+                                        (*s, *ev, None, None)
+                                    }
+                                    Some(Item::Message(m)) => {
+                                        let open = expand_multiframe && m.frames.len() > 1
+                                            || expanded_groups.contains(&m.seq);
+                                        message_row(
+                                            &mut row,
+                                            &cols,
+                                            m,
+                                            names,
+                                            open,
+                                            error_color,
+                                            &mut toggled_group,
+                                        );
+                                        return;
+                                    }
+                                    None => return,
+                                }
                             } else {
                                 let Some(seq) = index.get(frame_idx).copied() else {
                                     return;
@@ -1070,6 +1277,11 @@ impl Trace {
             ui.ctx().request_repaint();
         }
 
+        if let Some(seq) = toggled_group
+            && !self.expanded_groups.insert(seq)
+        {
+            self.expanded_groups.remove(&seq);
+        }
         if let Some((key, seq)) = toggled {
             match key {
                 Some(k) => {
@@ -1108,8 +1320,119 @@ fn columns_menu(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     egui::Popup::menu(&r.response).show(content);
 }
 
+/// One row of a grouped ISO-TP message.
+fn message_row(
+    row: &mut egui_extras::TableRow<'_, '_>,
+    cols: &[Col],
+    m: &Message,
+    names: &NameLookup,
+    open: bool,
+    error_color: egui::Color32,
+    toggled: &mut Option<u64>,
+) {
+    let info = diag_group::message_info(m);
+    let id_text = format!("{:03X}{}", m.id, if m.extended { "x" } else { "" });
+    for col in cols {
+        row.col(|ui| {
+            if !m.complete {
+                ui.visuals_mut().override_text_color = Some(error_color);
+            }
+            match col {
+                Col::Time => {
+                    ui.monospace(format!("{:.6}", m.time.as_secs_f64()));
+                }
+                Col::Chn => {
+                    ui.label(names.bus_name(m.bus));
+                }
+                Col::Id => {
+                    ui.monospace(&id_text);
+                }
+                Col::Name => {
+                    if arrow_with(ui, open, "Show the CAN frames of this message").clicked() {
+                        *toggled = Some(m.seq);
+                    }
+                    ui.label(m.kind.label());
+                }
+                Col::Dir => {
+                    ui.label("Tx");
+                }
+                Col::Hop => {
+                    ui.label("0");
+                }
+                Col::Type => {
+                    ui.label("ISO-TP");
+                }
+                Col::Len => {
+                    ui.label(m.payload.len().to_string());
+                }
+                Col::Data => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(diag_group::payload_hex(&m.payload)).monospace(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(hex_all(&m.payload));
+                }
+                Col::Sender => {
+                    ui.label(names.node_name(m.sender));
+                }
+                Col::Info => {
+                    ui.add(egui::Label::new(&info).truncate())
+                        .on_hover_text(&info);
+                }
+                Col::Dlc | Col::Count | Col::Dt => {}
+            }
+        });
+    }
+    row.response().context_menu(|ui| {
+        if ui.button("Copy payload").clicked() {
+            ui.ctx().copy_text(hex_all(&m.payload));
+            ui.close();
+        }
+    });
+}
+
+fn hex_all(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The CAN frames of a grouped message with their ISO-TP PCI.
+fn group_frames(m: &Message, store: &FrameStore, names: &NameLookup) -> Vec<SubFrame> {
+    m.frames
+        .iter()
+        .filter_map(|s| store.get(*s))
+        .map(|ev| {
+            let cfg = operow_isotp::IsoTpConfig {
+                tx_id: ev.frame.id,
+                extended_ids: ev.frame.extended,
+                ..operow_isotp::IsoTpConfig::default()
+            };
+            SubFrame {
+                time: format!("{:.6}", ev.time.as_secs_f64()),
+                id: format!(
+                    "{:03X}{}",
+                    ev.frame.id,
+                    if ev.frame.extended { "x" } else { "" }
+                ),
+                pci: operow_isotp::describe_pci(&ev.frame, &cfg),
+                data: hex_all(ev.frame.payload()),
+                sender: names.node_name(ev.sender),
+            }
+        })
+        .collect()
+}
+
 /// The expand/collapse triangle in front of a decodable message name.
 fn arrow(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    arrow_with(ui, open, "Show decoded signals")
+}
+
+fn arrow_with(ui: &mut egui::Ui, open: bool, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
     let icon = if open {
         egui_flow::Icon::TriangleDown
@@ -1117,7 +1440,7 @@ fn arrow(ui: &mut egui::Ui, open: bool) -> egui::Response {
         egui_flow::Icon::TriangleRight
     };
     icon.paint(ui.painter(), rect, ui.visuals().text_color());
-    resp.on_hover_text("Show decoded signals")
+    resp.on_hover_text(tip)
 }
 
 /// A one-line text field for a filter expression: amber when active, red
@@ -1392,6 +1715,20 @@ pub struct NameLookup {
     pub generator_names: HashMap<NodeId, String>,
     /// DBC databases per bus; their message names take precedence.
     pub dbcs: DbcStore,
+    /// CAN ids of every diagnostic-enabled ECU, per bus.
+    pub diag_channels: Vec<DiagChannel>,
+    /// The diagnostic-enabled ECUs, for the Diagnostics windows.
+    pub diag_targets: Vec<DiagTarget>,
+}
+
+/// A diagnostic-enabled ECU of the topology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagTarget {
+    pub node: NodeId,
+    pub name: String,
+    /// Buses the server listens on.
+    pub buses: Vec<BusId>,
+    pub cfg: operow_core::DiagConfig,
 }
 
 impl NameLookup {
@@ -1408,11 +1745,44 @@ impl NameLookup {
         for b in &topo.buses {
             self.bus_names.insert(b.id, b.name.clone());
         }
+        self.diag_channels.clear();
+        self.diag_targets.clear();
+        for n in &topo.nodes {
+            let Some(cfg) = &n.diag else { continue };
+            let buses: Vec<BusId> = match cfg.bus {
+                Some(b) => vec![b],
+                None => topo
+                    .links
+                    .iter()
+                    .filter(|l| l.node == n.id)
+                    .map(|l| l.bus)
+                    .collect(),
+            };
+            for bus in &buses {
+                self.diag_channels.push(DiagChannel {
+                    bus: *bus,
+                    extended: cfg.extended_ids,
+                    req_id: cfg.req_id,
+                    resp_id: cfg.resp_id,
+                    functional_id: cfg.functional_id,
+                });
+            }
+            self.diag_targets.push(DiagTarget {
+                node: n.id,
+                name: n.name.clone(),
+                buses,
+                cfg: cfg.clone(),
+            });
+        }
     }
 
     pub fn node_name(&self, id: NodeId) -> String {
         if let Some(ch) = crate::replay::log_channel(id) {
             return format!("Log ch{ch}");
+        }
+        // Virtual diagnostic testers (below the log channel ids).
+        if (operow_engine::TESTER_NODE_BASE..crate::replay::LOG_NODE_BASE).contains(&id.0) {
+            return "Tester".to_string();
         }
         self.generator_names
             .get(&id)
@@ -1478,6 +1848,18 @@ mod tests {
             frame: CanFrame::new(id, false, data).unwrap(),
             kind: Default::default(),
         }
+    }
+
+    #[test]
+    fn virtual_testers_are_named_tester() {
+        let n = names();
+        let tester = NodeId(operow_engine::TESTER_NODE_BASE + 3);
+        assert_eq!(n.node_name(tester), "Tester");
+        assert_eq!(n.node_name(NodeId(1)), "ECU");
+        assert_ne!(n.node_name(NodeId(crate::replay::LOG_NODE_BASE)), "Tester");
+        let mut e = ev(1, 0x7E0, Direction::Tx, 5, &[2, 0x3E, 0]);
+        e.sender = tester;
+        assert_eq!(TraceRow::from_event(&e, &n).sender_name, "Tester");
     }
 
     #[test]

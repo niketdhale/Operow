@@ -11,6 +11,7 @@ use operow_engine::{
 use egui_flow::{EdgeId, PulseShape, PulseStyle};
 
 use crate::dbcs;
+use crate::diag_window::{DiagWindow, Step};
 use crate::generator_window::{AutoChange, DbcRow, GenRow, GeneratorWindow, SendMode, SigEdit};
 use crate::graph::{Graph, GraphNode, PulseDir, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
@@ -84,6 +85,11 @@ pub struct StartupOptions {
     /// `--demo-generator`: open Generator 1 with four rows next to a Trace
     /// and start its cyclic rows once the measurement runs.
     pub demo_generator: bool,
+    /// `--demo-diag`: open a Diagnostics window targeting `Engine` that sends
+    /// a request sequence once the measurement runs, next to a grouped Trace.
+    pub demo_diag: bool,
+    /// `--demo-diag-dtcs`: like `--demo-diag`, with the DTCs tab shown.
+    pub demo_diag_dtcs: bool,
     /// `--network-view freeform|busline`: the Network window layout.
     pub network_view: Option<NetworkView>,
     /// `--demo-logging`: open the Logging window with a signal trigger and
@@ -183,6 +189,8 @@ pub struct OperowApp {
     /// The Generator window that was focused last; "Copy as generator
     /// frame" targets it.
     last_generator: Option<WindowId>,
+    /// Per-instance state of every open Diagnostics window.
+    diags: HashMap<WindowId, DiagWindow>,
     /// `--demo-generator`: start this window's cyclic rows when running.
     demo_generator_pending: Option<WindowId>,
     /// Every bus event, shared by all windows.
@@ -264,6 +272,7 @@ impl OperowApp {
             last_graph: None,
             generators: HashMap::new(),
             last_generator: None,
+            diags: HashMap::new(),
             demo_generator_pending: None,
             store: FrameStore::new(settings.frame_buffer_size),
             logging: LoggingConfig::default(),
@@ -327,6 +336,10 @@ impl OperowApp {
         }
         if self.last_generator.is_some_and(|g| !open.contains(&g)) {
             self.last_generator = None;
+        }
+        self.diags.retain(|id, _| open.contains(id));
+        for id in open.iter().filter(|w| w.kind == WindowKind::Diag) {
+            self.diags.entry(*id).or_default();
         }
         self.store.set_capacity(self.settings.frame_buffer_size);
         self.store
@@ -557,6 +570,9 @@ impl OperowApp {
         if opts.demo_generator {
             self.demo_generator();
         }
+        if opts.demo_diag {
+            self.demo_diag(opts.demo_diag_dtcs);
+        }
         if opts.demo_logging {
             self.demo_logging();
         }
@@ -579,6 +595,63 @@ impl OperowApp {
         if let Some(name) = opts.select.as_deref() {
             self.select_by_name(name);
         }
+    }
+
+    /// `--demo-diag`: a Diagnostics window targeting `Engine` that, once the
+    /// measurement runs, switches to the extended session, reads the VIN,
+    /// unlocks SecurityAccess, writes a DID, reads the DTCs and finally sends
+    /// an invalid request; docked next to a Trace that groups ISO-TP.
+    fn demo_diag(&mut self, dtcs_tab: bool) {
+        self.show_tree = false;
+        let id = WindowId::new(WindowKind::Diag, 1);
+        let trace = WindowId::new(WindowKind::Trace, 1);
+        self.dock = workspace::diag_demo_layout(id, trace);
+        self.layout_preset = None;
+        self.sync_instances();
+        if let Some(t) = self.traces.get_mut(&trace) {
+            use crate::trace::Col;
+            t.group_isotp = true;
+            t.expand_multiframe = true;
+            t.hidden.extend([
+                Col::Chn,
+                Col::Dir,
+                Col::Hop,
+                Col::Type,
+                Col::Dlc,
+                Col::Len,
+                Col::Count,
+                Col::Dt,
+            ]);
+            // Only the diagnostic ids, so the exchange fills the window.
+            t.filters.id.enabled = true;
+            t.filters.id.text = "7DF-7EF".into();
+        }
+        let target = self
+            .names
+            .diag_targets
+            .iter()
+            .find(|t| t.name == "Engine")
+            .or(self.names.diag_targets.first())
+            .cloned();
+        if let Some(d) = self.diags.get_mut(&id) {
+            if let Some(t) = &target {
+                d.select_target(t);
+            }
+            if dtcs_tab {
+                d.show_dtcs();
+            }
+            d.queue_steps([
+                Step::Send(vec![0x10, 0x03]),
+                Step::Send(vec![0x22, 0xF1, 0x90]),
+                Step::Send(vec![0x27, 0x01]),
+                Step::ComputeKey,
+                Step::Send(vec![0x2E, 0x01, 0x00, 0xCA, 0xFE, 0xBA, 0xBE]),
+                Step::Send(vec![0x19, 0x02, 0xFF]),
+                Step::Send(vec![0x22, 0xFF, 0xFF]),
+                Step::Select(vec![0x22, 0xF1, 0x90]),
+            ]);
+        }
+        workspace::focus(&mut self.dock, id);
     }
 
     /// `--demo-logging`: start recording once the Body bus's DoorStatus
@@ -781,6 +854,7 @@ impl OperowApp {
         self.last_graph = None;
         self.generators.clear();
         self.last_generator = None;
+        self.diags.clear();
         self.logging = topo
             .workspace
             .as_ref()
@@ -801,6 +875,11 @@ impl OperowApp {
             for (id, view) in workspace::generators_from_json(ws) {
                 if let Some(g) = self.generators.get_mut(&id) {
                     g.apply_view(view);
+                }
+            }
+            for (id, view) in workspace::diags_from_json(ws) {
+                if let Some(d) = self.diags.get_mut(&id) {
+                    d.apply_view(view);
                 }
             }
         }
@@ -1485,6 +1564,7 @@ impl OperowApp {
         self.last_graph = None;
         self.generators.clear();
         self.last_generator = None;
+        self.diags.clear();
         self.store.clear();
     }
 
@@ -1534,12 +1614,14 @@ impl OperowApp {
                 .iter()
                 .map(|(id, g)| (*id, g.view()))
                 .collect();
+            let diags = self.diags.iter().map(|(id, d)| (*id, d.view())).collect();
             topo.workspace = workspace::with_logging(
                 workspace::layout_to_json_with(
                     &self.dock,
                     views,
                     graphs,
                     generators,
+                    diags,
                     Some(self.graph.network_layout()),
                 ),
                 &self.logging,
@@ -1676,20 +1758,36 @@ impl OperowApp {
                     for g in self.generators.values_mut() {
                         g.stop_local();
                     }
+                    for d in self.diags.values_mut() {
+                        d.on_stopped();
+                    }
                 }
                 self.log(format!("state -> {s:?}"));
             }
             EngineEvent::Log(msg) => self.log(msg),
-            EngineEvent::DiagResponse { req, resp, .. } => {
-                // The diagnostic console (next job) consumes these; log for now.
-                let line = match resp {
-                    Ok(r) => operow_uds::describe(&r, false),
-                    Err(e) => format!("no response ({e})"),
-                };
-                self.log(format!(
-                    "diag {} -> {line}",
-                    operow_uds::describe(&req, true)
-                ));
+            EngineEvent::DiagResponse {
+                req,
+                resp,
+                elapsed_ms,
+            } => {
+                // The first Diagnostics window that asked for it gets it.
+                let mut ids: Vec<WindowId> = self.diags.keys().copied().collect();
+                ids.sort_by_key(|id| id.n);
+                let taken = ids.into_iter().any(|id| {
+                    self.diags
+                        .get_mut(&id)
+                        .is_some_and(|d| d.on_response(&req, &resp, elapsed_ms))
+                });
+                if !taken {
+                    let line = match resp {
+                        Ok(r) => operow_uds::describe(&r, false),
+                        Err(e) => format!("no response ({e})"),
+                    };
+                    self.log(format!(
+                        "diag {} -> {line}",
+                        operow_uds::describe(&req, true)
+                    ));
+                }
             }
             EngineEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
@@ -1787,6 +1885,31 @@ impl OperowApp {
         let mut cmds = Vec::new();
         for (id, g) in self.generators.iter_mut() {
             cmds.extend(g.update(ctx, *id, &self.names, running));
+        }
+        for cmd in cmds {
+            let _ = self.engine.cmd.send(cmd);
+        }
+    }
+
+    /// Simulation time in seconds: the newest of the last statistics tick
+    /// and the last bus event.
+    fn latest_time_s(&self) -> f64 {
+        let last = self
+            .store
+            .next_seq()
+            .checked_sub(1)
+            .and_then(|s| self.store.get(s))
+            .map_or(0.0, |e| e.time.as_secs_f64());
+        last.max(self.sim_time.as_secs_f64())
+    }
+
+    /// Queued requests and TesterPresent state of every Diagnostics window.
+    fn update_diags(&mut self) {
+        let running = self.run_state == RunState::Running;
+        let now_s = self.latest_time_s();
+        let mut cmds = Vec::new();
+        for d in self.diags.values_mut() {
+            cmds.extend(d.update(&self.names, running, now_s));
         }
         for cmd in cmds {
             let _ = self.engine.cmd.send(cmd);
@@ -2034,6 +2157,13 @@ impl OperowApp {
             }
             if ui.button("+ Generator").clicked() {
                 self.open_window(WindowKind::Generator, true);
+            }
+            if ui
+                .button("Diag")
+                .on_hover_text("Open a Diagnostics (UDS) window")
+                .clicked()
+            {
+                self.open_window(WindowKind::Diag, true);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2365,6 +2495,7 @@ impl eframe::App for OperowApp {
             }
         }
         self.update_generators(ctx);
+        self.update_diags();
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
@@ -2405,6 +2536,7 @@ impl eframe::App for OperowApp {
             self.graph.user_signals.retain(|u| u.id != id);
         }
 
+        let sim_time_s = self.latest_time_s();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -2414,6 +2546,8 @@ impl eframe::App for OperowApp {
                     traces: &mut self.traces,
                     graphs: &mut self.graphs,
                     generators: &mut self.generators,
+                    diags: &mut self.diags,
+                    sim_time_s,
                     store: &self.store,
                     names: &self.names,
                     status_log: &mut self.status_log,

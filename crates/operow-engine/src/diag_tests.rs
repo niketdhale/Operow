@@ -269,15 +269,46 @@ fn s3_timeout_returns_to_default_session() {
 fn periodic_tester_present_keeps_session() {
     let mut rig = Rig::new(diag_cfg(false), None);
     rig.ask(&[0x10, 0x03]);
-    rig.sim.set_tester_present(true, BUS, 0x7E0, 1000);
+    rig.sim.set_tester_present(tp_spec(true, false, false));
     rig.advance_ms(12_000);
     let tp = rig.frames.iter().filter(|e| e.frame.id == 0x7E0).count();
     assert!(tp >= 11, "{tp} tester present frames");
     assert_eq!(rig.ask(&[0x2E, 0x01, 0x00, 9, 8, 7, 6]), [0x6E, 0x01, 0x00]);
-    rig.sim.set_tester_present(false, BUS, 0x7E0, 1000);
+    assert!(
+        rig.frames
+            .iter()
+            .filter(|e| e.frame.id == 0x7E0 && e.frame.payload() == [2, 0x3E, 0x80])
+            .all(|e| e.sender == crate::sim::TESTER_PRESENT_NODE),
+        "sent by the tester identity"
+    );
+    rig.sim.set_tester_present(tp_spec(false, false, false));
     let before = rig.frames.len();
     rig.advance_ms(3000);
     assert_eq!(rig.frames.len(), before);
+}
+
+fn tp_spec(enable: bool, functional: bool, fd: bool) -> crate::TesterPresentSpec {
+    crate::TesterPresentSpec {
+        enable,
+        bus: BUS,
+        req_id: 0x7E0,
+        functional_id: 0x7DF,
+        functional,
+        extended: false,
+        fd,
+        period_ms: 1000,
+    }
+}
+
+#[test]
+fn tester_present_honours_functional_and_fd() {
+    let mut rig = Rig::new(diag_cfg(false), None);
+    rig.sim.set_tester_present(tp_spec(true, true, true));
+    rig.advance_ms(2500);
+    let tp: Vec<_> = rig.frames.iter().filter(|e| e.frame.id == 0x7DF).collect();
+    assert!(tp.len() >= 3, "{} functional frames", tp.len());
+    assert!(tp.iter().all(|e| e.frame.fd));
+    assert!(rig.frames.iter().all(|e| e.frame.id != 0x7E0));
 }
 
 #[test]

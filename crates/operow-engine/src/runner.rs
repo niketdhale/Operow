@@ -9,7 +9,7 @@ use crate::ecu::EcuCommand;
 use crate::sim::{
     BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
 };
-use crate::tester::DiagRequestSpec;
+use crate::tester::{DiagRequestSpec, TesterPresentSpec};
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,13 +95,17 @@ pub enum Command {
         payload: Vec<u8>,
         functional: bool,
     },
-    /// Start or stop a periodic TesterPresent (`3E 80`, single frame sent
-    /// on `req_id`) on `tester_bus`.
+    /// Start or stop a periodic TesterPresent (`3E 80`, single frame) from
+    /// the virtual "Tester" on `tester_bus`: sent on `functional_id` when
+    /// `functional`, else on `req_id`; as a CAN FD frame when `fd`.
     TesterPresent {
         enable: bool,
         tester_bus: BusId,
         req_id: u32,
+        functional_id: u32,
         functional: bool,
+        extended: bool,
+        fd: bool,
         period_ms: u32,
     },
     Shutdown,
@@ -451,11 +455,23 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
             enable,
             tester_bus,
             req_id,
+            functional_id,
+            functional,
+            extended,
+            fd,
             period_ms,
-            ..
         } => {
             if let Some(sim) = state.sim.as_mut() {
-                sim.set_tester_present(enable, tester_bus, req_id, period_ms);
+                sim.set_tester_present(TesterPresentSpec {
+                    enable,
+                    bus: tester_bus,
+                    req_id,
+                    functional_id,
+                    functional,
+                    extended,
+                    fd,
+                    period_ms,
+                });
             }
         }
         Command::Shutdown => return false,

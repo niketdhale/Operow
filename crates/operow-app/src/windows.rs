@@ -8,6 +8,7 @@ use operow_core::{BusId, CanErrorKind, NodeErrorState};
 use operow_engine::{Command, NodeErrorInfo, RunState};
 
 use crate::app::LiveBusStats;
+use crate::diag_window::DiagWindow;
 use crate::generator_window::GeneratorWindow;
 use crate::graph::{Graph, GraphNode, GraphViewer};
 use crate::graph_window::GraphWindow;
@@ -29,6 +30,9 @@ pub struct WindowViewer<'a> {
     pub traces: &'a mut HashMap<WindowId, Trace>,
     pub graphs: &'a mut HashMap<WindowId, GraphWindow>,
     pub generators: &'a mut HashMap<WindowId, GeneratorWindow>,
+    pub diags: &'a mut HashMap<WindowId, DiagWindow>,
+    /// Simulation time in seconds, for request timestamps.
+    pub sim_time_s: f64,
     pub store: &'a FrameStore,
     pub names: &'a NameLookup,
     pub status_log: &'a mut Vec<String>,
@@ -454,6 +458,7 @@ impl TabViewer for WindowViewer<'_> {
             WindowKind::Trace => self.traces.get(tab).and_then(|t| t.title.as_deref()),
             WindowKind::Graph => self.graphs.get(tab).and_then(|g| g.title.as_deref()),
             WindowKind::Generator => self.generators.get(tab).and_then(|g| g.title.as_deref()),
+            WindowKind::Diag => self.diags.get(tab).and_then(|g| g.title.as_deref()),
             _ => None,
         };
         match title {
@@ -480,6 +485,11 @@ impl TabViewer for WindowViewer<'_> {
             }
             WindowKind::Generator => {
                 if let Some(g) = self.generators.get_mut(tab) {
+                    g.begin_rename();
+                }
+            }
+            WindowKind::Diag => {
+                if let Some(g) = self.diags.get_mut(tab) {
                     g.begin_rename();
                 }
             }
@@ -525,6 +535,13 @@ impl TabViewer for WindowViewer<'_> {
                 let can_send = self.can_send();
                 if let Some(g) = self.generators.get_mut(&id) {
                     let cmds = g.ui(ui, id, self.names, can_send);
+                    self.cmds.extend(cmds);
+                }
+            }
+            WindowKind::Diag => {
+                let can_send = self.can_send();
+                if let Some(d) = self.diags.get_mut(&id) {
+                    let cmds = d.ui(ui, id, self.names, can_send, self.sim_time_s);
                     self.cmds.extend(cmds);
                 }
             }

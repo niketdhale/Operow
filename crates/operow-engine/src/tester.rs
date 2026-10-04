@@ -31,6 +31,22 @@ pub struct DiagRequestSpec {
     pub functional: bool,
 }
 
+/// A periodic TesterPresent (`3E 80`, single frame) from the virtual tester.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TesterPresentSpec {
+    pub enable: bool,
+    pub bus: BusId,
+    /// Physical request id.
+    pub req_id: u32,
+    /// Functional request id, used instead of `req_id` when `functional`.
+    pub functional_id: u32,
+    pub functional: bool,
+    pub extended: bool,
+    /// Send CAN FD frames (with escape-free SF, 8 bytes of payload).
+    pub fd: bool,
+    pub period_ms: u32,
+}
+
 /// Outcome of a [`DiagRequestSpec`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiagResult {
