@@ -83,6 +83,13 @@ cargo test --workspace
 cargo test -p operow-engine --test example_smoke
 ```
 
+CI uses [cargo-nextest](https://nexte.st) (optional locally: `cargo install cargo-nextest --locked`):
+
+```bash
+cargo nextest run --workspace
+cargo test --workspace --doc   # nextest skips doctests
+```
+
 ## Architecture
 
 The workspace consists of the following crates:
