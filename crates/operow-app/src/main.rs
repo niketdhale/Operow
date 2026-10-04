@@ -5,6 +5,7 @@
 
 mod app;
 mod dbcs;
+mod diag_props;
 mod filters;
 mod generator_window;
 mod graph;

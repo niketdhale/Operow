@@ -136,6 +136,131 @@ pub struct EcuConfig {
     /// Optional inline Rhai script run alongside the node's built-in behavior.
     #[serde(default)]
     pub script: Option<String>,
+    /// Optional simulated UDS diagnostic server (ISO 14229 over ISO-TP).
+    #[serde(default)]
+    pub diag: Option<DiagConfig>,
+}
+
+/// A readable (and optionally writable) data identifier of a diagnostic ECU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DidEntry {
+    pub did: u16,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub data: Vec<u8>,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// A stored diagnostic trouble code. `code` is the 24-bit DTC (two OBD
+/// bytes plus failure type); `status` the ISO 14229 status byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DtcEntry {
+    pub code: u32,
+    #[serde(default)]
+    pub status: u8,
+}
+
+/// How the key for SecurityAccess is derived from the seed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyAlgo {
+    /// Each seed byte is XORed with the constant (repeated cyclically).
+    XorConst(Vec<u8>),
+    /// The seed as big-endian number plus the constant, truncated to the
+    /// seed length.
+    AddConst(u32),
+    /// The node script's `on_security_key(seed)` returns the key.
+    Script,
+}
+
+/// SecurityAccess (0x27) settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Seed request level (odd); the key is sent with `level + 1`.
+    pub level: u8,
+    pub seed: Vec<u8>,
+    pub key_algo: KeyAlgo,
+}
+
+fn default_req_id() -> u32 {
+    0x7E0
+}
+fn default_resp_id() -> u32 {
+    0x7E8
+}
+fn default_functional_id() -> Option<u32> {
+    Some(0x7DF)
+}
+fn default_sessions() -> Vec<u8> {
+    vec![1, 2, 3]
+}
+fn default_p2_ms() -> u16 {
+    50
+}
+fn default_p2_star_ms() -> u16 {
+    5000
+}
+
+/// Configuration of the UDS server simulated by an ECU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagConfig {
+    /// Bus the server listens on; `None` means every bus the node is on.
+    #[serde(default)]
+    pub bus: Option<BusId>,
+    /// Physical request id (tester to ECU).
+    #[serde(default = "default_req_id")]
+    pub req_id: u32,
+    /// Response id (ECU to tester).
+    #[serde(default = "default_resp_id")]
+    pub resp_id: u32,
+    /// Functional request id; single-frame requests only.
+    #[serde(default = "default_functional_id")]
+    pub functional_id: Option<u32>,
+    #[serde(default)]
+    pub extended_ids: bool,
+    #[serde(default)]
+    pub fd: bool,
+    #[serde(default)]
+    pub padding: Option<u8>,
+    #[serde(default)]
+    pub block_size: u8,
+    #[serde(default)]
+    pub st_min_ms: u8,
+    #[serde(default)]
+    pub dids: Vec<DidEntry>,
+    #[serde(default)]
+    pub dtcs: Vec<DtcEntry>,
+    #[serde(default = "default_sessions")]
+    pub sessions_supported: Vec<u8>,
+    #[serde(default)]
+    pub security: Option<SecurityConfig>,
+    #[serde(default = "default_p2_ms")]
+    pub p2_ms: u16,
+    #[serde(default = "default_p2_star_ms")]
+    pub p2_star_ms: u16,
+}
+
+impl Default for DiagConfig {
+    fn default() -> Self {
+        DiagConfig {
+            bus: None,
+            req_id: default_req_id(),
+            resp_id: default_resp_id(),
+            functional_id: default_functional_id(),
+            extended_ids: false,
+            fd: false,
+            padding: None,
+            block_size: 0,
+            st_min_ms: 0,
+            dids: Vec::new(),
+            dtcs: Vec::new(),
+            sessions_supported: default_sessions(),
+            security: None,
+            p2_ms: default_p2_ms(),
+            p2_star_ms: default_p2_star_ms(),
+        }
+    }
 }
 
 fn default_data_bitrate() -> u32 {
@@ -264,6 +389,8 @@ pub enum TopologyError {
     RouteToSameBus { node: NodeId, bus: BusId },
     #[error("replay node {node:?} maps a channel to bus {bus:?} which it is not linked to")]
     ReplayBusNotLinked { node: NodeId, bus: BusId },
+    #[error("node {node:?} serves diagnostics on bus {bus:?} which it is not linked to")]
+    DiagBusNotLinked { node: NodeId, bus: BusId },
 }
 
 /// Errors returned by [`Topology::from_json`].
@@ -318,6 +445,11 @@ impl Topology {
                 if !linked(bus) {
                     return Err(TopologyError::TxBusNotLinked { node: node.id, bus });
                 }
+            }
+            if let Some(bus) = node.diag.as_ref().and_then(|d| d.bus)
+                && !linked(bus)
+            {
+                return Err(TopologyError::DiagBusNotLinked { node: node.id, bus });
             }
             if let NodeKind::Replay { channel_map, .. } = &node.kind {
                 for &(_, bus) in channel_map {

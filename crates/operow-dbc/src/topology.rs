@@ -195,6 +195,7 @@ impl Database {
                         kind: NodeKind::Ecu,
                         pos,
                         script: None,
+                        diag: None,
                     });
                     id
                 }
@@ -226,6 +227,7 @@ impl Database {
                 kind: NodeKind::Ecu,
                 pos: (80.0 + 180.0 * i as f32, 120.0),
                 script: None,
+                diag: None,
             })
             .collect::<Vec<_>>();
         let links = nodes.iter().map(|n| Link { node: n.id, bus }).collect();

@@ -1,6 +1,7 @@
 use crate::{
-    BusId, CanBusConfig, CanFrame, DbcRef, EcuConfig, IdFilter, Link, NodeId, NodeKind, RouteRule,
-    SendType, SignalByteOrder, Topology, TopologyError, TxMessage, UserSignalDef, UserSignalId,
+    BusId, CanBusConfig, CanFrame, DbcRef, DiagConfig, DidEntry, DtcEntry, EcuConfig, IdFilter,
+    KeyAlgo, Link, NodeId, NodeKind, RouteRule, SecurityConfig, SendType, SignalByteOrder,
+    Topology, TopologyError, TxMessage, UserSignalDef, UserSignalId,
 };
 
 #[test]
@@ -20,6 +21,7 @@ fn topology_json_roundtrip() {
             kind: Default::default(),
             pos: (1.0, 2.0),
             script: None,
+            diag: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -227,6 +229,7 @@ fn validate_rejects_bad_bus_references() {
             },
             pos: (0.0, 0.0),
             script: None,
+            diag: None,
         }],
         buses: ["A", "B"]
             .iter()
@@ -387,6 +390,7 @@ fn replay_topology(map: Vec<(u8, BusId)>) -> Topology {
             },
             pos: (0.0, 0.0),
             script: None,
+            diag: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -463,4 +467,84 @@ fn bus_event_without_kind_deserializes_as_frame() {
 fn bus_without_simulate_ack_defaults_to_false() {
     let b: CanBusConfig = serde_json::from_str(r#"{"id":1,"name":"A","bitrate":500000}"#).unwrap();
     assert!(!b.simulate_ack);
+}
+
+#[test]
+fn diag_config_defaults_and_old_json() {
+    // A node without `diag` (old project files) loads with none.
+    let old = r#"{"nodes":[{"id":1,"name":"A","tx":[]}],"buses":[],"links":[]}"#;
+    assert_eq!(Topology::from_json(old).unwrap().nodes[0].diag, None);
+
+    let d: DiagConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(d, DiagConfig::default());
+    assert_eq!((d.req_id, d.resp_id), (0x7E0, 0x7E8));
+    assert_eq!(d.functional_id, Some(0x7DF));
+    assert_eq!(d.sessions_supported, vec![1, 2, 3]);
+    assert_eq!((d.p2_ms, d.p2_star_ms), (50, 5000));
+
+    let mut topo = Topology::default();
+    topo.nodes.push(EcuConfig {
+        id: NodeId(1),
+        name: "Engine".into(),
+        tx: vec![],
+        kind: NodeKind::Ecu,
+        pos: (0.0, 0.0),
+        script: None,
+        diag: Some(DiagConfig {
+            dids: vec![DidEntry {
+                did: 0xF190,
+                name: "VIN".into(),
+                data: vec![1, 2],
+                writable: true,
+            }],
+            dtcs: vec![DtcEntry {
+                code: 0x012300,
+                status: 9,
+            }],
+            security: Some(SecurityConfig {
+                level: 1,
+                seed: vec![1],
+                key_algo: KeyAlgo::XorConst(vec![0xFF]),
+            }),
+            ..DiagConfig::default()
+        }),
+    });
+    assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
+}
+
+#[test]
+fn diag_bus_must_be_linked() {
+    let mut topo = Topology::default();
+    topo.buses.push(CanBusConfig {
+        id: BusId(1),
+        name: "CAN0".into(),
+        bitrate: 500_000,
+        fd_enabled: false,
+        data_bitrate: 2_000_000,
+        simulate_ack: false,
+    });
+    topo.nodes.push(EcuConfig {
+        id: NodeId(1),
+        name: "A".into(),
+        tx: vec![],
+        kind: NodeKind::Ecu,
+        pos: (0.0, 0.0),
+        script: None,
+        diag: Some(DiagConfig {
+            bus: Some(BusId(1)),
+            ..DiagConfig::default()
+        }),
+    });
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::DiagBusNotLinked {
+            node: NodeId(1),
+            bus: BusId(1)
+        })
+    );
+    topo.links.push(Link {
+        node: NodeId(1),
+        bus: BusId(1),
+    });
+    assert_eq!(topo.validate(), Ok(()));
 }

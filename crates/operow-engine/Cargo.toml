@@ -10,3 +10,5 @@ operow-log = { path = "../operow-log" }
 crossbeam-channel = { workspace = true }
 rhai = { version = "1.26.1", features = ["sync"] }
 thiserror.workspace = true
+operow-isotp = { path = "../operow-isotp" }
+operow-uds = { path = "../operow-uds" }

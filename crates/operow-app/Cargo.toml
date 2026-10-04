@@ -17,6 +17,7 @@ rfd = "0.15"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 operow-core = { workspace = true }
+operow-uds = { path = "../operow-uds" }
 operow-log = { path = "../operow-log" }
 operow-engine = { path = "../operow-engine" }
 operow-dbc = { path = "../operow-dbc" }

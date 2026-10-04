@@ -165,6 +165,17 @@ pub fn check_script(src: &str) -> Result<(), String> {
 /// Functions in Rhai cannot see top-level variables, so persistent script
 /// state lives in `this` (an object map shared by all handlers), e.g.
 /// `this.count += 1`. Top-level statements run once at start.
+///
+/// Diagnostics hooks (used by the node's UDS server, see `DiagConfig`):
+/// `fn on_diag(req)` receives the request bytes (array, SID first) and may
+/// return an array with the complete response (e.g. `[0x62, 0xF1, 0x90, 0x41]`)
+/// that replaces the built-in answer; an empty array sends no response and
+/// any other return value falls back to the built-in server. A response of
+/// the form `[0x7F, sid, 0x78]` (responsePending) is sent and `on_diag` is
+/// called again with the same request after 100 ms (up to 50 times) until it
+/// returns something else, so use `this` to remember that the request was
+/// seen. `fn on_security_key(seed)` returns the expected key (array) for
+/// `KeyAlgo::Script`.
 pub struct ScriptEcu {
     inner: Box<dyn Ecu>,
     name: String,
@@ -176,6 +187,8 @@ pub struct ScriptEcu {
     has_start: bool,
     has_timer: bool,
     has_message: bool,
+    has_diag: bool,
+    has_security_key: bool,
     timers: HashMap<u32, i64>,
     next_token: u32,
     logs: Vec<String>,
@@ -194,6 +207,7 @@ impl ScriptEcu {
         };
         let (has_start, has_timer, has_message) =
             (has("on_start", 0), has("on_timer", 1), has("on_message", 1));
+        let (has_diag, has_security_key) = (has("on_diag", 1), has("on_security_key", 1));
         Ok(ScriptEcu {
             inner,
             name: name.to_string(),
@@ -205,6 +219,8 @@ impl ScriptEcu {
             has_start,
             has_timer,
             has_message,
+            has_diag,
+            has_security_key,
             timers: HashMap::new(),
             next_token: SCRIPT_TIMER_BASE,
             logs: Vec::new(),
@@ -325,6 +341,33 @@ impl Ecu for ScriptEcu {
 
     fn on_command(&mut self, cmd: &EcuCommand, ctx: &mut EcuCtx) {
         self.inner.on_command(cmd, ctx);
+    }
+
+    fn script_hook(&mut self, name: &str, arg: &[u8], ctx: &mut EcuCtx) -> Option<Vec<u8>> {
+        let known = match name {
+            "on_diag" => self.has_diag,
+            "on_security_key" => self.has_security_key,
+            _ => false,
+        };
+        if !known {
+            return self.inner.script_hook(name, arg, ctx);
+        }
+        let arr: rhai::Array = arg.iter().map(|&b| Dynamic::from(b as i64)).collect();
+        let mut ret: Option<Dynamic> = None;
+        self.call(ctx, |engine, ast, scope, state| {
+            let opts = CallFnOptions::new()
+                .eval_ast(false)
+                .rewind_scope(false)
+                .bind_this_ptr(state);
+            ret = Some(engine.call_fn_with_options::<Dynamic>(opts, scope, ast, name, (arr,))?);
+            Ok(())
+        });
+        let arr = ret?.into_array().ok()?;
+        Some(
+            arr.iter()
+                .filter_map(|b| b.as_int().ok().map(|n| n as u8))
+                .collect(),
+        )
     }
 
     fn drain_logs(&mut self) -> Vec<String> {

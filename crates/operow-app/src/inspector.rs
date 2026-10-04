@@ -28,6 +28,7 @@ pub struct Inspector {
     was_running: bool,
     script_check: crate::script_editor::ScriptCheck,
     script_window: bool,
+    diag: crate::diag_props::DiagProps,
     /// Channels found in each Replay node's log: the resolved path they
     /// were read from, and the channels or the read error.
     project_dir: Option<std::path::PathBuf>,
@@ -190,6 +191,7 @@ impl Inspector {
             self.route_buf.clear();
             self.error = None;
             self.script_window = false;
+            self.diag.clear();
         }
 
         ui.add_space(4.0);
@@ -454,6 +456,8 @@ impl Inspector {
                         });
                 }
 
+                ui.separator();
+                self.diag.ui(ui, sel, &mut ecu.diag, &linked, running);
                 ui.separator();
                 self.script_ui(ui, sel, &mut ecu.script, running);
             }
@@ -971,7 +975,7 @@ impl Inspector {
     }
 }
 
-const RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
+pub(crate) const RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x30, 0x30);
 
 /// Filter discriminant without its parameters, for the combo box.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1060,7 +1064,7 @@ pub fn route_issue(r: &RouteRule, linked: &[(BusId, String)]) -> Option<String> 
     None
 }
 
-fn parse_hex_u32(s: &str) -> Option<u32> {
+pub(crate) fn parse_hex_u32(s: &str) -> Option<u32> {
     let s = s.trim();
     let s = s
         .strip_prefix("0x")
@@ -1099,14 +1103,14 @@ fn hex_edit(
     }
 }
 
-fn hex_bytes(data: &[u8]) -> String {
+pub(crate) fn hex_bytes(data: &[u8]) -> String {
     data.iter()
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
     if s.is_empty() {
         return Some(Vec::new());

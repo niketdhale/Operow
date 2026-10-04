@@ -29,6 +29,10 @@ fn on_message(msg) {
     }
 }
 
+// UDS server hooks (Diagnostics section): fn on_diag(req) returns a response
+// array (empty array = no response, [0x7F, sid, 0x78] = pending, then asked
+// again); fn on_security_key(seed) returns the key for "Script" key algorithms.
+
 // Other API: now_ms(), now_ns(), print(x), trigger(i), set_payload(i, data)
 "#;
 

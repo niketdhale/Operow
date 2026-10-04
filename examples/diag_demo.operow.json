@@ -1,0 +1,119 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "name": "Engine",
+      "tx": [
+        {
+          "name": "EngineStatus",
+          "frame": {
+            "id": 416,
+            "extended": false,
+            "dlc": 8,
+            "data": [0, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 100,
+          "enabled": true
+        }
+      ],
+      "pos": [420.0, 200.0],
+      "diag": {
+        "req_id": 2016,
+        "resp_id": 2024,
+        "functional_id": 2015,
+        "dids": [
+          {
+            "did": 61840,
+            "name": "VIN",
+            "data": [87, 65, 85, 90, 90, 90, 56, 75, 57, 66, 65, 49, 50, 51, 52, 53, 54],
+            "writable": false
+          },
+          {
+            "did": 61831,
+            "name": "PartNumber",
+            "data": [48, 50, 56, 49, 48, 50, 48, 48, 48, 49],
+            "writable": false
+          },
+          {
+            "did": 61836,
+            "name": "SerialNumber",
+            "data": [69, 67, 45, 48, 48, 48, 48, 52, 50],
+            "writable": false
+          },
+          {
+            "did": 256,
+            "name": "Calibration",
+            "data": [1, 2, 3, 4],
+            "writable": true
+          },
+          {
+            "did": 512,
+            "name": "Blob",
+            "data": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+            "writable": false
+          }
+        ],
+        "dtcs": [
+          {
+            "code": 74496,
+            "status": 9
+          },
+          {
+            "code": 196864,
+            "status": 47
+          },
+          {
+            "code": 12648583,
+            "status": 8
+          }
+        ],
+        "security": {
+          "level": 1,
+          "seed": [18, 52, 86, 120],
+          "key_algo": {
+            "XorConst": [165]
+          }
+        },
+        "sessions_supported": [1, 2, 3],
+        "p2_ms": 50,
+        "p2_star_ms": 5000
+      }
+    },
+    {
+      "id": 2,
+      "name": "Dashboard",
+      "tx": [
+        {
+          "name": "DashAlive",
+          "frame": {
+            "id": 992,
+            "extended": false,
+            "dlc": 2,
+            "data": [1, 0, 0, 0, 0, 0, 0, 0]
+          },
+          "period_ms": 200,
+          "enabled": true
+        }
+      ],
+      "pos": [160.0, 200.0]
+    }
+  ],
+  "buses": [
+    {
+      "id": 1,
+      "name": "CAN0",
+      "bitrate": 500000,
+      "fd_enabled": false
+    }
+  ],
+  "links": [
+    {
+      "node": 1,
+      "bus": 1
+    },
+    {
+      "node": 2,
+      "bus": 1
+    }
+  ]
+}

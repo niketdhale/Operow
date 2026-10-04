@@ -1680,6 +1680,17 @@ impl OperowApp {
                 self.log(format!("state -> {s:?}"));
             }
             EngineEvent::Log(msg) => self.log(msg),
+            EngineEvent::DiagResponse { req, resp, .. } => {
+                // The diagnostic console (next job) consumes these; log for now.
+                let line = match resp {
+                    Ok(r) => operow_uds::describe(&r, false),
+                    Err(e) => format!("no response ({e})"),
+                };
+                self.log(format!(
+                    "diag {} -> {line}",
+                    operow_uds::describe(&req, true)
+                ));
+            }
             EngineEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
                 self.log(format!("error: {msg}"));

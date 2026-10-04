@@ -9,6 +9,7 @@ use crate::ecu::EcuCommand;
 use crate::sim::{
     BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
 };
+use crate::tester::DiagRequestSpec;
 
 /// Coarse run state broadcast to listeners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,27 @@ pub enum Command {
         id: (u32, bool),
         control: MsgControl,
     },
+    /// Send a diagnostic request from a virtual "Tester" node on
+    /// `tester_bus` (see [`Simulation::diag_request`]). The outcome arrives
+    /// as [`EngineEvent::DiagResponse`]. Needs a running simulation.
+    DiagRequest {
+        tester_bus: BusId,
+        req_id: u32,
+        resp_id: u32,
+        extended: bool,
+        fd: bool,
+        payload: Vec<u8>,
+        functional: bool,
+    },
+    /// Start or stop a periodic TesterPresent (`3E 80`, single frame sent
+    /// on `req_id`) on `tester_bus`.
+    TesterPresent {
+        enable: bool,
+        tester_bus: BusId,
+        req_id: u32,
+        functional: bool,
+        period_ms: u32,
+    },
     Shutdown,
 }
 
@@ -97,6 +119,14 @@ pub enum EngineEvent {
     NodeStates {
         time: Timestamp,
         nodes: Vec<NodeErrorInfo>,
+    },
+    /// Outcome of a [`Command::DiagRequest`]; `resp` is the final response
+    /// (possibly a negative one) or why none arrived. `elapsed_ms` is
+    /// virtual time.
+    DiagResponse {
+        req: Vec<u8>,
+        resp: Result<Vec<u8>, String>,
+        elapsed_ms: f64,
     },
     State(RunState),
     Log(String),
@@ -212,6 +242,13 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         sim.run_until(Timestamp(state.virtual_ns), &mut frames_buf);
         for line in sim.drain_logs() {
             let _ = ev_tx.try_send(EngineEvent::Log(line));
+        }
+        for r in sim.take_diag_results() {
+            let _ = ev_tx.try_send(EngineEvent::DiagResponse {
+                req: r.req,
+                resp: r.resp,
+                elapsed_ms: r.elapsed_ms,
+            });
         }
         if !frames_buf.is_empty() {
             let batch = std::mem::take(&mut frames_buf);
@@ -374,6 +411,51 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 for line in sim.drain_logs() {
                     let _ = ev_tx.try_send(EngineEvent::Log(line));
                 }
+            }
+        }
+        Command::DiagRequest {
+            tester_bus,
+            req_id,
+            resp_id,
+            extended,
+            fd,
+            payload,
+            functional,
+        } => {
+            let fail = |msg: &str, payload: Vec<u8>| {
+                let _ = ev_tx.try_send(EngineEvent::DiagResponse {
+                    req: payload,
+                    resp: Err(msg.to_string()),
+                    elapsed_ms: 0.0,
+                });
+            };
+            match state.sim.as_mut() {
+                Some(sim) if state.run_state == RunState::Running => {
+                    let spec = DiagRequestSpec {
+                        bus: tester_bus,
+                        req_id,
+                        resp_id,
+                        extended,
+                        fd,
+                        payload: payload.clone(),
+                        functional,
+                    };
+                    if let Err(e) = sim.diag_request(spec) {
+                        fail(&e, payload);
+                    }
+                }
+                _ => fail("simulation is not running", payload),
+            }
+        }
+        Command::TesterPresent {
+            enable,
+            tester_bus,
+            req_id,
+            period_ms,
+            ..
+        } => {
+            if let Some(sim) = state.sim.as_mut() {
+                sim.set_tester_present(enable, tester_bus, req_id, period_ms);
             }
         }
         Command::Shutdown => return false,

@@ -6,10 +6,12 @@ use operow_core::{
     NodeId, NodeKind, Timestamp, Topology, TopologyError,
 };
 
+use crate::diag::DiagEcu;
 use crate::ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 use crate::gateway::GatewayEcu;
 use crate::replay::ReplayEcu;
 use crate::script::ScriptEcu;
+use crate::tester::{DiagRequestSpec, DiagResult, TESTER_NODE_BASE, TesterEcu};
 use crate::timing::frame_duration_ns_any;
 
 /// Maximum number of gateway hops a frame may take; forwards beyond it are
@@ -19,6 +21,10 @@ pub const MAX_HOPS: u8 = 8;
 /// First [`NodeId`] value reserved for interactive generators; topology
 /// nodes must stay below it.
 pub const GENERATOR_NODE_BASE: u32 = 0xF000_0000;
+
+/// Generator id used for periodic TesterPresent frames; far above the ids
+/// the application hands out.
+const TESTER_PRESENT_GENERATOR: u32 = 0x0FFF_FF00;
 
 /// Identifier of an interactive generator (a virtual sender that is linked
 /// to every bus and runs no ECU behavior).
@@ -248,6 +254,8 @@ pub enum SimError {
     Script { node: NodeId, msg: String },
     #[error("replay node {node:?}: {msg}")]
     Replay { node: String, msg: String },
+    #[error("diagnostics of node {node:?}: {msg}")]
+    Diag { node: String, msg: String },
 }
 
 /// Number of CAN error frames per [`CanErrorKind`].
@@ -436,6 +444,8 @@ pub struct Simulation {
     rng: Rng,
     offline: HashSet<(NodeId, BusId)>,
     msg_controls: HashMap<(NodeId, u32, bool), MsgControl>,
+    next_tester: u32,
+    diag_results: crate::tester::SharedResults,
 }
 
 impl Simulation {
@@ -482,6 +492,18 @@ impl Simulation {
                         .map_err(|msg| SimError::Script { node: node.id, msg })?,
                 );
             }
+            if let Some(diag) = node
+                .diag
+                .as_ref()
+                .filter(|_| !matches!(node.kind, NodeKind::Replay { .. }))
+            {
+                ecu = Box::new(DiagEcu::new(ecu, &node.name, diag).map_err(|msg| {
+                    SimError::Diag {
+                        node: node.name.clone(),
+                        msg,
+                    }
+                })?);
+            }
             ecus.insert(node.id, ecu);
             node_buses.entry(node.id).or_default();
         }
@@ -507,6 +529,8 @@ impl Simulation {
             rng: Rng::new(DEFAULT_SEED),
             offline: HashSet::new(),
             msg_controls: HashMap::new(),
+            next_tester: 0,
+            diag_results: Default::default(),
         })
     }
 
@@ -587,6 +611,7 @@ impl Simulation {
         let mut v: Vec<NodeErrorInfo> = self
             .node_buses
             .iter()
+            .filter(|(node, _)| node.0 < TESTER_NODE_BASE)
             .flat_map(|(node, buses)| buses.iter().map(move |bus| (*node, *bus)))
             .map(|(node, bus)| {
                 let (state, tec, rec) = self.node_state(node, bus);
@@ -900,6 +925,50 @@ impl Simulation {
     /// Stop every cyclic row of `gen_id`.
     pub fn gen_stop_all(&mut self, gen_id: GeneratorId) {
         self.gen_rows.retain(|(g, _), _| *g != gen_id);
+    }
+
+    /// Start a diagnostic request from a virtual "Tester" node linked to
+    /// `spec.bus` only. Its outcome appears later in
+    /// [`Simulation::take_diag_results`]. Returns the tester's node id.
+    pub fn diag_request(&mut self, spec: DiagRequestSpec) -> Result<NodeId, String> {
+        if !self.bus_configs.contains_key(&spec.bus) {
+            return Err(format!("unknown bus {:?}", spec.bus));
+        }
+        self.ensure_started();
+        let node = NodeId(TESTER_NODE_BASE + self.next_tester);
+        self.next_tester += 1;
+        let tester = TesterEcu::new(node, spec, self.diag_results.clone())?;
+        let bus = tester.bus();
+        self.node_buses.insert(node, vec![bus]);
+        self.bus_nodes.entry(bus).or_default().push(node);
+        self.ecus.insert(node, Box::new(tester));
+        self.run_callback(node, None, |ecu, ctx| ecu.on_start(ctx));
+        Ok(node)
+    }
+
+    /// Take the finished diagnostic requests and drop their tester nodes.
+    pub fn take_diag_results(&mut self) -> Vec<DiagResult> {
+        let results =
+            std::mem::take(&mut *self.diag_results.lock().unwrap_or_else(|e| e.into_inner()));
+        for r in &results {
+            self.ecus.remove(&r.node);
+            self.node_buses.remove(&r.node);
+            for nodes in self.bus_nodes.values_mut() {
+                nodes.retain(|n| *n != r.node);
+            }
+        }
+        results
+    }
+
+    /// Start or stop a periodic functional/physical TesterPresent
+    /// (`3E 80`, single frame) on `bus`, sent from a virtual generator.
+    pub fn set_tester_present(&mut self, enable: bool, bus: BusId, req_id: u32, period_ms: u32) {
+        let gen_id = GeneratorId(TESTER_PRESENT_GENERATOR);
+        let row = bus.0;
+        let period = (enable && period_ms > 0).then_some(u64::from(period_ms) * 1_000_000);
+        let frame = CanFrame::new(req_id, req_id > 0x7FF, &[0x02, 0x3E, 0x80])
+            .unwrap_or_else(|_| CanFrame::new(0x7DF, false, &[0x02, 0x3E, 0x80]).expect("valid"));
+        self.gen_set_cyclic(gen_id, row, Some(bus), frame, period);
     }
 
     /// Deliver `cmd` to `node`'s ECU at the current virtual time.

@@ -678,6 +678,7 @@ mod tests {
             kind: NodeKind::Ecu,
             pos: (0.0, 0.0),
             script: None,
+            diag: None,
         }
     }
 

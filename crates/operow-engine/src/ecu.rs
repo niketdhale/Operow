@@ -128,6 +128,12 @@ pub trait Ecu: Send {
     fn on_frame(&mut self, _bus: BusId, _frame: &CanFrame, _ctx: &mut EcuCtx) {}
     /// Called when an [`EcuCommand`] is delivered to this node.
     fn on_command(&mut self, _cmd: &EcuCommand, _ctx: &mut EcuCtx) {}
+    /// Run the node script's handler `name` (`on_diag`, `on_security_key`)
+    /// with `arg` as a byte array. `None` when no script handles it;
+    /// `Some(bytes)` is the array the handler returned.
+    fn script_hook(&mut self, _name: &str, _arg: &[u8], _ctx: &mut EcuCtx) -> Option<Vec<u8>> {
+        None
+    }
     /// Take any log lines produced since the last call.
     fn drain_logs(&mut self) -> Vec<String> {
         Vec::new()
