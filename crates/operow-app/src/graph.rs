@@ -275,7 +275,7 @@ impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
         let _ = (ui, snarl, pin);
         PinInfo::circle()
             .with_fill(self.theme.bus_color(0))
-            .with_stroke(Stroke::new(1.0, Color32::BLACK))
+            .with_stroke(Stroke::new(1.0_f32, Color32::BLACK))
     }
 
     fn show_output(
@@ -287,7 +287,7 @@ impl<'a> SnarlViewer<GraphNode> for GraphViewer<'a> {
         let _ = (ui, snarl, pin);
         PinInfo::circle()
             .with_fill(self.theme.bus_color(1))
-            .with_stroke(Stroke::new(1.0, Color32::BLACK))
+            .with_stroke(Stroke::new(1.0_f32, Color32::BLACK))
     }
 
     fn has_body(&mut self, node: &GraphNode) -> bool {
@@ -391,8 +391,8 @@ pub fn format_bitrate(bps: u32) -> String {
 pub fn snarl_style(theme: AppTheme) -> SnarlStyle {
     let mut style = SnarlStyle::new();
     style.bg_pattern_stroke = Some(match theme {
-        AppTheme::Light => Stroke::new(1.0, Color32::from_gray(210)),
-        AppTheme::Dark => Stroke::new(1.0, Color32::from_gray(60)),
+        AppTheme::Light => Stroke::new(1.0_f32, Color32::from_gray(210)),
+        AppTheme::Dark => Stroke::new(1.0_f32, Color32::from_gray(60)),
     });
     style
 }
