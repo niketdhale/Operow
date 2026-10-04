@@ -1,0 +1,9 @@
+[package]
+name = "operow-isotp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operow-core = { workspace = true }
+thiserror = { workspace = true }

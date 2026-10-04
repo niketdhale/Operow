@@ -4,6 +4,7 @@
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
+use crate::diag_window::DiagView;
 use crate::generator_window::GeneratorView;
 use crate::graph_window::GraphView;
 use crate::logging::LoggingConfig;
@@ -20,10 +21,11 @@ pub enum WindowKind {
     Graph,
     Generator,
     Faults,
+    Diag,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 8] = [
+    pub const ALL: [WindowKind; 9] = [
         WindowKind::Network,
         WindowKind::Properties,
         WindowKind::Trace,
@@ -32,6 +34,7 @@ impl WindowKind {
         WindowKind::Graph,
         WindowKind::Generator,
         WindowKind::Faults,
+        WindowKind::Diag,
     ];
 
     pub fn label(self) -> &'static str {
@@ -44,6 +47,7 @@ impl WindowKind {
             WindowKind::Graph => "Graph",
             WindowKind::Generator => "Generator",
             WindowKind::Faults => "Faults",
+            WindowKind::Diag => "Diagnostics",
         }
     }
 
@@ -51,7 +55,7 @@ impl WindowKind {
     pub fn multi(self) -> bool {
         matches!(
             self,
-            WindowKind::Trace | WindowKind::Graph | WindowKind::Generator
+            WindowKind::Trace | WindowKind::Graph | WindowKind::Generator | WindowKind::Diag
         )
     }
 }
@@ -161,6 +165,16 @@ pub fn generator_demo_layout(generator: WindowId) -> Dock {
     dock
 }
 
+/// Network on top; the Diagnostics window and a Trace side by side below
+/// (`--demo-diag`).
+pub fn diag_demo_layout(diag: WindowId, trace: WindowId) -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [_, bottom] = tree.split_below(NodeIndex::root(), 0.22, vec![diag]);
+    tree.split_right(bottom, 0.42, vec![trace]);
+    dock
+}
+
 /// Network on top; Trace and Statistics side by side below (`--demo-errors`).
 pub fn errors_demo_layout() -> Dock {
     let mut dock = DockState::new(vec![w(WindowKind::Network)]);
@@ -226,7 +240,7 @@ pub fn open_or_focus(dock: &mut Dock, kind: WindowKind, force_new: bool) -> Wind
     // Prefer the leaf that already holds windows of this kind.
     let open = open_windows(dock);
     let mut sibling = open.iter().copied().find(|t| t.kind == kind);
-    if sibling.is_none() && kind == WindowKind::Faults {
+    if sibling.is_none() && matches!(kind, WindowKind::Faults | WindowKind::Diag) {
         // Next to the bottom windows, not on top of the Network.
         sibling = open.iter().copied().find(|t| {
             matches!(
@@ -267,6 +281,10 @@ struct SavedLayout {
     /// Per-window settings of the Generator windows (rows, modes, ...).
     #[serde(default)]
     generators: Vec<(WindowId, GeneratorView)>,
+    /// Per-window settings of the Diagnostics windows (target, saved
+    /// requests, ...).
+    #[serde(default)]
+    diags: Vec<(WindowId, DiagView)>,
     /// The Network window's view and per-view positions. Projects saved
     /// before it existed have none and open in the default bus-line view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,21 +297,24 @@ struct SavedLayout {
 
 #[cfg(test)]
 pub fn layout_to_json(dock: &Dock) -> Option<serde_json::Value> {
-    layout_to_json_with(dock, Vec::new(), Vec::new(), Vec::new(), None)
+    layout_to_json_with(dock, Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
 }
 
-/// Like [`layout_to_json`], also saving the settings of Trace, Graph and
-/// Generator windows and the Network window's view and positions.
+/// Like [`layout_to_json`], also saving the settings of Trace, Graph,
+/// Generator and Diagnostics windows and the Network window's view and
+/// positions.
 pub fn layout_to_json_with(
     dock: &Dock,
     mut traces: Vec<(WindowId, TraceView)>,
     mut graphs: Vec<(WindowId, GraphView)>,
     mut generators: Vec<(WindowId, GeneratorView)>,
+    mut diags: Vec<(WindowId, DiagView)>,
     network: Option<NetworkLayout>,
 ) -> Option<serde_json::Value> {
     traces.sort_by_key(|(id, _)| (id.kind, id.n));
     graphs.sort_by_key(|(id, _)| (id.kind, id.n));
     generators.sort_by_key(|(id, _)| (id.kind, id.n));
+    diags.sort_by_key(|(id, _)| (id.kind, id.n));
     // Unlaid-out rects are infinite, which JSON cannot represent. Rects are
     // recomputed on the next frame, so store zeros.
     let mut dock = dock.clone();
@@ -309,6 +330,7 @@ pub fn layout_to_json_with(
         traces,
         graphs,
         generators,
+        diags,
         network,
         logging: None,
     })
@@ -359,6 +381,13 @@ pub fn graphs_from_json(value: &serde_json::Value) -> Vec<(WindowId, GraphView)>
 pub fn generators_from_json(value: &serde_json::Value) -> Vec<(WindowId, GeneratorView)> {
     serde_json::from_value::<SavedLayout>(value.clone())
         .map(|s| s.generators)
+        .unwrap_or_default()
+}
+
+/// Saved Diagnostics window settings; empty when absent or invalid.
+pub fn diags_from_json(value: &serde_json::Value) -> Vec<(WindowId, DiagView)> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .map(|s| s.diags)
         .unwrap_or_default()
 }
 
@@ -460,8 +489,15 @@ mod tests {
         };
         view.filters.id.enabled = true;
         view.filters.id.text = "100-2FF".into();
-        let json =
-            layout_to_json_with(&dock, vec![(id, view)], Vec::new(), Vec::new(), None).unwrap();
+        let json = layout_to_json_with(
+            &dock,
+            vec![(id, view)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         let back = traces_from_json(&json);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, id);
@@ -518,6 +554,7 @@ mod tests {
                 Vec::new(),
                 vec![(id, view.clone())],
                 Vec::new(),
+                Vec::new(),
                 None,
             ),
             ..Default::default()
@@ -573,6 +610,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 vec![(id, view.clone())],
+                Vec::new(),
                 None,
             ),
             ..Default::default()
@@ -585,6 +623,56 @@ mod tests {
         let old = layout_to_json(&dock).unwrap();
         assert!(generators_from_json(&old).is_empty());
         assert!(generators_from_json(&serde_json::json!("x")).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_windows_persist_in_workspace_json() {
+        use crate::diag_window::{DiagView, SavedRequest, TargetIds};
+        let mut dock = default_layout();
+        let id = open_or_focus(&mut dock, WindowKind::Diag, true);
+        assert_eq!(id.title(), "Diagnostics");
+        assert_eq!(
+            open_or_focus(&mut dock, WindowKind::Diag, true).title(),
+            "Diagnostics 2"
+        );
+        let view = DiagView {
+            title: Some("Engine ECU".into()),
+            target: Some("Engine".into()),
+            ids: TargetIds {
+                bus: Some(operow_core::BusId(1)),
+                req_id: 0x7E0,
+                resp_id: 0x7E8,
+                functional_id: 0x7DF,
+                extended: false,
+                fd: true,
+            },
+            functional: true,
+            tester_present: true,
+            tester_present_ms: 1000,
+            saved: vec![SavedRequest {
+                name: "VIN".into(),
+                hex: "22 F1 90".into(),
+            }],
+        };
+        let topo = Topology {
+            workspace: layout_to_json_with(
+                &dock,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![(id, view.clone())],
+                None,
+            ),
+            ..Default::default()
+        };
+        let back = Topology::from_json(&topo.to_json()).unwrap();
+        let ws = back.workspace.as_ref().unwrap();
+        assert_eq!(diags_from_json(ws), vec![(id, view)]);
+        assert!(layout_from_json(ws).is_some());
+        // Layouts saved before the Diagnostics window existed still load.
+        let old = layout_to_json(&dock).unwrap();
+        assert!(diags_from_json(&old).is_empty());
+        assert!(diags_from_json(&serde_json::json!("x")).is_empty());
     }
 
     #[test]
@@ -650,7 +738,14 @@ mod tests {
             ],
         };
         let topo = Topology {
-            workspace: layout_to_json_with(&dock, vec![], vec![], vec![], Some(layout.clone())),
+            workspace: layout_to_json_with(
+                &dock,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                Some(layout.clone()),
+            ),
             ..Default::default()
         };
         let back = Topology::from_json(&topo.to_json()).unwrap();
@@ -676,6 +771,7 @@ mod tests {
         g.state.nodes[1].position = egui::pos2(5.0, 6.0);
         let json = layout_to_json_with(
             &default_layout(),
+            vec![],
             vec![],
             vec![],
             vec![],

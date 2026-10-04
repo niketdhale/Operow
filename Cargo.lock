@@ -2431,7 +2431,9 @@ dependencies = [
  "operow-core",
  "operow-dbc",
  "operow-engine",
+ "operow-isotp",
  "operow-log",
+ "operow-uds",
  "rfd",
  "serde",
  "serde_json",
@@ -2461,8 +2463,18 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "operow-core",
+ "operow-isotp",
  "operow-log",
+ "operow-uds",
  "rhai",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "operow-isotp"
+version = "0.1.0"
+dependencies = [
+ "operow-core",
  "thiserror 2.0.21",
 ]
 
@@ -2473,6 +2485,13 @@ dependencies = [
  "flate2",
  "operow-core",
  "operow-engine",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "operow-uds"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.21",
 ]
 

@@ -30,6 +30,7 @@ const MIN_NODE_SIZE: egui::Vec2 = vec2(60.0, 30.0);
 
 /// A node placed on the canvas: either a simulated ECU or a CAN bus.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // few nodes; boxing would touch every match
 pub enum GraphNode {
     Ecu(EcuConfig),
     Bus(CanBusConfig),
@@ -205,6 +206,7 @@ impl Graph {
                 kind: Default::default(),
                 pos: (pos.x, pos.y),
                 script: None,
+                diag: None,
             }),
         )
     }

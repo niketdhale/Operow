@@ -31,6 +31,7 @@ fn topo_with_two_senders() -> Topology {
                 kind: Default::default(),
                 pos: (0.0, 0.0),
                 script: None,
+                diag: None,
             },
             EcuConfig {
                 id: NodeId(2),
@@ -46,6 +47,7 @@ fn topo_with_two_senders() -> Topology {
                 kind: Default::default(),
                 pos: (0.0, 0.0),
                 script: None,
+                diag: None,
             },
         ],
         buses: vec![CanBusConfig {
@@ -112,6 +114,7 @@ fn periodic_message_produces_expected_frame_count() {
             kind: Default::default(),
             pos: (0.0, 0.0),
             script: None,
+            diag: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -173,6 +176,7 @@ fn sender_does_not_receive_its_own_frame() {
                 kind: Default::default(),
                 pos: (0.0, 0.0),
                 script: None,
+                diag: None,
             },
             EcuConfig {
                 id: NodeId(2),
@@ -181,6 +185,7 @@ fn sender_does_not_receive_its_own_frame() {
                 kind: Default::default(),
                 pos: (0.0, 0.0),
                 script: None,
+                diag: None,
             },
         ],
         buses: vec![CanBusConfig {
@@ -278,6 +283,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             kind: Default::default(),
             pos: (0.0, 0.0),
             script: None,
+            diag: None,
         }],
         buses: vec![CanBusConfig {
             id: BusId(1),
@@ -351,6 +357,7 @@ fn node(id: u32, tx: Vec<TxMessage>, kind: NodeKind) -> EcuConfig {
         kind,
         pos: (0.0, 0.0),
         script: None,
+        diag: None,
     }
 }
 
@@ -1265,6 +1272,7 @@ fn err_topo(nodes: &[(u32, u32, u32)], bitrate: u32, simulate_ack: bool) -> Topo
                 kind: Default::default(),
                 pos: (0.0, 0.0),
                 script: None,
+                diag: None,
             })
             .collect(),
         buses: vec![CanBusConfig {

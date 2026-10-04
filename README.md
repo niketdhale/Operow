@@ -83,13 +83,21 @@ cargo test --workspace
 cargo test -p operow-engine --test example_smoke
 ```
 
+CI uses [cargo-nextest](https://nexte.st) (optional locally: `cargo install cargo-nextest --locked`):
+
+```bash
+cargo nextest run --workspace
+cargo test --workspace --doc   # nextest skips doctests
+```
+
 ## Architecture
 
-The workspace consists of four crates:
+The workspace consists of the following crates:
 
 - **operow-core**: Data types and CAN / CAN FD frame definitions
 - **operow-engine**: Discrete-event simulation engine
 - **operow-dbc**: DBC parser and signal decoding
+- **operow-isotp**: Sans-IO ISO 15765-2 (ISO-TP) transport state machine, independent of the engine
 - **operow-app**: Native egui frontend. The node-graph canvas comes from [`egui-flow`](https://github.com/niketdhale/egui-flow), a separate React Flow-style widget crate pulled in as a git dependency
 
 ## Roadmap

@@ -270,6 +270,7 @@ fn existing_ecu(id: u32, name: &str) -> EcuConfig {
         kind: Default::default(),
         pos: (60.0, 60.0),
         script: None,
+        diag: None,
     }
 }
 
