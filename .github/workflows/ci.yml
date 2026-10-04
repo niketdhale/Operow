@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+    paths-ignore: &ignore
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - "examples/**/*.png"
+  pull_request:
+    paths-ignore: *ignore
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+          version: 1.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        if: runner.os == 'Linux'
+        with:
+          packages: libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+          version: 1.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: cargo nextest run --workspace --locked
+
+      # nextest does not run doctests
+      - name: Run doctests
+        run: cargo test --workspace --doc --locked
+
+  build-release:
+    name: build-release (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    needs: [lint, test]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        if: runner.os == 'Linux'
+        with:
+          packages: libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+          version: 1.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' }}
+
+      - name: Build release
+        run: cargo build --release -p operow-app --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operow-${{ matrix.os }}
+          path: target/release/operow
