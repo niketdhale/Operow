@@ -556,6 +556,10 @@ pub struct Trace {
     group_gen: u64,
     /// Grouped messages (by first seq) whose frames are shown.
     expanded_groups: HashSet<u64>,
+    /// Time (ns) to scroll to at the next draw, see [`Trace::jump_to_time`].
+    jump: Option<u64>,
+    /// The row a jump landed on; drawn selected.
+    highlight_seq: Option<u64>,
 }
 
 impl Default for Trace {
@@ -590,6 +594,8 @@ impl Default for Trace {
             index_gen: 0,
             group_gen: 0,
             expanded_groups: HashSet::new(),
+            jump: None,
+            highlight_seq: None,
         }
     }
 }
@@ -655,6 +661,40 @@ impl Trace {
         self.expanded.clear();
         self.expanded_groups.clear();
         self.expanded_fixed.clear();
+        self.highlight_seq = None;
+    }
+
+    /// Scroll to the row nearest to `time_ns` (simulation time of the
+    /// frame) and select it. Switches to the plain chronological view and
+    /// stops following the newest frames.
+    pub fn jump_to_time(&mut self, time_ns: u64) {
+        self.mode = TraceMode::Chronological;
+        self.group_isotp = false;
+        self.autoscroll = false;
+        self.jump = Some(time_ns);
+    }
+
+    /// Display row index of the chronological row nearest to `time_ns`
+    /// among `index` (ascending seqs), and its seq. `extra` lists
+    /// `(position, rows)` of open signal expansions.
+    fn jump_target(
+        index: &VecDeque<u64>,
+        store: &FrameStore,
+        time_ns: u64,
+        extra: &[(usize, usize)],
+    ) -> Option<(usize, u64)> {
+        if index.is_empty() {
+            return None;
+        }
+        let at = |i: usize| store.get(index[i]).map_or(0, |e| e.time.0);
+        let mut pos = index.partition_point(|s| store.get(*s).is_some_and(|e| e.time.0 < time_ns));
+        pos = pos.min(index.len() - 1);
+        // The previous row may be nearer than the first one at or after it.
+        if pos > 0 && time_ns.abs_diff(at(pos - 1)) < time_ns.abs_diff(at(pos)) {
+            pos -= 1;
+        }
+        let rows: usize = extra.iter().filter(|e| e.0 < pos).map(|e| e.1).sum();
+        Some((pos + rows, index[pos]))
     }
 
     /// Clear this window's view only: it shows nothing older than now. The
@@ -1020,6 +1060,14 @@ impl Trace {
         }
         let exp_pos: Vec<(usize, usize)> = exps.iter().map(|e| (e.pos, e.rows())).collect();
         let total_rows = n_frames + exp_pos.iter().map(|e| e.1).sum::<usize>();
+        let mut scroll_row = None;
+        if let Some(t) = self.jump.take()
+            && let Some((row, seq)) = Self::jump_target(&self.index, store, t, &exp_pos)
+        {
+            scroll_row = Some(row);
+            self.highlight_seq = Some(seq);
+        }
+        let highlight = self.highlight_seq;
 
         let filters = &mut self.filters;
         let mut toggled: Option<(Option<FixedKey>, u64)> = None;
@@ -1053,7 +1101,9 @@ impl Trace {
                         c => Column::exact(c.width()),
                     });
                 }
-                if self.autoscroll && !fixed_mode {
+                if let Some(row) = scroll_row {
+                    table = table.scroll_to_row(row, Some(egui::Align::Center));
+                } else if self.autoscroll && !fixed_mode {
                     table = table.scroll_to_row(total_rows, Some(egui::Align::BOTTOM));
                 }
 
@@ -1158,6 +1208,7 @@ impl Trace {
                                 let Some(ev) = store.get(seq) else { return };
                                 (seq, *ev, None, None)
                             };
+                            row.set_selected(highlight == Some(seq));
                             let r = TraceRow::from_event(&ev, names);
                             let decodable = !ev.is_error() && message_def(names, &ev).is_some();
                             let open = match key {
@@ -2049,6 +2100,40 @@ mod tests {
         t.filters.bus.selected.insert("CAN1".into());
         t.update(&store, &n, Instant::now());
         assert_eq!(fixed_items(&t.fixed, &t.compiled, &n).len(), 1);
+    }
+
+    #[test]
+    fn jump_target_picks_the_nearest_row() {
+        let mut store = FrameStore::new(10);
+        store.push_batch(&[
+            ev(1, 0x10, Direction::Tx, 0, &[1]),
+            ev(1, 0x11, Direction::Tx, 10, &[1]),
+            ev(1, 0x12, Direction::Tx, 20, &[1]),
+        ]);
+        let index: VecDeque<u64> = (0..3).collect();
+        let ms = |t: u64| t * 1_000_000;
+        assert_eq!(
+            Trace::jump_target(&index, &store, ms(11), &[]),
+            Some((1, 1))
+        );
+        assert_eq!(
+            Trace::jump_target(&index, &store, ms(16), &[]),
+            Some((2, 2))
+        );
+        assert_eq!(
+            Trace::jump_target(&index, &store, ms(99), &[]),
+            Some((2, 2))
+        );
+        assert_eq!(Trace::jump_target(&index, &store, 0, &[]), Some((0, 0)));
+        // An open expansion of 2 lines above row 1 shifts the display row.
+        assert_eq!(
+            Trace::jump_target(&index, &store, ms(20), &[(0, 2)]),
+            Some((4, 2))
+        );
+        assert_eq!(Trace::jump_target(&VecDeque::new(), &store, 5, &[]), None);
+        let mut t = Trace::default();
+        t.jump_to_time(5);
+        assert!(!t.autoscroll && t.jump == Some(5));
     }
 
     #[test]

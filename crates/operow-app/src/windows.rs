@@ -17,6 +17,8 @@ use crate::inspector::Inspector;
 use crate::network_view::NetworkView;
 use crate::runtime::{self, FaultsState, RuntimeState};
 use crate::store::FrameStore;
+use crate::test_editor::TestEditor;
+use crate::tests_window::{TestsAction, TestsState};
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceAction};
 use crate::workspace::{WindowId, WindowKind};
@@ -31,6 +33,8 @@ pub struct WindowViewer<'a> {
     pub graphs: &'a mut HashMap<WindowId, GraphWindow>,
     pub generators: &'a mut HashMap<WindowId, GeneratorWindow>,
     pub diags: &'a mut HashMap<WindowId, DiagWindow>,
+    pub tests: &'a mut TestsState,
+    pub test_editors: &'a mut HashMap<WindowId, TestEditor>,
     /// Simulation time in seconds, for request timestamps.
     pub sim_time_s: f64,
     pub store: &'a FrameStore,
@@ -49,6 +53,8 @@ pub struct WindowViewer<'a> {
     pub cmds: Vec<Command>,
     /// Requests from trace windows (graph wiring, generator, log lines).
     pub trace_actions: Vec<TraceAction>,
+    /// Requests from the Tests window and the test editors.
+    pub test_actions: Vec<TestsAction>,
     /// A window a button asked to open this frame.
     pub open_request: Option<WindowKind>,
 }
@@ -461,6 +467,10 @@ impl TabViewer for WindowViewer<'_> {
             WindowKind::Diag => self.diags.get(tab).and_then(|g| g.title.as_deref()),
             _ => None,
         };
+        if tab.kind == WindowKind::TestEditor {
+            let name = self.test_editors.get(tab).map(|e| e.title());
+            return format!("Test \u{b7} {}", name.unwrap_or_default()).into();
+        }
         match title {
             Some(t) => format!("{} \u{b7} {t}", tab.title()).into(),
             None => tab.title().into(),
@@ -543,6 +553,17 @@ impl TabViewer for WindowViewer<'_> {
                 if let Some(d) = self.diags.get_mut(&id) {
                     let cmds = d.ui(ui, id, self.names, can_send, self.sim_time_s);
                     self.cmds.extend(cmds);
+                }
+            }
+            WindowKind::Tests => {
+                let actions = self.tests.ui(ui, egui::Id::new(("tests", id)));
+                self.test_actions.extend(actions);
+            }
+            WindowKind::TestEditor => {
+                let running = self.tests.running();
+                if let Some(e) = self.test_editors.get_mut(&id) {
+                    let actions = e.ui(ui, egui::Id::new(("test_editor", id)), running);
+                    self.test_actions.extend(actions);
                 }
             }
         }

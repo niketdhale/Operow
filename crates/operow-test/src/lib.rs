@@ -46,9 +46,11 @@ mod report;
 mod runner;
 
 pub use export::{to_html, to_json, to_junit};
-pub use project::{Project, ProjectError, TestModule};
+pub use project::{Project, ProjectError, TestModule, module_name};
 pub use report::{CaseResult, Failure, ModuleResult, RunReport, Status, Step, Totals, TraceRow};
-pub use runner::{Progress, ProgressFn, RunOptions, TestRunner};
+pub use runner::{
+    EventSink, Progress, ProgressFn, RunOptions, Source, TestRunner, check_module, list_cases,
+};
 
 #[cfg(test)]
 mod tests;

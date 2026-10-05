@@ -25,6 +25,8 @@ mod settings;
 mod signal_dialog;
 mod signals;
 mod store;
+mod test_editor;
+mod tests_window;
 mod theme;
 mod trace;
 mod windows;
@@ -60,6 +62,8 @@ fn main() -> eframe::Result<()> {
                 opts.demo_diag_dtcs = true;
             }
             "--open-log" => opts.open_log = args.next().map(PathBuf::from),
+            "--demo-tests" => opts.demo_tests = true,
+            "--demo-test-editor" => opts.demo_test_editor = true,
             "--demo-logging" => opts.demo_logging = true,
             "--demo-errors" => opts.demo_errors = true,
             "--demo-faults" => opts.demo_faults = true,

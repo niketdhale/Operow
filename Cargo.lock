@@ -2542,6 +2542,7 @@ dependencies = [
  "operow-isotp",
  "operow-log",
  "operow-project",
+ "operow-test",
  "operow-uds",
  "rfd",
  "serde",

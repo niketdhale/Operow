@@ -33,7 +33,7 @@ impl TestModule {
     }
 }
 
-pub(crate) fn module_name(path: &str) -> String {
+pub fn module_name(path: &str) -> String {
     Path::new(path)
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned())
@@ -88,6 +88,16 @@ impl Project {
         if !errors.is_empty() {
             return Err(ProjectError::Dbc(errors));
         }
+        Ok(Project::from_parts(name, topology, dbcs, dir))
+    }
+
+    /// Build a project from an in-memory topology and already parsed DBCs.
+    pub fn from_parts(
+        name: impl Into<String>,
+        topology: Topology,
+        dbcs: DbcStore,
+        dir: Option<&Path>,
+    ) -> Project {
         let tests = topology
             .tests
             .iter()
@@ -96,12 +106,12 @@ impl Project {
                 file: resolve_path(dir, p),
             })
             .collect();
-        Ok(Project {
+        Project {
             name: name.into(),
             dir: dir.map(Path::to_path_buf),
             topology,
             dbcs,
             tests,
-        })
+        }
     }
 }

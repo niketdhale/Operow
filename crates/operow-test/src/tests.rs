@@ -803,3 +803,44 @@ fn examples_all_pass() {
         assert_eq!(r.totals.skipped, skipped, "{name}");
     }
 }
+
+#[test]
+fn event_sink_receives_step_events() {
+    let seen = Arc::new(Mutex::new(Vec::<operow_core::BusEvent>::new()));
+    let s = seen.clone();
+    let opts = RunOptions {
+        event_sink: Some(Arc::new(move |evs| {
+            s.lock().unwrap().extend_from_slice(evs)
+        })),
+        ..RunOptions::default()
+    };
+    let r = run_with(
+        gateway(),
+        "fn test_a() { wait_for_message_on(\"Body\", 0x100, 50); }",
+        opts,
+    );
+    assert_eq!(case(&r, "test_a").status, Status::Pass);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|e| e.frame.id == 0x100), "{}", seen.len());
+    // Times are those of the case's own simulation, ascending per step.
+    assert!(seen.iter().all(|e| e.time.0 <= 51_000_000));
+}
+
+#[test]
+fn check_module_reports_compile_errors_only() {
+    assert_eq!(
+        check_module("fn test_a() { wait(5); unknown_api(1); }"),
+        Ok(())
+    );
+    let e = check_module("fn test_a( {").unwrap_err();
+    assert!(!e.is_empty());
+}
+
+#[test]
+fn project_from_parts_keeps_given_dbcs() {
+    let p = example("dbc_demo.operow.json");
+    let q = Project::from_parts("mem", p.topology.clone(), p.dbcs.clone(), p.dir.as_deref());
+    assert_eq!(q.tests.len(), 1);
+    assert_eq!(q.dbcs.by_bus.len(), 1);
+    assert_eq!(q.name, "mem");
+}

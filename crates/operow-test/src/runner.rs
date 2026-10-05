@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use operow_core::BusEvent;
 use rhai::{AST, CallFnOptions, Dynamic, Engine, EvalAltResult, Scope};
 
 use crate::api::{self, Abort, Ctx, Shared, lock};
@@ -35,6 +36,10 @@ pub enum Progress {
 
 pub type ProgressFn = Arc<dyn Fn(&Progress) + Send + Sync>;
 
+/// Receives the bus events of every simulation step of a running case, in
+/// virtual time of that case's simulation (starting at 0).
+pub type EventSink = Arc<dyn Fn(&[BusEvent]) + Send + Sync>;
+
 /// Settings of a run.
 #[derive(Clone)]
 pub struct RunOptions {
@@ -57,6 +62,9 @@ pub struct RunOptions {
     /// starts.
     pub stop_flag: Arc<AtomicBool>,
     pub progress: Option<ProgressFn>,
+    /// Called with the events of each simulation step (after `run_until`),
+    /// for example to stream them into a trace.
+    pub event_sink: Option<EventSink>,
 }
 
 impl Default for RunOptions {
@@ -70,6 +78,7 @@ impl Default for RunOptions {
             trace_extract_ms: 200,
             stop_flag: Arc::new(AtomicBool::new(false)),
             progress: None,
+            event_sink: None,
         }
     }
 }
@@ -81,7 +90,7 @@ pub struct TestRunner {
 }
 
 /// A module source, or why it could not be read.
-type Source = (String, Result<String, String>);
+pub type Source = (String, Result<String, String>);
 
 impl TestRunner {
     pub fn new(project: Project, options: RunOptions) -> Self {
@@ -116,6 +125,13 @@ impl TestRunner {
             .iter()
             .map(|(p, s)| (p.to_string(), Ok(s.to_string())))
             .collect();
+        self.run_all(sources, filter)
+    }
+
+    /// Run test modules given as `(path, source or read error)`, ignoring
+    /// the project's own list. An unreadable module is reported as an
+    /// errored module.
+    pub fn run_loaded(&self, sources: Vec<Source>, filter: Option<&str>) -> RunReport {
         self.run_all(sources, filter)
     }
 
@@ -162,6 +178,7 @@ impl TestRunner {
             o.step_ns,
             o.per_test_timeout_ms,
             o.stop_flag.clone(),
+            o.event_sink.clone(),
         )
         .map_err(|e| format!("cannot build the simulation: {e}"))?;
         let shared: Shared = Arc::new(Mutex::new(ctx));
@@ -410,6 +427,22 @@ fn module_status(cases: &[CaseResult]) -> Status {
     } else {
         Status::Pass
     }
+}
+
+/// Check that a test module compiles. Rhai resolves function names at run
+/// time, so the test API needs no registering for the check: unknown
+/// functions such as `wait_for_message` are not flagged.
+pub fn check_module(src: &str) -> Result<(), String> {
+    Engine::new()
+        .compile(src)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The names of the `test_*` functions of a module, in source order.
+pub fn list_cases(src: &str) -> Result<Vec<String>, String> {
+    let ast = Engine::new().compile(src).map_err(|e| e.to_string())?;
+    Ok(Fns::discover(&ast, src).tests)
 }
 
 /// A simulation plus the Rhai engine bound to it.

@@ -265,6 +265,7 @@ pub(crate) struct Ctx {
     payloads: HashMap<(BusId, u32, bool), Vec<u8>>,
     pub steps: Vec<Step>,
     pub abort: Option<(Abort, u64)>,
+    sink: Option<crate::runner::EventSink>,
 }
 
 pub(crate) type Shared = Arc<Mutex<Ctx>>;
@@ -280,6 +281,7 @@ impl Ctx {
         step_ns: u64,
         timeout_ms: u64,
         stop: Arc<AtomicBool>,
+        sink: Option<crate::runner::EventSink>,
     ) -> Result<Ctx, String> {
         let mut sim = Simulation::new(&project.topology).map_err(|e| e.to_string())?;
         sim.set_seed(seed);
@@ -310,6 +312,7 @@ impl Ctx {
             payloads: HashMap::new(),
             steps: Vec::new(),
             abort: None,
+            sink,
         })
     }
 
@@ -510,6 +513,11 @@ impl Ctx {
             self.sim.run_until(Timestamp(next), &mut buf);
             self.now_ns = next;
             let mut found = None;
+            if let Some(sink) = &self.sink
+                && !buf.is_empty()
+            {
+                sink(&buf);
+            }
             for ev in buf.drain(..) {
                 self.ingest(ev);
                 if found.is_none() {

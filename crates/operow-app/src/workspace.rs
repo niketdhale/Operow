@@ -22,10 +22,14 @@ pub enum WindowKind {
     Generator,
     Faults,
     Diag,
+    Tests,
+    /// One open test module; opened from the Tests window or project tree.
+    TestEditor,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 9] = [
+    /// The kinds the Window menu offers (a test editor needs a file).
+    pub const ALL: [WindowKind; 10] = [
         WindowKind::Network,
         WindowKind::Properties,
         WindowKind::Trace,
@@ -35,6 +39,7 @@ impl WindowKind {
         WindowKind::Generator,
         WindowKind::Faults,
         WindowKind::Diag,
+        WindowKind::Tests,
     ];
 
     pub fn label(self) -> &'static str {
@@ -48,6 +53,8 @@ impl WindowKind {
             WindowKind::Generator => "Generator",
             WindowKind::Faults => "Faults",
             WindowKind::Diag => "Diagnostics",
+            WindowKind::Tests => "Tests",
+            WindowKind::TestEditor => "Test editor",
         }
     }
 
@@ -55,7 +62,11 @@ impl WindowKind {
     pub fn multi(self) -> bool {
         matches!(
             self,
-            WindowKind::Trace | WindowKind::Graph | WindowKind::Generator | WindowKind::Diag
+            WindowKind::Trace
+                | WindowKind::Graph
+                | WindowKind::Generator
+                | WindowKind::Diag
+                | WindowKind::TestEditor
         )
     }
 }
@@ -240,7 +251,12 @@ pub fn open_or_focus(dock: &mut Dock, kind: WindowKind, force_new: bool) -> Wind
     // Prefer the leaf that already holds windows of this kind.
     let open = open_windows(dock);
     let mut sibling = open.iter().copied().find(|t| t.kind == kind);
-    if sibling.is_none() && matches!(kind, WindowKind::Faults | WindowKind::Diag) {
+    if sibling.is_none()
+        && matches!(
+            kind,
+            WindowKind::Faults | WindowKind::Diag | WindowKind::Tests | WindowKind::TestEditor
+        )
+    {
         // Next to the bottom windows, not on top of the Network.
         sibling = open.iter().copied().find(|t| {
             matches!(
@@ -293,6 +309,9 @@ struct SavedLayout {
     /// none and get the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     logging: Option<LoggingConfig>,
+    /// Test modules open in Test editor windows, as listed in the project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    editors: Vec<(WindowId, String)>,
 }
 
 #[cfg(test)]
@@ -333,6 +352,7 @@ pub fn layout_to_json_with(
         diags,
         network,
         logging: None,
+        editors: Vec::new(),
     })
     .ok()
 }
@@ -347,6 +367,29 @@ pub fn with_logging(
         .as_object_mut()?
         .insert("logging".into(), serde_json::to_value(logging).ok()?);
     Some(layout)
+}
+
+/// Add the open test editors to a layout produced by
+/// [`layout_to_json_with`].
+pub fn with_editors(
+    layout: Option<serde_json::Value>,
+    mut editors: Vec<(WindowId, String)>,
+) -> Option<serde_json::Value> {
+    let mut layout = layout?;
+    editors.sort_by_key(|(id, _)| (id.kind, id.n));
+    if !editors.is_empty() {
+        layout
+            .as_object_mut()?
+            .insert("editors".into(), serde_json::to_value(editors).ok()?);
+    }
+    Some(layout)
+}
+
+/// Saved test editors (window and module path); empty when absent.
+pub fn editors_from_json(value: &serde_json::Value) -> Vec<(WindowId, String)> {
+    serde_json::from_value::<SavedLayout>(value.clone())
+        .map(|s| s.editors)
+        .unwrap_or_default()
 }
 
 /// Saved logging settings; `None` when absent or invalid.
@@ -398,6 +441,26 @@ pub fn layout_from_json(value: &serde_json::Value) -> Option<Dock> {
         return None;
     }
     Some(saved.dock)
+}
+
+/// Network on top; the Tests window below with a Trace to its right
+/// (`--demo-tests`).
+pub fn tests_demo_layout() -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [_, bottom] = tree.split_below(NodeIndex::root(), 0.2, vec![w(WindowKind::Tests)]);
+    tree.split_right(bottom, 0.72, vec![w(WindowKind::Trace)]);
+    dock
+}
+
+/// Network on top; a test editor and the Tests window below
+/// (`--demo-test-editor`).
+pub fn test_editor_demo_layout(editor: WindowId) -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [_, bottom] = tree.split_below(NodeIndex::root(), 0.2, vec![editor]);
+    tree.split_right(bottom, 0.36, vec![w(WindowKind::Tests)]);
+    dock
 }
 
 #[cfg(test)]
