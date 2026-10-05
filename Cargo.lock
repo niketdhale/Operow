@@ -2433,6 +2433,7 @@ dependencies = [
  "operow-engine",
  "operow-isotp",
  "operow-log",
+ "operow-project",
  "operow-uds",
  "rfd",
  "serde",
@@ -2485,6 +2486,28 @@ dependencies = [
  "flate2",
  "operow-core",
  "operow-engine",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "operow-project"
+version = "0.1.0"
+dependencies = [
+ "operow-core",
+ "operow-dbc",
+]
+
+[[package]]
+name = "operow-test"
+version = "0.1.0"
+dependencies = [
+ "operow-core",
+ "operow-dbc",
+ "operow-engine",
+ "operow-project",
+ "rhai",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

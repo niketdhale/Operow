@@ -1,0 +1,15 @@
+[package]
+name = "operow-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operow-core = { workspace = true }
+operow-engine = { path = "../operow-engine" }
+operow-dbc = { path = "../operow-dbc" }
+operow-project = { path = "../operow-project" }
+rhai = { version = "1.26.1", features = ["sync"] }
+serde = { workspace = true }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = { workspace = true }

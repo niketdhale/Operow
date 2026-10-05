@@ -106,6 +106,8 @@ pub struct Graph {
     pub databases: Vec<DbcRef>,
     /// User-defined signals; round-tripped through the topology.
     pub user_signals: Vec<UserSignalDef>,
+    /// Test modules of the project; round-tripped through the topology.
+    pub tests: Vec<String>,
     /// Which layout the canvas currently shows.
     view: NetworkView,
     /// Saved positions of the free-form layout. While that view is active
@@ -129,6 +131,7 @@ impl Graph {
             next_bus_id: 1,
             databases: Vec::new(),
             user_signals: Vec::new(),
+            tests: Vec::new(),
             view: NetworkView::default(),
             free: HashMap::new(),
             line: HashMap::new(),
@@ -395,6 +398,7 @@ impl Graph {
             links,
             databases: self.databases.clone(),
             user_signals: self.user_signals.clone(),
+            tests: self.tests.clone(),
             workspace: None,
         }
     }
@@ -413,6 +417,7 @@ impl Graph {
         let mut g = Graph::new();
         g.databases = topo.databases.clone();
         g.user_signals = topo.user_signals.clone();
+        g.tests = topo.tests.clone();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 

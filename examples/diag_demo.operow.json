@@ -115,5 +115,8 @@
       "node": 2,
       "bus": 1
     }
+  ],
+  "tests": [
+    "tests/diag_tests.rhai"
   ]
 }

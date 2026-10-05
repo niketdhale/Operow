@@ -59,5 +59,9 @@
     { "node": 2, "bus": 2 },
     { "node": 3, "bus": 1 },
     { "node": 3, "bus": 2 }
+  ],
+  "tests": [
+    "tests/gateway_tests.rhai",
+    "tests/fault_tests.rhai"
   ]
 }

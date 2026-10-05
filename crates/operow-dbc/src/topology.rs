@@ -244,6 +244,7 @@ impl Database {
             links,
             databases: Vec::new(),
             user_signals: Vec::new(),
+            tests: Vec::new(),
             workspace: None,
         }
     }

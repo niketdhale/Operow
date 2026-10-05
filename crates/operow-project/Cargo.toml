@@ -1,0 +1,9 @@
+[package]
+name = "operow-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operow-core = { workspace = true }
+operow-dbc = { path = "../operow-dbc" }

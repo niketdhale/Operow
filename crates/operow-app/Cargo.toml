@@ -22,6 +22,7 @@ operow-isotp = { path = "../operow-isotp" }
 operow-log = { path = "../operow-log" }
 operow-engine = { path = "../operow-engine" }
 operow-dbc = { path = "../operow-dbc" }
+operow-project = { path = "../operow-project" }
 egui_dock = { version = "0.18", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 egui_plot = "0.34"
