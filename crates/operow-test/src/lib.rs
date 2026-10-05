@@ -40,10 +40,12 @@
 //!   `log(msg)`
 
 mod api;
+mod export;
 mod project;
 mod report;
 mod runner;
 
+pub use export::{to_html, to_json, to_junit};
 pub use project::{Project, ProjectError, TestModule};
 pub use report::{CaseResult, Failure, ModuleResult, RunReport, Status, Step, Totals, TraceRow};
 pub use runner::{Progress, ProgressFn, RunOptions, TestRunner};

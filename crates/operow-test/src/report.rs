@@ -113,6 +113,26 @@ impl RunReport {
         r
     }
 
+    /// Recompute `totals` after `modules` was edited.
+    pub fn recompute_totals(&mut self) {
+        self.totals = RunReport::compute_totals(&self.modules);
+    }
+
+    /// Join reports of separate runs of the same project (for example one
+    /// per module, run in parallel) into one, keeping the order of `parts`.
+    /// `duration_ms` is the wall-clock time of the whole run.
+    pub fn merge(parts: Vec<RunReport>, duration_ms: u64) -> Option<RunReport> {
+        let mut parts = parts.into_iter();
+        let mut merged = parts.next()?;
+        for p in parts {
+            merged.stopped |= p.stopped;
+            merged.modules.extend(p.modules);
+        }
+        merged.duration_ms = duration_ms;
+        merged.recompute_totals();
+        Some(merged)
+    }
+
     pub(crate) fn compute_totals(modules: &[ModuleResult]) -> Totals {
         let mut t = Totals {
             modules: modules.len() as u32,

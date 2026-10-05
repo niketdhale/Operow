@@ -50,7 +50,7 @@ A CANoe-inspired ECU network simulator for automotive CAN / CAN FD design and te
 
 ## Download
 
-Windows x64 builds come from the "Release (Windows)" workflow. Pushes to `develop` publish a zip as an Actions artifact (`operow-windows-x64`, kept 30 days; open the workflow run under the Actions tab). Tags matching `v*` also create a GitHub Release with the zip attached, found under Releases. The zip contains `operow.exe`, `examples/`, `README.md` and `LICENSE`.
+Windows x64 builds come from the "Release (Windows)" workflow. Pushes to `develop` publish a zip as an Actions artifact (`operow-windows-x64`, kept 30 days; open the workflow run under the Actions tab). Tags matching `v*` also create a GitHub Release with the zip attached, found under Releases. The zip contains `operow.exe`, `operow-cli.exe`, `examples/`, `README.md` and `LICENSE`.
 
 ## Build & Run
 
@@ -76,7 +76,39 @@ Open them with File > Open.
 - `examples/dbc_demo.operow.json`: DBC-decoded traffic using `examples/sample.dbc`
 - `examples/script.operow.json`: Requester and Responder ECUs driven by Rhai scripts
 
-## Testing
+## Testing your network
+
+Projects list Rhai test modules (`"tests": ["tests/gateway_tests.rhai"]`). Every `test_*` function runs against a fresh simulation in virtual time, so tests are fast and repeatable. Optional `module_setup`, `module_teardown`, `setup` and `teardown` functions wrap the cases.
+
+```rhai
+fn test_forwards_engine_data() {
+    // Engine sends 0x100 on Powertrain; the gateway forwards it to Body.
+    let f = wait_for_message_on("Body", 0x100, 50);
+    expect_eq(f.dlc, 8);
+}
+
+fn test_vin() {
+    let r = uds("Engine", [0x22, 0xF1, 0x90]);
+    expect_eq(r[0], 0x62);
+}
+```
+
+The full script API is documented in `crates/operow-test/src/lib.rs`; see `examples/tests/` for more.
+
+The headless `operow-cli` runs them without the GUI:
+
+```bash
+cargo run -p operow-cli -- test examples/gateway.operow.json --report out/ --junit out/junit.xml
+operow-cli test project.operow.json --filter 'test_cycle*' --jobs 4 --fail-fast
+operow-cli run examples/gateway.operow.json --duration 10s --log trace.blf
+operow-cli replay trace.blf --export csv --out trace.csv --dbc examples/sample.dbc
+operow-cli convert trace.blf trace.asc
+operow-cli diag examples/diag_demo.operow.json --node Engine --req "22 F1 90"
+```
+
+`test` exit codes: `0` all passed (skipped cases are fine), `1` a test failed, `2` an error: unreadable project, script compile or runtime error, bad usage. Reports: `--report DIR` writes a self-contained `report.html` (collapsible modules, steps, failure trace extracts, light and dark theme), `--junit FILE` JUnit XML for CI systems, `--json FILE` the full result model. `--seed` makes runs with fault injection reproducible.
+
+## Testing Operow itself
 
 ```bash
 cargo test --workspace
@@ -98,6 +130,10 @@ The workspace consists of the following crates:
 - **operow-engine**: Discrete-event simulation engine
 - **operow-dbc**: DBC parser and signal decoding
 - **operow-isotp**: Sans-IO ISO 15765-2 (ISO-TP) transport state machine, independent of the engine
+- **operow-log**: ASC and BLF log readers and writers
+- **operow-uds**: UDS (ISO 14229) message encoding and decoding
+- **operow-test**: Rhai test runner, result model and HTML / JUnit / JSON reports
+- **operow-cli**: Headless command line: `test`, `run`, `replay`, `convert`, `diag`
 - **operow-app**: Native egui frontend. The node-graph canvas comes from [`egui-flow`](https://github.com/niketdhale/egui-flow), a separate React Flow-style widget crate pulled in as a git dependency
 
 ## Roadmap

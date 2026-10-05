@@ -34,7 +34,7 @@ jobs:
           shared-key: release-windows
           save-if: ${{ github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/') }}
       - name: Build
-        run: cargo build --release -p operow-app --locked
+        run: cargo build --release -p operow-app -p operow-cli --locked
       - name: Package
         shell: pwsh
         run: |
@@ -42,7 +42,7 @@ jobs:
           else { $ver = "develop-" + $env:GITHUB_SHA.Substring(0, 7) }
           $dir = "dist/operow-windows-x64"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item target/release/operow.exe $dir
+          Copy-Item target/release/operow.exe, target/release/operow-cli.exe $dir
           Copy-Item -Recurse examples "$dir/examples"
           Copy-Item README.md, LICENSE $dir
           $zip = "dist/operow-$ver-windows-x64.zip"
