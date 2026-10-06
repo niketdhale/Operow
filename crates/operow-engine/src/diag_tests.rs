@@ -73,6 +73,7 @@ fn topo(diag: DiagConfig, script: Option<&str>) -> Topology {
             fd_enabled: true,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![Link {
             node: NodeId(1),

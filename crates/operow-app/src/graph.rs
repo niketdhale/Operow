@@ -292,6 +292,7 @@ impl Graph {
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
+                hardware: None,
             }),
         );
         self.editor.commit(&self.state);
@@ -1066,8 +1067,8 @@ impl GraphViewer {
     }
 }
 
-/// Text inside a bus bar: `CAN1 · 500k · 12.3%`, with ` · 20 err` appended
-/// when `errors > 0`.
+/// Text inside a bus bar: `CAN1 · 500k · 12.3%`, with ` · HW` after the name
+/// for a bus bound to hardware and ` · 20 err` appended when `errors > 0`.
 pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String {
     let rate = if b.fd_enabled {
         format!(
@@ -1084,7 +1085,12 @@ pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String
     } else {
         String::new()
     };
-    format!("{} \u{b7} {rate} \u{b7} {load}{err}", b.name)
+    let hw = if b.hardware.is_some() {
+        " \u{b7} HW"
+    } else {
+        ""
+    };
+    format!("{}{hw} \u{b7} {rate} \u{b7} {load}{err}", b.name)
 }
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
@@ -1453,6 +1459,7 @@ mod tests {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         };
         assert_eq!(
             bus_bar_label(&b, Some(12.34), 0),
@@ -1460,11 +1467,19 @@ mod tests {
         );
         let fd = CanBusConfig {
             fd_enabled: true,
-            ..b
+            ..b.clone()
         };
         assert_eq!(
             bus_bar_label(&fd, None, 0),
             "CAN1 \u{b7} FD 500k/2M \u{b7} 0%"
+        );
+        let hw = CanBusConfig {
+            hardware: Some(operow_core::HwBinding::new("socketcan:can0")),
+            ..b.clone()
+        };
+        assert_eq!(
+            bus_bar_label(&hw, None, 0),
+            "CAN1 \u{b7} HW \u{b7} 500k \u{b7} 0%"
         );
         assert_eq!(
             bus_bar_label(&fd, Some(1.0), 20),

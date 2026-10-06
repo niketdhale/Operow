@@ -122,6 +122,22 @@ cargo nextest run --workspace
 cargo test --workspace --doc   # nextest skips doctests
 ```
 
+## Hardware
+
+A bus can be bound to a real CAN adapter (`"hardware": {"interface": "socketcan:can0", "listen_only": true, "receive_own": false}` on the bus). Frames from the adapter appear as received frames on that bus (sender `HW <bus>`), reach the simulated nodes and are forwarded by gateways to other buses, including other hardware buses. Frames simulated nodes send onto the bus go to the adapter.
+
+- **Real-time only.** With any hardware bus the engine runs at speed 1.0 (other speeds are refused) and virtual time follows the wall clock. Simulated buses keep their simulated timing, paced to real time. `operow-cli run` does the same.
+- **Listen-only by default.** Nothing is transmitted unless `listen_only` is `false`; dropped frames are counted per bus. Opening failures are reported and the measurement does not start.
+- **SocketCAN (Linux).** `socketcan:<interface>`; classic and FD. Bitrate and the controller's listen-only mode are configured outside Operow:
+  ```bash
+  sudo ip link set can0 type can bitrate 500000 dbitrate 2000000 fd on listen-only on
+  sudo ip link set up can0
+  ```
+  For testing without hardware: `sudo modprobe vcan; sudo ip link add dev vcan0 type vcan; sudo ip link set up vcan0`, then `cargo test -p operow-hw -- --ignored`.
+- **`virtual:<name>`**: in-process loopback, all platforms (tests, demos).
+- **`udp:<name>`**: connects Operow processes on one machine over loopback multicast (no admin rights; works on Windows). The datagram format is documented in `crates/operow-hw/src/udp.rs`.
+- PCAN and Vector XL drivers are planned.
+
 ## Architecture
 
 The workspace consists of the following crates:
@@ -130,6 +146,7 @@ The workspace consists of the following crates:
 - **operow-engine**: Discrete-event simulation engine
 - **operow-dbc**: DBC parser and signal decoding
 - **operow-isotp**: Sans-IO ISO 15765-2 (ISO-TP) transport state machine, independent of the engine
+- **operow-hw**: CAN hardware abstraction: SocketCAN, virtual and UDP drivers
 - **operow-log**: ASC and BLF log readers and writers
 - **operow-uds**: UDS (ISO 14229) message encoding and decoding
 - **operow-test**: Rhai test runner, result model and HTML / JUnit / JSON reports

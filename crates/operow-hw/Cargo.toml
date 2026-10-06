@@ -1,0 +1,21 @@
+[package]
+name = "operow-hw"
+description = "CAN hardware abstraction for Operow: driver registry, in-process virtual driver and SocketCAN"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["socketcan"]
+# Linux SocketCAN driver (raw libc sockets, no extra crate). Ignored on
+# other operating systems.
+socketcan = []
+
+[dependencies]
+operow-core = { workspace = true }
+crossbeam-channel = { workspace = true }
+thiserror.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

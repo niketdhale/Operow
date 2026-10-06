@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 operow-core = { workspace = true }
 operow-log = { path = "../operow-log" }
+operow-hw = { path = "../operow-hw" }
 crossbeam-channel = { workspace = true }
 rhai = { version = "1.26.1", features = ["sync"] }
 thiserror.workspace = true

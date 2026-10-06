@@ -30,6 +30,7 @@ fn topology_json_roundtrip() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -242,6 +243,7 @@ fn validate_rejects_bad_bus_references() {
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
+                hardware: None,
             })
             .collect(),
         links: vec![Link {
@@ -401,6 +403,7 @@ fn replay_topology(map: Vec<(u8, BusId)>) -> Topology {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -524,6 +527,7 @@ fn diag_bus_must_be_linked() {
         fd_enabled: false,
         data_bitrate: 2_000_000,
         simulate_ack: false,
+        hardware: None,
     });
     topo.nodes.push(EcuConfig {
         id: NodeId(1),
@@ -549,4 +553,18 @@ fn diag_bus_must_be_linked() {
         bus: BusId(1),
     });
     assert_eq!(topo.validate(), Ok(()));
+}
+
+#[test]
+fn bus_hardware_binding_defaults_and_roundtrips() {
+    let b: CanBusConfig = serde_json::from_str(r#"{"id":1,"name":"A","bitrate":500000}"#).unwrap();
+    assert_eq!(b.hardware, None);
+    let b: CanBusConfig = serde_json::from_str(
+        r#"{"id":1,"name":"A","bitrate":500000,"hardware":{"interface":"socketcan:can0"}}"#,
+    )
+    .unwrap();
+    let hw = b.hardware.clone().unwrap();
+    assert!(hw.listen_only && !hw.receive_own);
+    let back: CanBusConfig = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+    assert_eq!(back, b);
 }

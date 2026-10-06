@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use operow_core::{BusEvent, BusId, Timestamp};
-use operow_engine::Simulation;
+use operow_engine::{HwBridge, HwNotice, Simulation};
 use operow_log::{LogRecord, RecordKind};
 use operow_test::Project;
 
@@ -54,14 +54,31 @@ pub fn run(a: &RunArgs) -> Result<ExitCode, String> {
         None => None,
     };
 
+    // Buses bound to hardware force real time.
+    let mut bridge = HwBridge::open(topo).map_err(|e| e.to_string())?;
+    if bridge.is_some() {
+        println!("Hardware buses present: running in real time (speed 1.0)");
+    }
     let wall = Instant::now();
     let mut events: Vec<BusEvent> = Vec::new();
     let mut written = 0u64;
     let mut now = 0u64;
     while now < total_ns {
-        now = (now + CHUNK_NS).min(total_ns);
         events.clear();
-        sim.run_until(Timestamp(now), &mut events);
+        if let Some(b) = bridge.as_mut() {
+            std::thread::sleep(Duration::from_millis(1));
+            let (t, notices) = b.step(&mut sim, &mut events);
+            now = t.min(total_ns);
+            for n in notices {
+                match n {
+                    HwNotice::Log(l) => println!("[{:9.3} s] {l}", now as f64 / 1e9),
+                    HwNotice::Error(e) => return Err(e),
+                }
+            }
+        } else {
+            now = (now + CHUNK_NS).min(total_ns);
+            sim.run_until(Timestamp(now), &mut events);
+        }
         if let Some(w) = &mut writer {
             for ev in &events {
                 let Some(&channel) = channels.get(&ev.bus) else {
@@ -84,13 +101,14 @@ pub fn run(a: &RunArgs) -> Result<ExitCode, String> {
         for line in sim.drain_logs() {
             println!("[{:9.3} s] {line}", now as f64 / 1e9);
         }
-        if a.realtime {
+        if a.realtime && bridge.is_none() {
             let due = Duration::from_nanos(now);
             if let Some(wait) = due.checked_sub(wall.elapsed()) {
                 std::thread::sleep(wait);
             }
         }
     }
+    drop(bridge);
     if let Some(w) = writer {
         w.finish()
             .map_err(|e| format!("cannot write the log: {e}"))?;

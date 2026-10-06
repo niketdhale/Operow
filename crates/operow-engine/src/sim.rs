@@ -22,6 +22,18 @@ pub const MAX_HOPS: u8 = 8;
 /// nodes must stay below it.
 pub const GENERATOR_NODE_BASE: u32 = 0xF000_0000;
 
+/// First [`NodeId`] value of the virtual senders standing for real hardware
+/// (`HW_NODE_BASE + bus id`): frames received from a hardware bus are
+/// attributed to [`hw_node`]. Below the tester range, above any topology
+/// node.
+pub const HW_NODE_BASE: u32 = 0xC000_0000;
+
+/// The virtual "HW <bus>" node that sends everything arriving from the real
+/// bus bound to `bus`.
+pub fn hw_node(bus: BusId) -> NodeId {
+    NodeId(HW_NODE_BASE.saturating_add(bus.0 & 0x0FFF_FFFF))
+}
+
 /// Virtual sender of periodic TesterPresent frames, at the top of the
 /// tester range so it never collides with one-shot testers.
 pub const TESTER_PRESENT_NODE: NodeId = NodeId(TESTER_NODE_BASE + 0x0FFF_0000);
@@ -315,6 +327,8 @@ pub struct BusStats {
     pub dropped_offline: u64,
     /// Frames dropped by a [`MsgControl`] (paused or `drop_pct`).
     pub dropped_msg_control: u64,
+    /// Frames simulated nodes tried to send onto a listen-only hardware bus.
+    pub dropped_listen_only: u64,
 }
 
 impl BusStats {
@@ -380,6 +394,26 @@ enum EventKind {
         meta: FrameMeta,
         frame: CanFrame,
     },
+    /// A frame sent onto a hardware bus has been on the wire long enough for
+    /// the simulated nodes of that bus to see it.
+    HwDeliver {
+        bus: BusId,
+        meta: FrameMeta,
+        frame: CanFrame,
+    },
+    /// A frame (or, with `error`, an error frame) arrived from the real bus.
+    HwRx {
+        bus: BusId,
+        frame: CanFrame,
+        error: Option<CanErrorKind>,
+    },
+}
+
+/// Runtime state of a bus bound to hardware.
+struct HwBusInfo {
+    interface: String,
+    listen_only: bool,
+    warned_listen_only: bool,
 }
 
 struct Scheduled {
@@ -452,6 +486,12 @@ pub struct Simulation {
     msg_controls: HashMap<(NodeId, u32, bool), MsgControl>,
     next_tester: u32,
     diag_results: crate::tester::SharedResults,
+    hw_buses: HashMap<BusId, HwBusInfo>,
+    /// Frames to put on real buses, taken by [`Simulation::take_hw_tx`].
+    hw_tx: Vec<(BusId, CanFrame)>,
+    /// Events of frames sent onto hardware buses, flushed by `run_until`.
+    hw_events: Vec<BusEvent>,
+    sim_logs: Vec<String>,
 }
 
 impl Simulation {
@@ -473,7 +513,18 @@ impl Simulation {
         let mut bus_pending = HashMap::new();
         let mut stats = HashMap::new();
         let all_buses: Vec<BusId> = topology.buses.iter().map(|b| b.id).collect();
+        let mut hw_buses = HashMap::new();
         for bus in &topology.buses {
+            if let Some(hw) = &bus.hardware {
+                hw_buses.insert(
+                    bus.id,
+                    HwBusInfo {
+                        interface: hw.interface.clone(),
+                        listen_only: hw.listen_only,
+                        warned_listen_only: false,
+                    },
+                );
+            }
             bus_configs.insert(bus.id, bus.clone());
             bus_busy.insert(bus.id, false);
             bus_pending.insert(bus.id, Vec::new());
@@ -538,6 +589,10 @@ impl Simulation {
             msg_controls: HashMap::new(),
             next_tester: 0,
             diag_results: Default::default(),
+            hw_buses,
+            hw_tx: Vec::new(),
+            hw_events: Vec::new(),
+            sim_logs: Vec::new(),
         })
     }
 
@@ -550,17 +605,37 @@ impl Simulation {
     /// Take the log lines (e.g. script output) produced by all ECUs since
     /// the last call, ordered by node id.
     pub fn drain_logs(&mut self) -> Vec<String> {
+        let mut logs = std::mem::take(&mut self.sim_logs);
         let mut nodes: Vec<NodeId> = self.ecus.keys().copied().collect();
         nodes.sort();
-        nodes
-            .into_iter()
-            .flat_map(|n| {
-                self.ecus
-                    .get_mut(&n)
-                    .map(|e| e.drain_logs())
-                    .unwrap_or_default()
-            })
-            .collect()
+        logs.extend(nodes.into_iter().flat_map(|n| {
+            self.ecus
+                .get_mut(&n)
+                .map(|e| e.drain_logs())
+                .unwrap_or_default()
+        }));
+        logs
+    }
+
+    /// Whether any bus is bound to hardware (the simulation then has to be
+    /// driven in real time, see [`crate::HwBridge`]).
+    pub fn has_hardware(&self) -> bool {
+        !self.hw_buses.is_empty()
+    }
+
+    /// Take the frames queued for transmission onto real buses since the last
+    /// call, oldest first. Listen-only buses never queue anything.
+    pub fn take_hw_tx(&mut self) -> Vec<(BusId, CanFrame)> {
+        std::mem::take(&mut self.hw_tx)
+    }
+
+    /// Feed a frame (or, with `error`, an error frame) received from the real
+    /// bus bound to `bus`. `at_ns` is when it arrived; it is clamped so time
+    /// never runs backwards. Ignored for buses without hardware.
+    pub fn hw_rx(&mut self, bus: BusId, frame: CanFrame, at_ns: u64, error: Option<CanErrorKind>) {
+        if self.hw_buses.contains_key(&bus) {
+            self.schedule(at_ns.max(self.now), EventKind::HwRx { bus, frame, error });
+        }
     }
 
     /// Current virtual simulation time.
@@ -1067,14 +1142,78 @@ impl Simulation {
     }
 
     fn push_pending(&mut self, bus: BusId, frame: CanFrame, meta: FrameMeta) {
+        if self.hw_buses.contains_key(&bus) {
+            self.hw_transmit(bus, frame, meta);
+            return;
+        }
         self.bus_pending.entry(bus).or_default().push((frame, meta));
         self.schedule(self.now, EventKind::Arbitrate { bus });
+    }
+
+    /// A simulated node sent `frame` onto a hardware bus: there is no
+    /// simulated arbitration or timing, the frame goes straight to the
+    /// adapter (unless the bus is listen-only) and is recorded as sent now.
+    fn hw_transmit(&mut self, bus: BusId, frame: CanFrame, meta: FrameMeta) {
+        let (fd_enabled, nominal, data_rate) = self
+            .bus_configs
+            .get(&bus)
+            .map_or((false, 500_000, 500_000), |c| {
+                (c.fd_enabled, c.bitrate, c.data_bitrate)
+            });
+        if frame.fd && !fd_enabled {
+            self.stats.entry(bus).or_default().error_frames += 1;
+            return;
+        }
+        let name = self.bus_configs.get(&bus).map(|c| c.name.clone());
+        let Some(info) = self.hw_buses.get_mut(&bus) else {
+            return;
+        };
+        if info.listen_only {
+            let warn = !info.warned_listen_only;
+            info.warned_listen_only = true;
+            let iface = info.interface.clone();
+            self.stats.entry(bus).or_default().dropped_listen_only += 1;
+            if warn {
+                self.sim_logs.push(format!(
+                    "bus {}: listen-only, frames from simulated nodes are not sent to {iface} \
+                     (clear listen_only on the bus binding to transmit)",
+                    name.unwrap_or_else(|| format!("{bus:?}"))
+                ));
+            }
+            return;
+        }
+        let duration_ns = frame_duration_ns_any(&frame, nominal, data_rate);
+        let st = self.stats.entry(bus).or_default();
+        st.frames += 1;
+        st.busy_ns += duration_ns;
+        self.hw_tx.push((bus, frame));
+        self.hw_events.push(BusEvent {
+            time: Timestamp(self.now),
+            bus,
+            sender: meta.sender,
+            origin: meta.origin,
+            dir: if meta.hop == 0 {
+                Direction::Tx
+            } else {
+                Direction::Rx
+            },
+            frame_uid: meta.uid,
+            hop: meta.hop,
+            frame,
+            kind: BusEventKind::Frame,
+        });
+        self.count_tx_ok(meta.sender, bus);
+        self.schedule(
+            self.now + duration_ns.max(1),
+            EventKind::HwDeliver { bus, meta, frame },
+        );
     }
 
     /// Advance the simulation, processing all events up to and including
     /// `target`, appending every [`BusEvent`] produced to `out`.
     pub fn run_until(&mut self, target: Timestamp, out: &mut Vec<BusEvent>) {
         self.ensure_started();
+        out.append(&mut self.hw_events);
         while let Some(Reverse(sch)) = self.heap.peek() {
             if sch.time > target.0 {
                 break;
@@ -1082,6 +1221,7 @@ impl Simulation {
             let Reverse(sch) = self.heap.pop().unwrap();
             self.now = sch.time;
             self.handle_event(sch.kind, out);
+            out.append(&mut self.hw_events);
         }
         if target.0 > self.now {
             self.now = target.0;
@@ -1395,6 +1535,69 @@ impl Simulation {
                     self.stats.entry(bus).or_default().dropped_bus_off += 1;
                 } else {
                     self.push_pending(bus, frame, meta);
+                }
+            }
+            EventKind::HwDeliver { bus, meta, frame } => {
+                for node in self.receivers(bus, meta.sender) {
+                    self.count_rx_ok(node, bus);
+                    self.run_callback(node, Some(meta), |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
+                }
+            }
+            EventKind::HwRx { bus, frame, error } => {
+                let node = hw_node(bus);
+                let uid = self.next_uid;
+                self.next_uid += 1;
+                let meta = FrameMeta {
+                    sender: node,
+                    origin: node,
+                    uid,
+                    hop: 0,
+                };
+                let (fd_enabled, nominal, data_rate) = self
+                    .bus_configs
+                    .get(&bus)
+                    .map_or((false, 500_000, 500_000), |c| {
+                        (c.fd_enabled, c.bitrate, c.data_bitrate)
+                    });
+                if let Some(error) = error {
+                    let bit_ns = self.bit_ns(bus);
+                    let st = self.stats.entry(bus).or_default();
+                    st.can_errors.add(error);
+                    st.busy_ns += ACTIVE_ERROR_FRAME_BITS * bit_ns;
+                    out.push(BusEvent {
+                        time: Timestamp(self.now),
+                        bus,
+                        sender: node,
+                        origin: node,
+                        dir: Direction::Rx,
+                        frame_uid: uid,
+                        hop: 0,
+                        frame,
+                        kind: BusEventKind::Error { error, node },
+                    });
+                    return;
+                }
+                if frame.fd && !fd_enabled {
+                    self.stats.entry(bus).or_default().error_frames += 1;
+                    return;
+                }
+                let st = self.stats.entry(bus).or_default();
+                st.frames += 1;
+                st.busy_ns += frame_duration_ns_any(&frame, nominal, data_rate);
+                out.push(BusEvent {
+                    time: Timestamp(self.now),
+                    bus,
+                    sender: node,
+                    origin: node,
+                    dir: Direction::Rx,
+                    frame_uid: uid,
+                    hop: 0,
+                    frame,
+                    kind: BusEventKind::Frame,
+                });
+                for n in self.receivers(bus, node) {
+                    self.count_rx_ok(n, bus);
+                    self.run_callback(n, Some(meta), |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
                 }
             }
             EventKind::Recover { node, bus } => {

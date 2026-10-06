@@ -57,6 +57,7 @@ fn topo_with_two_senders() -> Topology {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![
             Link {
@@ -124,6 +125,7 @@ fn periodic_message_produces_expected_frame_count() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -197,6 +199,7 @@ fn sender_does_not_receive_its_own_frame() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![
             Link {
@@ -295,6 +298,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             fd_enabled,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         }],
         links: vec![Link {
             node: NodeId(1),
@@ -350,6 +354,7 @@ fn bus(id: u32, name: &str) -> CanBusConfig {
         fd_enabled: false,
         data_bitrate: 2_000_000,
         simulate_ack: false,
+        hardware: None,
     }
 }
 
@@ -1294,6 +1299,7 @@ fn err_topo(nodes: &[(u32, u32, u32)], bitrate: u32, simulate_ack: bool) -> Topo
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack,
+            hardware: None,
         }],
         links: nodes
             .iter()

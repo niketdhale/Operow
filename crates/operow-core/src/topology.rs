@@ -290,6 +290,38 @@ pub struct CanBusConfig {
     /// transmits happily, as in the pre-error-model simulator.
     #[serde(default)]
     pub simulate_ack: bool,
+    /// Binds the bus to a real CAN adapter. The engine then runs in real
+    /// time and this bus is no longer simulated.
+    #[serde(default)]
+    pub hardware: Option<HwBinding>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A real CAN channel a bus is bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HwBinding {
+    /// `driver:channel`, e.g. `socketcan:can0`.
+    pub interface: String,
+    /// Never transmit onto the real bus (the safe default).
+    #[serde(default = "default_true")]
+    pub listen_only: bool,
+    /// Request the adapter's echo of own frames.
+    #[serde(default)]
+    pub receive_own: bool,
+}
+
+impl HwBinding {
+    /// A listen-only binding to `interface`.
+    pub fn new(interface: impl Into<String>) -> Self {
+        HwBinding {
+            interface: interface.into(),
+            listen_only: true,
+            receive_own: false,
+        }
+    }
 }
 
 /// Attaches a node to a bus.
