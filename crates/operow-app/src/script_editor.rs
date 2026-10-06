@@ -53,18 +53,34 @@ pub fn is_error_line(line: &str) -> bool {
     l.contains("script error") || l.starts_with("error:")
 }
 
+/// A compile check of some kind of Rhai source.
+pub type Checker = fn(&str) -> Result<(), String>;
+
 /// Cached result of the last compile check, keyed by the checked text.
 #[derive(Default)]
 pub struct ScriptCheck {
     text: Option<String>,
     result: Option<Result<(), String>>,
+    /// Replaces the node-script check, for other kinds of Rhai source.
+    checker: Option<Checker>,
 }
 
 impl ScriptCheck {
+    /// A check that runs `checker` instead of the node-script compile.
+    pub fn with_checker(checker: Checker) -> Self {
+        ScriptCheck {
+            checker: Some(checker),
+            ..ScriptCheck::default()
+        }
+    }
+
     /// Re-run the check only when `src` differs from the last checked text.
     pub fn update(&mut self, src: &str) -> &Result<(), String> {
         if self.text.as_deref() != Some(src) {
-            self.result = Some(operow_engine::check_script(src));
+            self.result = Some(match self.checker {
+                Some(f) => f(src),
+                None => operow_engine::check_script(src),
+            });
             self.text = Some(src.to_string());
         }
         self.result.as_ref().expect("result set above")
@@ -80,6 +96,20 @@ pub fn editor_ui(
     check: &mut ScriptCheck,
     rows: usize,
 ) -> bool {
+    editor_ui_at(ui, id, script, editable, check, rows, None)
+}
+
+/// Like [`editor_ui`]; `goto` (1-based) puts the cursor on that line and
+/// scrolls it into view.
+pub fn editor_ui_at(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    script: &mut String,
+    editable: bool,
+    check: &mut ScriptCheck,
+    rows: usize,
+    goto: Option<u32>,
+) -> bool {
     let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = egui_extras::syntax_highlighting::highlight(
@@ -93,23 +123,42 @@ pub fn editor_ui(
         ui.fonts_mut(|f| f.layout_job(job))
     };
     let mut changed = false;
-    egui::ScrollArea::vertical()
+    let mut area = egui::ScrollArea::vertical()
         .id_salt(id.with("scroll"))
-        .max_height(ui.available_height().max(120.0))
-        .show(ui, |ui| {
-            changed = ui
-                .add(
-                    egui::TextEdit::multiline(script)
-                        .id(id)
-                        .code_editor()
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(rows)
-                        .desired_width(f32::INFINITY)
-                        .interactive(editable)
-                        .layouter(&mut layouter),
-                )
-                .changed();
-        });
+        .max_height((ui.available_height() - 28.0).max(120.0));
+    if let Some(line) = goto {
+        let row_h = ui.fonts_mut(|f| f.row_height(&egui::TextStyle::Monospace.resolve(ui.style())));
+        let line = line.saturating_sub(1) as usize;
+        area = area.vertical_scroll_offset((line as f32 - 3.0).max(0.0) * row_h);
+        // Cursor at the start of that line.
+        let offset: usize = script
+            .split('\n')
+            .take(line)
+            .map(|l| l.chars().count() + 1)
+            .sum();
+        let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(offset),
+            )));
+        state.store(ui.ctx(), id);
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    area.show(ui, |ui| {
+        changed = ui
+            .add(
+                egui::TextEdit::multiline(script)
+                    .id(id)
+                    .code_editor()
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(rows)
+                    .desired_width(f32::INFINITY)
+                    .interactive(editable)
+                    .layouter(&mut layouter),
+            )
+            .changed();
+    });
     ui.horizontal(|ui| {
         let ok = ui.button("Check").clicked();
         let _ = ok; // result below is always current; the button forces a refresh

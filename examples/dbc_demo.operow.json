@@ -143,5 +143,8 @@
       "path": "sample.dbc",
       "bus": 1
     }
+  ],
+  "tests": [
+    "tests/dbc_tests.rhai"
   ]
 }

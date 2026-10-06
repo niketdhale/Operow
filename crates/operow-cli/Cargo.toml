@@ -1,0 +1,25 @@
+[package]
+name = "operow-cli"
+description = "Headless command line for Operow: run tests, simulate, replay and convert logs, send diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "operow-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+operow-core = { workspace = true }
+operow-dbc = { path = "../operow-dbc" }
+operow-engine = { path = "../operow-engine" }
+operow-log = { path = "../operow-log" }
+operow-project = { path = "../operow-project" }
+operow-test = { path = "../operow-test" }
+operow-uds = { path = "../operow-uds" }
+
+[dev-dependencies]
+operow-log = { path = "../operow-log" }
+serde_json = "1"
+tempfile = "3"

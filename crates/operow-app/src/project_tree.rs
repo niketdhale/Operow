@@ -19,10 +19,18 @@ pub struct TreeOutput {
     /// "Add to graph" was chosen for a signal.
     pub add_signal_to_graph: Option<SignalRef>,
     pub delete_signal: Option<UserSignalId>,
+    /// "+ New test module..." was clicked.
+    pub new_test_module: bool,
+    /// Test module (project path) to run.
+    pub run_test_module: Option<String>,
+    /// Test module (project path) to open in an editor.
+    pub open_test_module: Option<String>,
+    /// Index into `topology.tests` to remove from the project.
+    pub remove_test_module: Option<usize>,
 }
 
 /// Draws the tree.
-pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
+pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore, tests_busy: bool) -> TreeOutput {
     let mut out = TreeOutput::default();
     let mut picked = None;
     let selected = graph.selected();
@@ -223,6 +231,46 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore) -> TreeOutput {
                     }
                     if !any {
                         ui.weak("No scripts");
+                    }
+                });
+
+            CollapsingHeader::new(RichText::new("Tests").strong())
+                .icon(crate::icons::disclosure)
+                .default_open(true)
+                .show(ui, |ui| {
+                    if graph.tests.is_empty() {
+                        ui.weak("No test modules");
+                    }
+                    for (i, path) in graph.tests.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(icons::icon_image(ui, icons::script()));
+                            let resp = ui
+                                .selectable_label(false, operow_test::module_name(path))
+                                .on_hover_text(format!("{path}\nDouble-click to edit"));
+                            if resp.double_clicked() {
+                                out.open_test_module = Some(path.clone());
+                            }
+                            resp.context_menu(|ui| {
+                                if ui
+                                    .add_enabled(!tests_busy, egui::Button::new("Run"))
+                                    .clicked()
+                                {
+                                    out.run_test_module = Some(path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Open in editor").clicked() {
+                                    out.open_test_module = Some(path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Remove from project").clicked() {
+                                    out.remove_test_module = Some(i);
+                                    ui.close();
+                                }
+                            });
+                        });
+                    }
+                    if ui.button("+ New test module\u{2026}").clicked() {
+                        out.new_test_module = true;
                     }
                 });
         });

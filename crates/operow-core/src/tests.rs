@@ -37,6 +37,7 @@ fn topology_json_roundtrip() {
         }],
         databases: vec![],
         user_signals: vec![],
+        tests: vec![],
         workspace: None,
     };
 
@@ -249,6 +250,7 @@ fn validate_rejects_bad_bus_references() {
         }],
         databases: vec![],
         user_signals: vec![],
+        tests: vec![],
         workspace: None,
     };
     assert_eq!(

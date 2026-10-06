@@ -362,6 +362,10 @@ pub struct Topology {
     /// Signals the user defined on raw messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_signals: Vec<UserSignalDef>,
+    /// Rhai test modules (`.rhai` files) run by the test runner; relative
+    /// paths resolve against the project file's folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
     /// Opaque UI workspace (window layout) saved with the project. The core
     /// crate does not interpret it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

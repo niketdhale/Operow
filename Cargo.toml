@@ -8,6 +8,9 @@ members = [
     "crates/operow-log",
     "crates/operow-isotp",
     "crates/operow-uds",
+    "crates/operow-project",
+    "crates/operow-test",
+    "crates/operow-cli",
 ]
 
 [workspace.package]

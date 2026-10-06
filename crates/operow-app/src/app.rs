@@ -29,6 +29,8 @@ use crate::settings::{self, AppSettings, WhenFull};
 use crate::signal_dialog::{DialogOutcome, NewSignalDialog};
 use crate::signals::{RawKind, SignalRef};
 use crate::store::FrameStore;
+use crate::test_editor::{Template, TestEditor};
+use crate::tests_window::{Job, TestsAction, TestsState};
 use crate::theme::AppTheme;
 use crate::trace::{NameLookup, Trace, TraceAction, TraceMode};
 use crate::windows::WindowViewer;
@@ -106,6 +108,43 @@ pub struct StartupOptions {
     /// `--open-log <path>`: open an offline session (channels mapped to the
     /// buses in order) and play it at x1.
     pub open_log: Option<PathBuf>,
+    /// `--demo-tests`: open the Tests window with a Trace, add an in-memory
+    /// module with one failing case, run everything (streaming the frames)
+    /// and select the failing case.
+    pub demo_tests: bool,
+    /// `--demo-test-editor`: like `--demo-tests`, with the failing module
+    /// open in a test editor at the failing line.
+    pub demo_test_editor: bool,
+}
+
+/// In-memory test module of `--demo-tests`: one case fails on purpose.
+const DEMO_FAILING_PATH: &str = "tests/demo_failing.rhai";
+const DEMO_FAILING_SRC: &str = r#"// In-memory module of --demo-tests.
+
+fn test_door_status_is_remapped() {
+    let f = wait_for_message_on("Powertrain", 0x300, 200);
+    expect_eq(f.dlc, 2);
+}
+
+fn test_door_status_has_eight_bytes() {
+    let f = wait_for_message_on("Powertrain", 0x300, 200);
+    // The remapped frame is 2 bytes long, so this fails.
+    expect_eq(f.dlc, 8);
+}
+"#;
+
+/// The "New test module" modal: which template to start from.
+struct NewTestDialog {
+    template: Template,
+}
+
+/// Where `--demo-tests` is in its sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemoTests {
+    /// Waiting for the first frame to start the run.
+    Start,
+    /// Waiting for the run to end.
+    Running,
 }
 
 /// The "Import DBC" modal: a parsed file plus where to put it.
@@ -191,6 +230,16 @@ pub struct OperowApp {
     last_generator: Option<WindowId>,
     /// Per-instance state of every open Diagnostics window.
     diags: HashMap<WindowId, DiagWindow>,
+    /// The Tests window's tree, options and run.
+    tests: TestsState,
+    /// Open test editors, by window.
+    test_editors: HashMap<WindowId, TestEditor>,
+    new_test: Option<NewTestDialog>,
+    /// `--demo-tests` / `--demo-test-editor`: modules that exist only in
+    /// memory, as `(project path, source)`.
+    demo_modules: Vec<(String, String)>,
+    demo_tests: Option<DemoTests>,
+    demo_test_editor: bool,
     /// `--demo-generator`: start this window's cyclic rows when running.
     demo_generator_pending: Option<WindowId>,
     /// Every bus event, shared by all windows.
@@ -273,6 +322,12 @@ impl OperowApp {
             generators: HashMap::new(),
             last_generator: None,
             diags: HashMap::new(),
+            tests: TestsState::default(),
+            test_editors: HashMap::new(),
+            new_test: None,
+            demo_modules: Vec::new(),
+            demo_tests: None,
+            demo_test_editor: false,
             demo_generator_pending: None,
             store: FrameStore::new(settings.frame_buffer_size),
             logging: LoggingConfig::default(),
@@ -341,6 +396,7 @@ impl OperowApp {
         for id in open.iter().filter(|w| w.kind == WindowKind::Diag) {
             self.diags.entry(*id).or_default();
         }
+        self.test_editors.retain(|id, _| open.contains(id));
         self.store.set_capacity(self.settings.frame_buffer_size);
         self.store
             .set_reject_when_full(self.settings.when_full == WhenFull::StopMeasurement);
@@ -576,6 +632,9 @@ impl OperowApp {
         if opts.demo_logging {
             self.demo_logging();
         }
+        if opts.demo_tests || opts.demo_test_editor {
+            self.demo_tests(opts.demo_test_editor);
+        }
         for t in self.traces.values_mut() {
             if opts.demo_errors {
                 // The injected errors are at the very start of the run.
@@ -652,6 +711,35 @@ impl OperowApp {
             ]);
         }
         workspace::focus(&mut self.dock, id);
+    }
+
+    /// `--demo-tests`: the Tests window next to a Trace, with an in-memory
+    /// failing module added to the project; the run starts on the first
+    /// frame (see `update_tests`).
+    fn demo_tests(&mut self, editor: bool) {
+        self.show_tree = editor;
+        self.no_start = true;
+        self.demo_modules
+            .push((DEMO_FAILING_PATH.into(), DEMO_FAILING_SRC.into()));
+        self.graph.tests.push(DEMO_FAILING_PATH.into());
+        self.tests.stream = true;
+        self.demo_tests = Some(DemoTests::Start);
+        self.demo_test_editor = editor;
+        if editor {
+            let id = WindowId::new(WindowKind::TestEditor, 1);
+            self.dock = workspace::test_editor_demo_layout(id);
+            let file = std::path::PathBuf::from(DEMO_FAILING_PATH);
+            let mut e = TestEditor::open(DEMO_FAILING_PATH.into(), file);
+            e.set_text(DEMO_FAILING_SRC);
+            self.test_editors.insert(id, e);
+        } else {
+            self.dock = workspace::tests_demo_layout();
+        }
+        self.layout_preset = None;
+        self.sync_instances();
+        if let Some(t) = self.traces.get_mut(&WindowId::new(WindowKind::Trace, 1)) {
+            t.autoscroll = false;
+        }
     }
 
     /// `--demo-logging`: start recording once the Body bus's DoorStatus
@@ -855,6 +943,8 @@ impl OperowApp {
         self.generators.clear();
         self.last_generator = None;
         self.diags.clear();
+        self.test_editors.clear();
+        self.tests = TestsState::default();
         self.logging = topo
             .workspace
             .as_ref()
@@ -883,7 +973,29 @@ impl OperowApp {
                 }
             }
         }
+        self.restore_test_editors(topo);
         self.reload_dbcs();
+    }
+
+    /// Reopen the test editors saved in the workspace and drop editor tabs
+    /// whose module is gone.
+    fn restore_test_editors(&mut self, topo: &Topology) {
+        let dir = self
+            .project_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf());
+        if let Some(ws) = &topo.workspace {
+            for (id, path) in workspace::editors_from_json(ws) {
+                if topo.tests.contains(&path) {
+                    let file = dbcs::resolve_path(dir.as_deref(), &path);
+                    self.test_editors.insert(id, TestEditor::open(path, file));
+                }
+            }
+        }
+        let editors = &self.test_editors;
+        self.dock
+            .retain_tabs(|t| t.kind != WindowKind::TestEditor || editors.contains_key(t));
     }
 
     /// Project file name without `.operow.json`, for log file names.
@@ -921,6 +1033,236 @@ impl OperowApp {
     fn sync_dbcs(&mut self) {
         let buses: Vec<BusId> = self.graph.databases.iter().map(|d| d.bus).collect();
         self.names.dbcs.by_bus.retain(|b, _| buses.contains(b));
+    }
+
+    /// Source of a test module: an in-memory demo module, the open editor's
+    /// text (saved or not), else the file.
+    fn read_test_source(
+        demo: &[(String, String)],
+        editors: &HashMap<WindowId, TestEditor>,
+        dir: Option<&std::path::Path>,
+        path: &str,
+    ) -> Result<String, String> {
+        if let Some((_, src)) = demo.iter().find(|(p, _)| p == path) {
+            return Ok(src.clone());
+        }
+        if let Some(e) = editors.values().find(|e| e.path == path) {
+            return Ok(e.text.clone());
+        }
+        let file = dbcs::resolve_path(dir, path);
+        std::fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))
+    }
+
+    /// Keep the Tests tree in step with the project, forward the frames of
+    /// a streaming run to the store and drive the `--demo-tests` sequence.
+    fn update_tests(&mut self) {
+        let dir = self.project_dir();
+        let (demo, editors) = (&self.demo_modules, &self.test_editors);
+        self.tests.sync_modules(&self.graph.tests, |p| {
+            Self::read_test_source(demo, editors, dir.as_deref(), p)
+        });
+        let frames = self.tests.poll();
+        if !frames.is_empty() {
+            self.store.push_batch(&frames);
+        }
+    }
+
+    fn demo_tests_step(&mut self, ctx: &egui::Context) {
+        match self.demo_tests {
+            Some(DemoTests::Start) => {
+                self.demo_tests = Some(DemoTests::Running);
+                let jobs = self.tests.jobs_all();
+                self.start_tests(ctx, jobs);
+            }
+            Some(DemoTests::Running) if !self.tests.running() => {
+                self.demo_tests = None;
+                let failing = self.tests.modules.iter().find_map(|m| {
+                    m.cases
+                        .iter()
+                        .find(|c| c.status == Some(operow_test::Status::Fail))
+                        .map(|c| (m.path.clone(), c.name.clone()))
+                });
+                if let Some((path, case)) = failing {
+                    let line = self
+                        .tests
+                        .modules
+                        .iter()
+                        .find(|m| m.path == path)
+                        .and_then(|m| m.cases.iter().find(|c| c.name == case))
+                        .and_then(|c| c.result.as_ref())
+                        .and_then(|r| r.failure.as_ref())
+                        .and_then(|f| f.line);
+                    self.tests.selection = crate::tests_window::Selection::Case(path.clone(), case);
+                    if self.demo_test_editor {
+                        self.open_test_editor(&path, line);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run `jobs` on a background thread over the current, unsaved project.
+    fn start_tests(&mut self, ctx: &egui::Context, jobs: Vec<Job>) {
+        if jobs.is_empty() || self.tests.running() {
+            return;
+        }
+        let dir = self.project_dir();
+        let project = operow_test::Project::from_parts(
+            self.project_name(),
+            self.graph.to_topology(),
+            self.names.dbcs.clone(),
+            dir.as_deref(),
+        );
+        let sources = self
+            .graph
+            .tests
+            .iter()
+            .map(|p| {
+                let src = Self::read_test_source(
+                    &self.demo_modules,
+                    &self.test_editors,
+                    dir.as_deref(),
+                    p,
+                );
+                (p.clone(), src)
+            })
+            .collect();
+        // Streamed cases go after what the trace already holds.
+        let base_ns = self
+            .store
+            .find_latest(1, |_| true)
+            .map_or(0, |e| e.time.0 + 100_000_000);
+        self.tests.start(project, sources, jobs, base_ns, ctx);
+    }
+
+    fn handle_test_actions(&mut self, ctx: &egui::Context, actions: Vec<TestsAction>) {
+        for action in actions {
+            match action {
+                TestsAction::RunAll => {
+                    let jobs = self.tests.jobs_all();
+                    self.start_tests(ctx, jobs);
+                }
+                TestsAction::RunSelected => {
+                    let jobs = self.tests.jobs_selected();
+                    self.start_tests(ctx, jobs);
+                }
+                TestsAction::RunFailed => {
+                    let jobs = self.tests.jobs_failed();
+                    self.start_tests(ctx, jobs);
+                }
+                TestsAction::RunModule(path) => {
+                    self.start_tests(ctx, vec![Job { path, case: None }]);
+                }
+                TestsAction::RunCase(path, case) => {
+                    self.start_tests(
+                        ctx,
+                        vec![Job {
+                            path,
+                            case: Some(case),
+                        }],
+                    );
+                }
+                TestsAction::Stop => self.tests.stop(),
+                TestsAction::Refresh => self.tests.mark_dirty(),
+                TestsAction::OpenEditor { path, line } => self.open_test_editor(&path, line),
+                TestsAction::JumpTrace(ns) => {
+                    let id = self.open_window(WindowKind::Trace, false);
+                    self.sync_instances();
+                    if let Some(t) = self.traces.get_mut(&id) {
+                        t.jump_to_time(ns);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a test module in a test editor (or focus the one that has it),
+    /// at `line` when given.
+    fn open_test_editor(&mut self, path: &str, line: Option<u32>) {
+        let existing = self
+            .test_editors
+            .iter()
+            .find(|(_, e)| e.path == path)
+            .map(|(id, _)| *id);
+        let id = match existing {
+            Some(id) => {
+                workspace::focus(&mut self.dock, id);
+                id
+            }
+            None => {
+                let id = self.open_window(WindowKind::TestEditor, true);
+                let file = dbcs::resolve_path(self.project_dir().as_deref(), path);
+                self.test_editors
+                    .insert(id, TestEditor::open(path.to_string(), file));
+                id
+            }
+        };
+        if let (Some(l), Some(e)) = (line, self.test_editors.get_mut(&id)) {
+            e.goto_line(l);
+        }
+    }
+
+    /// Write a new module from `template` to `file`, add it to the project
+    /// and open it.
+    fn create_test_module(&mut self, template: Template, file: PathBuf) {
+        let file = if file.extension().is_none() {
+            file.with_extension("rhai")
+        } else {
+            file
+        };
+        if let Err(e) = std::fs::write(&file, template.source()) {
+            self.log_error(format!("cannot write {}: {e}", file.display()));
+            return;
+        }
+        let abs = file.canonicalize().unwrap_or(file);
+        let stored = dbcs::stored_path(&abs, self.project_dir().as_deref());
+        if !self.graph.tests.contains(&stored) {
+            self.graph.tests.push(stored.clone());
+        }
+        self.tests.mark_dirty();
+        self.log(format!("created test module {stored}"));
+        self.open_test_editor(&stored, None);
+    }
+
+    fn new_test_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.new_test else {
+            return;
+        };
+        let mut create = false;
+        let mut cancel = false;
+        egui::Window::new("New test module")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Start from a template:");
+                for t in Template::ALL {
+                    ui.radio_value(&mut dialog.template, t, t.label())
+                        .on_hover_text(t.hint());
+                }
+                ui.weak(dialog.template.hint());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    create = ui.button("Choose file\u{2026}").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        let template = dialog.template;
+        if cancel {
+            self.new_test = None;
+        } else if create {
+            let mut dlg = rfd::FileDialog::new()
+                .set_file_name("tests.rhai")
+                .add_filter("Rhai test module", &["rhai"]);
+            if let Some(dir) = self.project_dir() {
+                dlg = dlg.set_directory(dir);
+            }
+            if let Some(file) = dlg.save_file() {
+                self.new_test = None;
+                self.create_test_module(template, file);
+            }
+        }
     }
 
     fn log_error(&mut self, msg: String) {
@@ -1565,6 +1907,8 @@ impl OperowApp {
         self.generators.clear();
         self.last_generator = None;
         self.diags.clear();
+        self.test_editors.clear();
+        self.tests = TestsState::default();
         self.store.clear();
     }
 
@@ -1615,16 +1959,24 @@ impl OperowApp {
                 .map(|(id, g)| (*id, g.view()))
                 .collect();
             let diags = self.diags.iter().map(|(id, d)| (*id, d.view())).collect();
-            topo.workspace = workspace::with_logging(
-                workspace::layout_to_json_with(
-                    &self.dock,
-                    views,
-                    graphs,
-                    generators,
-                    diags,
-                    Some(self.graph.network_layout()),
+            let editors = self
+                .test_editors
+                .iter()
+                .map(|(id, e)| (*id, e.path.clone()))
+                .collect();
+            topo.workspace = workspace::with_editors(
+                workspace::with_logging(
+                    workspace::layout_to_json_with(
+                        &self.dock,
+                        views,
+                        graphs,
+                        generators,
+                        diags,
+                        Some(self.graph.network_layout()),
+                    ),
+                    &self.logging,
                 ),
-                &self.logging,
+                editors,
             );
             let json = topo.to_json();
             if let Err(e) = std::fs::write(&path, json) {
@@ -2165,6 +2517,13 @@ impl OperowApp {
             {
                 self.open_window(WindowKind::Diag, true);
             }
+            if ui
+                .button("Tests")
+                .on_hover_text("Open the Tests window")
+                .clicked()
+            {
+                self.open_window(WindowKind::Tests, false);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -2475,6 +2834,10 @@ impl eframe::App for OperowApp {
 
         self.update_offline(ctx);
         self.sync_instances();
+        self.update_tests();
+        if self.demo_tests.is_some() {
+            self.demo_tests_step(ctx);
+        }
         self.run_logging(ctx);
         let now = std::time::Instant::now();
         for t in self.traces.values_mut() {
@@ -2519,7 +2882,8 @@ impl eframe::App for OperowApp {
                 .show(ctx, |ui| {
                     ui.heading("Project");
                     ui.separator();
-                    tree = project_tree::ui(ui, &self.graph, &self.names.dbcs);
+                    tree =
+                        project_tree::ui(ui, &self.graph, &self.names.dbcs, self.tests.running());
                 });
         }
         if let Some(id) = tree.picked {
@@ -2535,6 +2899,25 @@ impl eframe::App for OperowApp {
         if let Some(id) = tree.delete_signal {
             self.graph.user_signals.retain(|u| u.id != id);
         }
+        if tree.new_test_module {
+            self.new_test = Some(NewTestDialog {
+                template: Template::Basic,
+            });
+        }
+        if let Some(path) = tree.open_test_module {
+            self.open_test_editor(&path, None);
+        }
+        if let Some(i) = tree.remove_test_module
+            && i < self.graph.tests.len()
+        {
+            let path = self.graph.tests.remove(i);
+            self.tests.mark_dirty();
+            self.log(format!("removed test module {path} from the project"));
+        }
+        if let Some(path) = tree.run_test_module {
+            self.open_window(WindowKind::Tests, false);
+            self.handle_test_actions(ctx, vec![TestsAction::RunModule(path)]);
+        }
 
         let sim_time_s = self.latest_time_s();
         egui::CentralPanel::default()
@@ -2547,6 +2930,8 @@ impl eframe::App for OperowApp {
                     graphs: &mut self.graphs,
                     generators: &mut self.generators,
                     diags: &mut self.diags,
+                    tests: &mut self.tests,
+                    test_editors: &mut self.test_editors,
                     sim_time_s,
                     store: &self.store,
                     names: &self.names,
@@ -2565,6 +2950,7 @@ impl eframe::App for OperowApp {
                         .map(|p| p.to_path_buf()),
                     cmds: Vec::new(),
                     trace_actions: Vec::new(),
+                    test_actions: Vec::new(),
                     open_request: None,
                 };
                 let style = egui_dock::Style::from_egui(ui.style().as_ref());
@@ -2574,10 +2960,12 @@ impl eframe::App for OperowApp {
                     .show_close_buttons(true)
                     .show_inside(ui, &mut viewer);
                 let (cmds, actions) = (viewer.cmds, viewer.trace_actions);
+                let test_actions = viewer.test_actions;
                 if let Some(kind) = viewer.open_request {
                     self.open_window(kind, false);
                 }
                 self.handle_trace_actions(actions);
+                self.handle_test_actions(ctx, test_actions);
                 for cmd in cmds {
                     let _ = self.engine.cmd.send(cmd);
                 }
@@ -2590,6 +2978,7 @@ impl eframe::App for OperowApp {
         self.import_dialog_ui(ctx);
         self.open_log_dialog_ui(ctx);
         self.new_signal_dialog_ui(ctx);
+        self.new_test_dialog_ui(ctx);
         self.take_screenshot_if_needed(ctx);
 
         if let Some(path) = self.screenshot_path.clone() {
