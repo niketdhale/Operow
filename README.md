@@ -122,6 +122,25 @@ cargo nextest run --workspace
 cargo test --workspace --doc   # nextest skips doctests
 ```
 
+## Hardware
+
+A bus can be bound to a real CAN adapter (`"hardware": {"interface": "socketcan:can0", "listen_only": true, "receive_own": false}` on the bus). Frames from the adapter appear as received frames on that bus (sender `HW <bus>`), reach the simulated nodes and are forwarded by gateways to other buses, including other hardware buses. Frames simulated nodes send onto the bus go to the adapter.
+
+- **Real-time only.** With any hardware bus the engine runs at speed 1.0 (other speeds are refused) and virtual time follows the wall clock. Simulated buses keep their simulated timing, paced to real time. `operow-cli run` does the same.
+- **Listen-only by default.** Nothing is transmitted unless `listen_only` is `false`; dropped frames are counted per bus. Opening failures are reported and the measurement does not start.
+- **SocketCAN (Linux).** `socketcan:<interface>`; classic and FD. Bitrate and the controller's listen-only mode are configured outside Operow:
+  ```bash
+  sudo ip link set can0 type can bitrate 500000 dbitrate 2000000 fd on listen-only on
+  sudo ip link set up can0
+  ```
+  For testing without hardware: `sudo modprobe vcan; sudo ip link add dev vcan0 type vcan; sudo ip link set up vcan0`, then `cargo test -p operow-hw -- --ignored`.
+- **`virtual:<name>`**: in-process loopback, all platforms (tests, demos).
+- **`udp:<name>`**: connects Operow processes on one machine over loopback multicast (no admin rights; works on Windows). The datagram format is documented in `crates/operow-hw/src/udp.rs`.
+- **Vector XL (Windows).** `vector:<channel name>` (e.g. `vector:VN1630 Channel 1`, `vector:Virtual Channel 1`) or `vector:<channelIndex>`; the names are listed in the interface chooser. The XL Driver Library (`vxlapi64.dll`) is loaded at run time, so Operow starts without it and the driver just reports itself unavailable. Classic and CAN FD (FD needs a channel with FD support); Operow sets the bitrate, and listen-only selects the controller's silent mode (the default). If another application holds init access to the channel, Operow still opens it but cannot set the bitrate (the channel description says so). Vector virtual channels count as virtual in the app (no LIVE warning).
+  **Testing without hardware:** install *Vector Driver Setup* (it includes the XL Driver Library and the virtual CAN channels, "Virtual Channel 1/2" and so on), then bind one bus to `vector:Virtual Channel 1` and run a second tool, or a second Operow bus bound to `vector:Virtual Channel 2`, against the other end. **Status: tested only against a mock, never with the real library or hardware; please report issues.** The mock tests run everywhere: `cargo test -p operow-hw vector`.
+- **PCAN-Basic (Windows, Linux).** `pcan:PCAN_USBBUS1` (also `pcan:usb1` or the raw handle `pcan:0x51`; `PCI`, `LAN` and `PCC` channels work alike); the attached channels are listed in the interface chooser with the device name. PEAK's PCAN-Basic library (`PCANBasic.dll` from the PCAN driver package on Windows, `libpcanbasic.so` from PCAN-Basic for Linux) is loaded at run time, so Operow starts without it and the driver just reports itself unavailable. Classic CAN (5 kbit/s to 1 Mbit/s; other rates are refused because PCAN-Basic takes a bit timing register value) and CAN FD (bit timing computed for an 80 MHz clock and about 80 % sample point, FD needs an FD-capable device). Listen-only is set before the channel is initialised. Own transmitted frames (`receive_own`) use PCAN-Basic's echo frames; if the library does not support them, opening with `receive_own` fails. Error frames are reported as generic bit errors (PCAN-Basic does not document their payload); remote frames are ignored. macOS is not supported (it would need the third-party PCBUSB library, which could be added later).
+  **Linux:** with PEAK's mainline kernel driver (`peak_usb`) PCAN adapters also show up as SocketCAN interfaces (`can0`); SocketCAN is the recommended path there. Use `pcan:` only with PEAK's own `peak-linux-driver` and PCAN-Basic for Linux. **Status: tested only against a mock, no PEAK hardware available; please report issues.** The mock tests run everywhere: `cargo test -p operow-hw pcan`.
+
 ## Architecture
 
 The workspace consists of the following crates:
@@ -130,6 +149,7 @@ The workspace consists of the following crates:
 - **operow-engine**: Discrete-event simulation engine
 - **operow-dbc**: DBC parser and signal decoding
 - **operow-isotp**: Sans-IO ISO 15765-2 (ISO-TP) transport state machine, independent of the engine
+- **operow-hw**: CAN hardware abstraction: SocketCAN, Vector, PCAN, virtual and UDP drivers
 - **operow-log**: ASC and BLF log readers and writers
 - **operow-uds**: UDS (ISO 14229) message encoding and decoding
 - **operow-test**: Rhai test runner, result model and HTML / JUnit / JSON reports

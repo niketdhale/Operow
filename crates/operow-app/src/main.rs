@@ -12,6 +12,7 @@ mod filters;
 mod generator_window;
 mod graph;
 mod graph_window;
+mod hw_ui;
 mod icons;
 mod inspector;
 mod logging;
@@ -68,6 +69,8 @@ fn main() -> eframe::Result<()> {
             "--demo-errors" => opts.demo_errors = true,
             "--demo-faults" => opts.demo_faults = true,
             "--demo-busoff" => opts.demo_busoff = true,
+            "--demo-hw-udp" => opts.demo_hw_udp = true,
+            "--demo-hw-confirm" => opts.demo_hw_confirm = true,
             "--network-view" => {
                 opts.network_view = args
                     .next()

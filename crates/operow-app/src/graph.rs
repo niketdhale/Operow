@@ -292,6 +292,7 @@ impl Graph {
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
+                hardware: None,
             }),
         );
         self.editor.commit(&self.state);
@@ -1066,8 +1067,8 @@ impl GraphViewer {
     }
 }
 
-/// Text inside a bus bar: `CAN1 · 500k · 12.3%`, with ` · 20 err` appended
-/// when `errors > 0`.
+/// Text inside a bus bar: `CAN1 · 500k · 12.3%`, with ` · HW can0` (or
+/// ` · HW can0 (listen)`) after the name for a bus bound to hardware and ` · 20 err` appended when `errors > 0`.
 pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String {
     let rate = if b.fd_enabled {
         format!(
@@ -1084,7 +1085,11 @@ pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String
     } else {
         String::new()
     };
-    format!("{} \u{b7} {rate} \u{b7} {load}{err}", b.name)
+    let hw = b
+        .hardware
+        .as_ref()
+        .map_or(String::new(), crate::hw_ui::bar_suffix);
+    format!("{}{hw} \u{b7} {rate} \u{b7} {load}{err}", b.name)
 }
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
@@ -1095,6 +1100,9 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
                 let load = self.loads.get(&b.id).copied();
                 let errors = self.bus_errors.get(&b.id).copied().unwrap_or(0);
                 ui.label(egui::RichText::new(bus_bar_label(b, load, errors)).strong());
+                if let Some(hw) = &b.hardware {
+                    crate::hw_ui::chip_ui(ui, hw);
+                }
             });
             return;
         }
@@ -1133,6 +1141,11 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
         ui.horizontal(|ui| {
             ui.add(icons::icon_image(ui, icon));
             ui.label(egui::RichText::new(title).strong());
+            if let GraphNode::Bus(b) = &node.data
+                && let Some(hw) = &b.hardware
+            {
+                crate::hw_ui::chip_ui(ui, hw);
+            }
             if let GraphNode::Ecu(e) = &node.data
                 && e.script.is_some()
             {
@@ -1453,6 +1466,7 @@ mod tests {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            hardware: None,
         };
         assert_eq!(
             bus_bar_label(&b, Some(12.34), 0),
@@ -1460,11 +1474,19 @@ mod tests {
         );
         let fd = CanBusConfig {
             fd_enabled: true,
-            ..b
+            ..b.clone()
         };
         assert_eq!(
             bus_bar_label(&fd, None, 0),
             "CAN1 \u{b7} FD 500k/2M \u{b7} 0%"
+        );
+        let hw = CanBusConfig {
+            hardware: Some(operow_core::HwBinding::new("socketcan:can0")),
+            ..b.clone()
+        };
+        assert_eq!(
+            bus_bar_label(&hw, None, 0),
+            "CAN1 \u{b7} HW can0 (listen) \u{b7} 500k \u{b7} 0%"
         );
         assert_eq!(
             bus_bar_label(&fd, Some(1.0), 20),

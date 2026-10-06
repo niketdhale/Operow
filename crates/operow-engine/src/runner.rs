@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
+use crate::hw::{HwBridge, HwBusStatus, HwLink, HwNotice};
 use crate::sim::{
     BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
 };
@@ -132,6 +133,10 @@ pub enum EngineEvent {
         resp: Result<Vec<u8>, String>,
         elapsed_ms: f64,
     },
+    /// State of every hardware bus (empty when the topology has none or the
+    /// measurement is stopped); sent right after each `Stats`, and when the
+    /// channels open, fail to open or close.
+    HwStatus(Vec<HwBusStatus>),
     State(RunState),
     Log(String),
     Error(String),
@@ -139,6 +144,9 @@ pub enum EngineEvent {
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const TICK: Duration = Duration::from_millis(5);
+/// Loop period while hardware buses are open (bounds the latency of frames
+/// between the adapter and the simulation).
+const HW_TICK: Duration = Duration::from_millis(1);
 const STATS_INTERVAL: Duration = Duration::from_millis(200);
 /// Virtual nanoseconds advanced per tick when running at "as fast as
 /// possible" (speed 0).
@@ -195,6 +203,43 @@ struct EngineState {
     /// Buses we have already logged a "dropped FD frame(s)" warning for, so
     /// we only warn once per bus.
     warned_fd_buses: std::collections::HashSet<BusId>,
+    /// The topology has a bus bound to hardware: real time only.
+    realtime_only: bool,
+    /// Open hardware channels while running.
+    hw: Option<HwBridge>,
+    paused_at: Option<Instant>,
+}
+
+const REALTIME_MSG: &str = "hardware buses present: the engine runs in real time only (speed 1.0)";
+
+fn send_notices(notices: Vec<HwNotice>, ev_tx: &Sender<EngineEvent>) {
+    for n in notices {
+        let _ = ev_tx.try_send(match n {
+            HwNotice::Log(l) => EngineEvent::Log(l),
+            HwNotice::Error(e) => EngineEvent::Error(e),
+        });
+    }
+}
+
+/// Status of the hardware buses of `topology` while no channel is open:
+/// `Closed`, or `Error(why)` when opening failed.
+fn closed_status(topology: Option<&Topology>, error: Option<&str>) -> Vec<HwBusStatus> {
+    topology
+        .into_iter()
+        .flat_map(|t| &t.buses)
+        .filter_map(|b| {
+            let hw = b.hardware.as_ref()?;
+            Some(HwBusStatus {
+                bus: b.id,
+                interface: hw.interface.clone(),
+                listen_only: hw.listen_only,
+                link: error.map_or(HwLink::Closed, |e| HwLink::Error(e.to_string())),
+                controller: Default::default(),
+                rx_frames: 0,
+                tx_frames: 0,
+            })
+        })
+        .collect()
 }
 
 fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
@@ -205,6 +250,9 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         speed: 1.0,
         virtual_ns: 0,
         warned_fd_buses: std::collections::HashSet::new(),
+        realtime_only: false,
+        hw: None,
+        paused_at: None,
     };
     let mut last_tick = Instant::now();
     let mut last_stats = Instant::now();
@@ -212,7 +260,8 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
     let mut dropped_batches: u64 = 0;
 
     loop {
-        match cmd_rx.recv_timeout(TICK) {
+        let tick = if state.hw.is_some() { HW_TICK } else { TICK };
+        match cmd_rx.recv_timeout(tick) {
             Ok(cmd) => {
                 if !handle_command(cmd, &mut state, &ev_tx) {
                     return;
@@ -225,6 +274,9 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
         }
 
         if state.run_state != RunState::Running {
+            if let Some(hw) = state.hw.as_mut() {
+                hw.discard_pending();
+            }
             last_tick = Instant::now();
             continue;
         }
@@ -236,14 +288,20 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
 
         let elapsed = last_tick.elapsed();
         last_tick = Instant::now();
-        let advance_ns = if state.speed == 0.0 {
-            FAST_FORWARD_STEP_NS
+        if let Some(hw) = state.hw.as_mut() {
+            // Real time: virtual time is the wall clock.
+            let (now, notices) = hw.step(sim, &mut frames_buf);
+            state.virtual_ns = now;
+            send_notices(notices, &ev_tx);
         } else {
-            (elapsed.as_secs_f64() * state.speed * 1_000_000_000.0).round() as u64
-        };
-        state.virtual_ns = state.virtual_ns.saturating_add(advance_ns);
-
-        sim.run_until(Timestamp(state.virtual_ns), &mut frames_buf);
+            let advance_ns = if state.speed == 0.0 {
+                FAST_FORWARD_STEP_NS
+            } else {
+                (elapsed.as_secs_f64() * state.speed * 1_000_000_000.0).round() as u64
+            };
+            state.virtual_ns = state.virtual_ns.saturating_add(advance_ns);
+            sim.run_until(Timestamp(state.virtual_ns), &mut frames_buf);
+        }
         for line in sim.drain_logs() {
             let _ = ev_tx.try_send(EngineEvent::Log(line));
         }
@@ -280,6 +338,9 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
                 time: Timestamp(state.virtual_ns),
                 nodes: sim.node_states(),
             });
+            if let Some(hw) = state.hw.as_ref() {
+                let _ = ev_tx.try_send(EngineEvent::HwStatus(hw.status()));
+            }
             if dropped_batches > 0 {
                 let _ = ev_tx.try_send(EngineEvent::Log(format!(
                     "dropped {dropped_batches} frame batches (consumer too slow)"
@@ -295,6 +356,13 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
     match cmd {
         Command::Load(topology) => match Simulation::new(&topology) {
             Ok(sim) => {
+                state.hw = None;
+                state.paused_at = None;
+                state.realtime_only = topology.buses.iter().any(|b| b.hardware.is_some());
+                if state.realtime_only && state.speed != 1.0 {
+                    state.speed = 1.0;
+                    let _ = ev_tx.try_send(EngineEvent::Log(REALTIME_MSG.into()));
+                }
                 state.sim = Some(sim);
                 state.topology = Some(topology);
                 state.virtual_ns = 0;
@@ -312,6 +380,23 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
         },
         Command::Start => {
             if state.sim.is_some() {
+                if state.realtime_only && state.hw.is_none() {
+                    let opened = state.topology.as_ref().map_or(Ok(None), HwBridge::open);
+                    match opened {
+                        Ok(bridge) => {
+                            if let Some(b) = &bridge {
+                                let _ = ev_tx.try_send(EngineEvent::HwStatus(b.status()));
+                            }
+                            state.hw = bridge;
+                        }
+                        Err(e) => {
+                            let status = closed_status(state.topology.as_ref(), Some(&e));
+                            let _ = ev_tx.try_send(EngineEvent::HwStatus(status));
+                            let _ = ev_tx.try_send(EngineEvent::Error(e));
+                            return true;
+                        }
+                    }
+                }
                 state.run_state = RunState::Running;
                 let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
             } else {
@@ -319,6 +404,11 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
             }
         }
         Command::Stop => {
+            if state.hw.take().is_some() {
+                let status = closed_status(state.topology.as_ref(), None);
+                let _ = ev_tx.try_send(EngineEvent::HwStatus(status));
+            }
+            state.paused_at = None;
             if let Some(topology) = &state.topology {
                 state.sim = Simulation::new(topology).ok();
             }
@@ -330,16 +420,26 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
         Command::Pause => {
             if state.run_state == RunState::Running {
                 state.run_state = RunState::Paused;
+                state.paused_at = Some(Instant::now());
                 let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
             }
         }
         Command::Resume => {
             if state.run_state == RunState::Paused {
+                if let (Some(hw), Some(at)) = (state.hw.as_mut(), state.paused_at.take()) {
+                    hw.shift_epoch(at.elapsed());
+                }
                 state.run_state = RunState::Running;
                 let _ = ev_tx.try_send(EngineEvent::State(state.run_state));
             }
         }
-        Command::SetSpeed(speed) => state.speed = speed.max(0.0),
+        Command::SetSpeed(speed) => {
+            if state.realtime_only && speed != 1.0 {
+                let _ = ev_tx.try_send(EngineEvent::Log(REALTIME_MSG.into()));
+            } else {
+                state.speed = speed.max(0.0);
+            }
+        }
         Command::SendOnce(node, bus, frame) => {
             if let Some(sim) = state.sim.as_mut() {
                 sim.send_once(node, bus, frame);
@@ -474,7 +574,10 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 });
             }
         }
-        Command::Shutdown => return false,
+        Command::Shutdown => {
+            state.hw = None;
+            return false;
+        }
     }
     true
 }

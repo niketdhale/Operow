@@ -42,6 +42,7 @@ pub struct WindowViewer<'a> {
     pub status_log: &'a mut Vec<String>,
     pub bus_stats: &'a HashMap<BusId, LiveBusStats>,
     pub node_states: &'a [NodeErrorInfo],
+    pub hw_status: &'a [operow_engine::HwBusStatus],
     pub run_state: RunState,
     pub faults: &'a mut FaultsState,
     pub runtime: &'a mut RuntimeState,
@@ -382,10 +383,68 @@ impl WindowViewer<'_> {
                             ui.end_row();
                         }
                     });
+                if !self.hw_status.is_empty() {
+                    ui.add_space(12.0);
+                    ui.strong("Hardware buses");
+                    self.hw_status_ui(ui);
+                }
                 if !self.node_states.is_empty() {
                     ui.add_space(12.0);
                     ui.strong("Nodes");
                     self.node_states_ui(ui);
+                }
+            });
+    }
+
+    /// Per hardware bus: interface, link and controller state, TEC/REC,
+    /// frames received and sent, and frames held back by listen-only.
+    fn hw_status_ui(&self, ui: &mut egui::Ui) {
+        let mut rows: Vec<(String, &operow_engine::HwBusStatus)> = self
+            .hw_status
+            .iter()
+            .map(|s| (self.names.bus_name(s.bus), s))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        egui::Grid::new("hw_status_grid")
+            .num_columns(8)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for h in [
+                    "Bus",
+                    "Interface",
+                    "State",
+                    "TEC/REC",
+                    "Rx",
+                    "Tx",
+                    "Listen-only drops",
+                ] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (name, s) in rows {
+                    ui.label(&name);
+                    ui.label(&s.interface);
+                    let (text, ok) = crate::hw_ui::status_chip(s);
+                    let state = match &s.link {
+                        operow_engine::HwLink::Error(e) => format!("error: {e}"),
+                        operow_engine::HwLink::Closed => "closed".to_string(),
+                        operow_engine::HwLink::Open => s.controller.state.label().to_string(),
+                    };
+                    if ok {
+                        ui.label(state);
+                    } else {
+                        ui.colored_label(ERROR_RED, state).on_hover_text(text);
+                    }
+                    ui.label(format!("{}/{}", s.controller.tec, s.controller.rec));
+                    ui.label(s.rx_frames.to_string());
+                    ui.label(s.tx_frames.to_string());
+                    let dropped = self
+                        .bus_stats
+                        .get(&s.bus)
+                        .map_or(0, |b| b.dropped_listen_only);
+                    ui.label(dropped.to_string());
+                    ui.end_row();
                 }
             });
     }

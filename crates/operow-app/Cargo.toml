@@ -21,6 +21,7 @@ operow-uds = { path = "../operow-uds" }
 operow-isotp = { path = "../operow-isotp" }
 operow-log = { path = "../operow-log" }
 operow-engine = { path = "../operow-engine" }
+operow-hw = { path = "../operow-hw" }
 operow-dbc = { path = "../operow-dbc" }
 operow-project = { path = "../operow-project" }
 operow-test = { path = "../operow-test" }
