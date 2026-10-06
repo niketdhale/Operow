@@ -1,18 +1,21 @@
 [package]
 name = "operow-hw"
-description = "CAN hardware abstraction for Operow: driver registry, in-process virtual driver and SocketCAN"
+description = "CAN hardware abstraction for Operow: driver registry, in-process virtual driver, SocketCAN, Vector and PCAN"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["socketcan", "vector"]
+default = ["socketcan", "vector", "pcan"]
 # Linux SocketCAN driver (raw libc sockets, no extra crate). Ignored on
 # other operating systems.
 socketcan = []
 # Vector XL Driver Library driver: logic everywhere, runtime-loaded DLL on
 # Windows only (unavailable elsewhere).
 vector = []
+# PEAK PCAN-Basic driver: logic everywhere, runtime-loaded library on Windows
+# and Linux only (unavailable elsewhere).
+pcan = []
 
 [dependencies]
 operow-core = { workspace = true }
@@ -23,5 +26,5 @@ socket2 = { version = "0.5", features = ["all"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 libloading = "0.8"

@@ -1,8 +1,8 @@
 //! CAN hardware abstraction for Operow.
 //!
 //! A [`Driver`] knows how to list and open channels of one kind of adapter
-//! (`socketcan:can0`, `virtual:bench`, `vector:Virtual Channel 1`; the Vector XL
-//! vendor library is a C library loaded at runtime). An opened channel is a
+//! (`socketcan:can0`, `virtual:bench`, `vector:Virtual Channel 1`, `pcan:PCAN_USBBUS1`; the Vector XL and PEAK
+//! PCAN-Basic vendor libraries are C libraries loaded at runtime). An opened channel is a
 //! `Box<dyn CanChannel>`. [`drivers`] returns the drivers usable on this
 //! operating system and [`open_channel`] opens a channel by its
 //! `driver:channel` name.
@@ -22,6 +22,9 @@ mod socketcan;
 // its DLL loader is Windows-only. Elsewhere the driver is unavailable.
 #[cfg(feature = "vector")]
 mod vector;
+// Same for PCAN-Basic: its loader exists on Windows and Linux only.
+#[cfg(feature = "pcan")]
+mod pcan;
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -34,6 +37,8 @@ pub use udp::{
 };
 pub use virtual_driver::{VirtualDriver, virtual_inject_error};
 
+#[cfg(feature = "pcan")]
+pub use pcan::PcanDriver;
 #[cfg(all(target_os = "linux", feature = "socketcan"))]
 pub use socketcan::SocketCanDriver;
 #[cfg(feature = "vector")]
@@ -180,6 +185,8 @@ pub fn drivers() -> Vec<Box<dyn Driver>> {
     v.push(Box::new(SocketCanDriver));
     #[cfg(feature = "vector")]
     v.push(Box::new(VectorDriver::new()));
+    #[cfg(feature = "pcan")]
+    v.push(Box::new(PcanDriver::new()));
     v.push(Box::new(UdpDriver));
     v.push(Box::new(VirtualDriver));
     v
