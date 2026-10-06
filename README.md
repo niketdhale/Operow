@@ -23,8 +23,12 @@ A CANoe-inspired ECU network simulator for automotive CAN / CAN FD design and te
 - Gateways with routing, ID remapping and delay between buses
 - Send types: Cyclic, Event, OnChange, CyclicIfActive and CyclicAndEvent
 - Rhai scripting (CAPL-like) for ECU behavior, with a live log
-- Interactive generators for raw and DBC-decoded frames
+- Interactive generators for raw frames and DBC-decoded messages and signals
 - Deterministic, event-driven timing
+- Error model: TEC / REC counters, error active / error passive / bus-off states with recovery
+- Fault injection (CRC, ACK, form errors and more) by probability, count or trigger
+- Nodes can be taken online / offline at run time
+- Per-message controls: pause, drop, delay and jitter
 
 ### Analysis
 
@@ -33,7 +37,32 @@ A CANoe-inspired ECU network simulator for automotive CAN / CAN FD design and te
 - Tx/Rx direction shown from the bus point of view
 - DBC decoding of frames and signals
 - Live graphs of DBC, user and raw signals
-- Bus statistics and CSV export
+- Bus statistics, including per-node error states, and CSV export
+
+### Logging & replay
+
+- Record ASC or BLF logs, with start/stop triggers and pre- and post-trigger buffering
+- Offline replay of ASC / BLF logs with seek, speed and loop
+- A Replay node injects a log into a running simulation
+- ASC to BLF and BLF to ASC conversion
+
+### Diagnostics
+
+- ISO-TP (ISO 15765-2) transport and UDS (ISO 14229) services
+- Simulated diagnostic ECUs with sessions, SecurityAccess, DIDs and DTCs
+- Diagnostics console and a DTC view
+- Trace can group ISO-TP segments into whole messages
+
+### Testing & automation
+
+- Rhai test modules run in virtual time, with a Tests window in the app
+- HTML, JUnit and JSON reports
+- `operow-cli` with `test`, `run`, `replay`, `convert` and `diag`, and CI-ready exit codes
+
+### Hardware
+
+- Bind a bus to a real or virtual interface: virtual loopback, UDP between processes, SocketCAN, Vector XL and PCAN-Basic
+- Vector XL and PCAN are tested against mocks only so far, not yet on real devices
 
 ### Workspace
 
@@ -75,6 +104,10 @@ Open them with File > Open.
 - `examples/gateway.operow.json`: Powertrain and Body buses joined by a routing gateway
 - `examples/dbc_demo.operow.json`: DBC-decoded traffic using `examples/sample.dbc`
 - `examples/script.operow.json`: Requester and Responder ECUs driven by Rhai scripts
+- `examples/replay_demo.operow.json`: a Replay node plays `examples/sample_log.asc` in a loop through a gateway onto the Powertrain and Body buses
+- `examples/diag_demo.operow.json`: Engine and Dashboard ECUs with a simulated UDS diagnostic server on the Engine, for the Diagnostics console
+- `examples/tests/`: Rhai test modules (`gateway_tests`, `dbc_tests`, `diag_tests`, `fault_tests`) referenced by the projects above
+- `examples/sample.dbc`, `examples/sample_log.asc` and `examples/sample_log.blf`: sample database and logs used by the examples
 
 ## Testing your network
 
@@ -158,12 +191,20 @@ The workspace consists of the following crates:
 
 ## Roadmap
 
-- Logging & replay
-- Error simulation & node controls
-- ISO-TP / UDS
-- Test sequences & headless CLI
-- Hardware: SocketCAN / PCAN / Vector
+Done:
+
+- ✅ Logging & replay
+- ✅ Error simulation & node controls
+- ✅ ISO-TP / UDS
+- ✅ Test sequences & headless CLI
+- ✅ Hardware interfaces: SocketCAN, PCAN, Vector (PCAN and Vector so far only mock-tested)
+
+Upcoming:
+
 - Ethernet / SOME-IP
+- LIN
+- Panels (user dashboards)
+- Hardware validation on real PCAN and Vector devices
 
 ## License
 
