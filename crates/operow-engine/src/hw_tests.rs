@@ -238,3 +238,40 @@ fn non_realtime_speed_is_rejected_with_hardware() {
     )));
     h.shutdown();
 }
+
+#[test]
+fn hw_status_reports_open_counts_and_closed_after_stop() {
+    let topo = Topology {
+        nodes: vec![],
+        buses: vec![bus(1, Some(binding("eng_status", true)))],
+        ..Default::default()
+    };
+    let mut ext = open_channel(&ChannelConfig::new("virtual:eng_status")).unwrap();
+    let h = Engine::spawn();
+    start(&h, topo);
+    assert!(wait_for(&h, running));
+    ext.send(&CanFrame::new(0x10, false, &[1]).unwrap())
+        .unwrap();
+    let mut seen = None;
+    wait_for(&h, |ev| match ev {
+        EngineEvent::HwStatus(s) if s.iter().any(|b| b.rx_frames > 0) => {
+            seen = Some(s.clone());
+            true
+        }
+        _ => false,
+    });
+    let s = seen.expect("status with rx count");
+    assert_eq!(s[0].interface, "virtual:eng_status");
+    assert_eq!(s[0].link, crate::HwLink::Open);
+    h.cmd.send(Command::Stop).unwrap();
+    let mut closed = false;
+    wait_for(&h, |ev| match ev {
+        EngineEvent::HwStatus(s) => {
+            closed = s.iter().all(|b| b.link == crate::HwLink::Closed);
+            closed
+        }
+        _ => false,
+    });
+    assert!(closed);
+    h.shutdown();
+}

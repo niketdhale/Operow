@@ -199,6 +199,17 @@ pub fn errors_demo_layout() -> Dock {
     dock
 }
 
+/// Network and Properties on top; Trace and Statistics side by side below
+/// (`--demo-hw-udp`, `--demo-hw-confirm`).
+pub fn hw_demo_layout() -> Dock {
+    let mut dock = DockState::new(vec![w(WindowKind::Network)]);
+    let tree = dock.main_surface_mut();
+    let [top, _props] = tree.split_right(NodeIndex::root(), 0.62, vec![w(WindowKind::Properties)]);
+    let [_, bottom] = tree.split_below(top, 0.4, vec![w(WindowKind::Trace), w(WindowKind::Log)]);
+    tree.split_right(bottom, 0.38, vec![w(WindowKind::Statistics)]);
+    dock
+}
+
 /// Network on top; Trace and Log below with Faults to the right of them
 /// (`--demo-faults`, `--demo-busoff`).
 pub fn faults_demo_layout() -> Dock {

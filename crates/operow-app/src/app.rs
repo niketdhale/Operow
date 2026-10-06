@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use operow_core::{BusId, CanErrorKind, DbcRef, Timestamp, Topology};
 use operow_dbc::{BusTarget, Database};
 use operow_engine::{
-    BusStats, CanErrorCounts, Command, Engine, EngineEvent, EngineHandle, GeneratorId, InjectMode,
-    InjectSpec, NodeErrorInfo, RunState,
+    BusStats, CanErrorCounts, Command, Engine, EngineEvent, EngineHandle, GeneratorId, HwBusStatus,
+    InjectMode, InjectSpec, NodeErrorInfo, RunState,
 };
 
 use egui_flow::{EdgeId, PulseShape, PulseStyle};
@@ -15,6 +15,7 @@ use crate::diag_window::{DiagWindow, Step};
 use crate::generator_window::{AutoChange, DbcRow, GenRow, GeneratorWindow, SendMode, SigEdit};
 use crate::graph::{Graph, GraphNode, PulseDir, pulses_for_events};
 use crate::graph_window::{GraphWindow, YAxis};
+use crate::hw_ui::{self, HwBusRef};
 use crate::icons;
 use crate::inspector::Inspector;
 use crate::logging::{
@@ -56,6 +57,7 @@ pub struct LiveBusStats {
     pub dropped_bus_off: u64,
     pub dropped_offline: u64,
     pub dropped_msg_control: u64,
+    pub dropped_listen_only: u64,
 }
 
 /// Options for headless runs / screenshots.
@@ -115,6 +117,18 @@ pub struct StartupOptions {
     /// `--demo-test-editor`: like `--demo-tests`, with the failing module
     /// open in a test editor at the failing line.
     pub demo_test_editor: bool,
+    /// `--demo-hw-udp`: bind the `Body` bus to `udp:operow-demo` (transmit
+    /// allowed) and run an in-process "external ECU" sending 0x200 on it.
+    pub demo_hw_udp: bool,
+    /// `--demo-hw-confirm`: bind `Body` to a fake `socketcan:can0`
+    /// (transmitting) and show the transmit confirmation without starting.
+    pub demo_hw_confirm: bool,
+}
+
+/// Transmit confirmation before Start: the real buses that would transmit.
+struct TxConfirm {
+    buses: Vec<HwBusRef>,
+    dont_ask: bool,
 }
 
 /// In-memory test module of `--demo-tests`: one case fails on purpose.
@@ -298,6 +312,17 @@ pub struct OperowApp {
     demo_faults: bool,
     /// `--demo-busoff`: force `Engine` bus-off on every start.
     demo_busoff: bool,
+
+    /// State of the hardware buses, from the live engine.
+    hw_status: Vec<HwBusStatus>,
+    /// Hardware buses of the running (or last started) measurement.
+    run_hw: Vec<HwBusRef>,
+    /// The open transmit confirmation, if any.
+    tx_confirm: Option<TxConfirm>,
+    /// "Don't ask again" was ticked: Start without confirming.
+    skip_tx_confirm: bool,
+    /// Stops the `--demo-hw-udp` external ECU thread.
+    demo_hw_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OperowApp {
@@ -365,6 +390,11 @@ impl OperowApp {
             demo_errors: false,
             demo_faults: false,
             demo_busoff: false,
+            hw_status: Vec::new(),
+            run_hw: Vec::new(),
+            tx_confirm: None,
+            skip_tx_confirm: false,
+            demo_hw_stop: Default::default(),
         };
         app.sync_instances();
         app
@@ -653,6 +683,18 @@ impl OperowApp {
         }
         if let Some(name) = opts.select.as_deref() {
             self.select_by_name(name);
+        }
+        if opts.demo_hw_udp {
+            self.demo_hw("udp:operow-demo", false);
+            self.spawn_demo_ecu();
+        }
+        if opts.demo_hw_confirm {
+            self.demo_hw("socketcan:can0", false);
+            self.no_start = true;
+            self.tx_confirm = Some(TxConfirm {
+                buses: hw_ui::hw_buses(&self.graph.to_topology()),
+                dont_ask: false,
+            });
         }
     }
 
@@ -1818,12 +1860,33 @@ impl OperowApp {
         }
     }
 
+    /// Start the measurement, asking first when a real hardware bus would
+    /// transmit (see [`hw_ui::confirm_needed`]).
     fn start(&mut self) {
         if self.offline.is_some() {
             self.log("close the offline log to run the simulation");
             return;
         }
+        let buses = hw_ui::hw_buses(&self.graph.to_topology());
+        if hw_ui::confirm_needed(&buses, self.skip_tx_confirm) {
+            self.tx_confirm = Some(TxConfirm {
+                buses,
+                dont_ask: false,
+            });
+            return;
+        }
+        self.start_confirmed(false);
+    }
+
+    /// Start without asking; `listen_only` forces every real hardware bus
+    /// listen-only for this run (the project is not changed).
+    fn start_confirmed(&mut self, listen_only: bool) {
         let mut topo = self.graph.to_topology();
+        if listen_only {
+            hw_ui::force_listen_only(&mut topo);
+        }
+        self.run_hw = hw_ui::hw_buses(&topo);
+        self.hw_status.clear();
         // Replay nodes read their log from the engine thread; hand it
         // paths that do not depend on the working directory.
         let dir = self.project_dir();
@@ -1875,6 +1938,122 @@ impl OperowApp {
             }
         }
         let _ = self.engine.cmd.send(Command::Start);
+    }
+
+    fn tx_confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some(c) = &mut self.tx_confirm else {
+            return;
+        };
+        let names: Vec<String> = hw_ui::transmit_buses(&c.buses)
+            .iter()
+            .map(|b| format!("{} ({})", b.name, b.interface))
+            .collect();
+        let mut choice = None;
+        egui::Window::new("Transmit on real CAN buses?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Operow will transmit on real CAN buses: {}",
+                        names.join(", ")
+                    ))
+                    .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    "Simulated nodes, generators and gateways will put frames on the \
+                     physical bus. Make sure the bitrate matches and nothing safety \
+                     relevant is connected.",
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut c.dont_ask, "Don't ask again for this project session");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Start").clicked() {
+                        choice = Some(Some(false));
+                    }
+                    if ui.button("Start listen-only").clicked() {
+                        choice = Some(Some(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(None);
+                    }
+                });
+            });
+        if let Some(choice) = choice {
+            let dont_ask = c.dont_ask;
+            self.tx_confirm = None;
+            if let Some(listen_only) = choice {
+                self.skip_tx_confirm |= dont_ask;
+                self.start_confirmed(listen_only);
+            }
+        }
+    }
+
+    /// Whether any bus of the project is bound to hardware.
+    fn project_has_hardware(&self) -> bool {
+        self.graph
+            .state
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.data, crate::graph::GraphNode::Bus(b) if b.hardware.is_some()))
+    }
+
+    fn bus_by_name(&self, name: &str) -> Option<egui_flow::NodeId> {
+        self.graph
+            .state
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.data, crate::graph::GraphNode::Bus(b) if b.name == name))
+            .map(|n| n.id)
+    }
+
+    /// `--demo-hw-udp` / `--demo-hw-confirm`: bind `Body` to `interface`.
+    fn demo_hw(&mut self, interface: &str, listen_only: bool) {
+        let Some(id) = self.bus_by_name("Body") else {
+            self.last_error = Some("--demo-hw-*: no bus called Body".into());
+            return;
+        };
+        if let Some(crate::graph::GraphNode::Bus(b)) = self.graph.node_mut(id) {
+            b.hardware = Some(operow_core::HwBinding {
+                interface: interface.into(),
+                listen_only,
+                receive_own: false,
+            });
+        }
+        self.dock = workspace::hw_demo_layout();
+        self.layout_preset = None;
+        self.show_tree = false;
+        self.graph.select(id);
+    }
+
+    /// The `--demo-hw-udp` "external ECU": sends 0x200 every 50 ms on
+    /// `udp:operow-demo` from a thread of this process until the app ends.
+    fn spawn_demo_ecu(&self) {
+        let stop = self.demo_hw_stop.clone();
+        let _ = std::thread::Builder::new()
+            .name("demo-external-ecu".into())
+            .spawn(move || {
+                let mut cfg = operow_hw::ChannelConfig::new("udp:operow-demo");
+                cfg.bitrate = 250_000;
+                let Ok(mut ch) = operow_hw::open_channel(&cfg) else {
+                    return;
+                };
+                let mut n: u8 = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(f) =
+                        operow_core::CanFrame::new(0x200, false, &[0xE0, n, 0, 0, 0, 0, 0, 0])
+                    {
+                        let _ = ch.send(&f);
+                    }
+                    n = n.wrapping_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                ch.close();
+            });
     }
 
     fn stop(&mut self) {
@@ -2088,6 +2267,7 @@ impl OperowApp {
                     entry.dropped_bus_off = stats.dropped_bus_off;
                     entry.dropped_offline = stats.dropped_offline;
                     entry.dropped_msg_control = stats.dropped_msg_control;
+                    entry.dropped_listen_only = stats.dropped_listen_only;
                     entry.prev = stats;
                 }
                 self.prev_stats_time = time;
@@ -2097,6 +2277,7 @@ impl OperowApp {
                 self.runtime.observe(&nodes, std::time::Instant::now());
                 self.node_states = nodes;
             }
+            EngineEvent::HwStatus(status) => self.hw_status = status,
             EngineEvent::State(s) => {
                 let was_stopped = self.run_state == RunState::Stopped;
                 self.run_state = s;
@@ -2473,19 +2654,27 @@ impl OperowApp {
                 0
             };
             let prev_idx = speed_idx;
-            egui::ComboBox::from_id_salt("speed_combo")
-                .selected_text(match speed_idx {
-                    0 => "Real-time x1",
-                    1 => "Real-time x2",
-                    2 => "Real-time x10",
-                    _ => "As fast as possible",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut speed_idx, 0, "Real-time x1");
-                    ui.selectable_value(&mut speed_idx, 1, "Real-time x2");
-                    ui.selectable_value(&mut speed_idx, 2, "Real-time x10");
-                    ui.selectable_value(&mut speed_idx, 3, "As fast as possible");
-                });
+            let has_hw = self.project_has_hardware();
+            if has_hw {
+                speed_idx = 0;
+            }
+            ui.add_enabled_ui(!has_hw, |ui| {
+                egui::ComboBox::from_id_salt("speed_combo")
+                    .selected_text(match speed_idx {
+                        0 => "Real-time x1",
+                        1 => "Real-time x2",
+                        2 => "Real-time x10",
+                        _ => "As fast as possible",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut speed_idx, 0, "Real-time x1");
+                        ui.selectable_value(&mut speed_idx, 1, "Real-time x2");
+                        ui.selectable_value(&mut speed_idx, 2, "Real-time x10");
+                        ui.selectable_value(&mut speed_idx, 3, "As fast as possible");
+                    });
+            })
+            .response
+            .on_disabled_hover_text("Hardware buses run in real time only (x1)");
             if speed_idx != prev_idx {
                 self.speed = match speed_idx {
                     0 => 1.0,
@@ -2641,6 +2830,12 @@ impl OperowApp {
             buses.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, load) in buses {
                 ui.label(format!("{name}: {load:.1}%"));
+                ui.separator();
+            }
+            let mut hw: Vec<_> = self.hw_status.iter().collect();
+            hw.sort_by_key(|s| s.bus.0);
+            for s in hw {
+                hw_ui::status_chip_ui(ui, s, &self.names.bus_name(s.bus));
                 ui.separator();
             }
 
@@ -2807,6 +3002,13 @@ impl OperowApp {
     }
 }
 
+impl Drop for OperowApp {
+    fn drop(&mut self) {
+        self.demo_hw_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl eframe::App for OperowApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.save(storage);
@@ -2863,6 +3065,14 @@ impl eframe::App for OperowApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.top_bar(ui);
         });
+
+        if self.run_state != RunState::Stopped
+            && let Some(b) = hw_ui::banner(&self.run_hw)
+        {
+            egui::TopBottomPanel::top("hw_banner").show(ctx, |ui| {
+                hw_ui::banner_ui(ui, &b);
+            });
+        }
 
         if self.offline.is_some() {
             egui::TopBottomPanel::top("replay_bar").show(ctx, |ui| {
@@ -2938,6 +3148,7 @@ impl eframe::App for OperowApp {
                     status_log: &mut self.status_log,
                     bus_stats: &self.bus_stats,
                     node_states: &self.node_states,
+                    hw_status: &self.hw_status,
                     run_state: self.run_state,
                     faults: &mut self.faults,
                     runtime: &mut self.runtime,
@@ -2979,6 +3190,7 @@ impl eframe::App for OperowApp {
         self.open_log_dialog_ui(ctx);
         self.new_signal_dialog_ui(ctx);
         self.new_test_dialog_ui(ctx);
+        self.tx_confirm_ui(ctx);
         self.take_screenshot_if_needed(ctx);
 
         if let Some(path) = self.screenshot_path.clone() {

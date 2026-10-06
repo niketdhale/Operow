@@ -1782,6 +1782,14 @@ pub struct DiagTarget {
     pub cfg: operow_core::DiagConfig,
 }
 
+/// The bus whose real hardware the virtual sender `id` stands for (see
+/// `operow_engine::hw_node`).
+pub fn hw_bus_of(id: NodeId) -> Option<BusId> {
+    (operow_engine::HW_NODE_BASE..operow_engine::TESTER_NODE_BASE)
+        .contains(&id.0)
+        .then(|| BusId(id.0 - operow_engine::HW_NODE_BASE))
+}
+
 impl NameLookup {
     pub fn rebuild(&mut self, topo: &operow_core::Topology) {
         self.node_names.clear();
@@ -1830,6 +1838,10 @@ impl NameLookup {
     pub fn node_name(&self, id: NodeId) -> String {
         if let Some(ch) = crate::replay::log_channel(id) {
             return format!("Log ch{ch}");
+        }
+        // Frames that arrived from a real bus.
+        if let Some(bus) = hw_bus_of(id) {
+            return format!("HW {}", self.bus_name(bus));
         }
         // Virtual diagnostic testers (below the log channel ids).
         if (operow_engine::TESTER_NODE_BASE..crate::replay::LOG_NODE_BASE).contains(&id.0) {
@@ -1886,6 +1898,17 @@ impl NameLookup {
 mod tests {
     use super::*;
     use operow_core::Timestamp;
+
+    #[test]
+    fn hardware_senders_are_named_after_their_bus() {
+        let mut names = NameLookup::default();
+        names.bus_names.insert(BusId(2), "Body".into());
+        let id = operow_engine::hw_node(BusId(2));
+        assert_eq!(hw_bus_of(id), Some(BusId(2)));
+        assert_eq!(names.node_name(id), "HW Body");
+        assert_eq!(hw_bus_of(NodeId(5)), None);
+        assert_eq!(hw_bus_of(NodeId(operow_engine::TESTER_NODE_BASE)), None);
+    }
 
     fn ev(bus: u32, id: u32, dir: Direction, t_ms: u64, data: &[u8]) -> BusEvent {
         BusEvent {

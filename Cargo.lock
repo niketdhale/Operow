@@ -2539,6 +2539,7 @@ dependencies = [
  "operow-core",
  "operow-dbc",
  "operow-engine",
+ "operow-hw",
  "operow-isotp",
  "operow-log",
  "operow-project",

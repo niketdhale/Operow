@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use operow_core::{BusEvent, BusId, CanFrame, NodeId, Timestamp, Topology};
 
 use crate::ecu::EcuCommand;
-use crate::hw::{HwBridge, HwNotice};
+use crate::hw::{HwBridge, HwBusStatus, HwLink, HwNotice};
 use crate::sim::{
     BusStats, GeneratorId, InjectSpec, MsgControl, NodeErrorInfo, SimError, Simulation,
 };
@@ -133,6 +133,10 @@ pub enum EngineEvent {
         resp: Result<Vec<u8>, String>,
         elapsed_ms: f64,
     },
+    /// State of every hardware bus (empty when the topology has none or the
+    /// measurement is stopped); sent right after each `Stats`, and when the
+    /// channels open, fail to open or close.
+    HwStatus(Vec<HwBusStatus>),
     State(RunState),
     Log(String),
     Error(String),
@@ -215,6 +219,27 @@ fn send_notices(notices: Vec<HwNotice>, ev_tx: &Sender<EngineEvent>) {
             HwNotice::Error(e) => EngineEvent::Error(e),
         });
     }
+}
+
+/// Status of the hardware buses of `topology` while no channel is open:
+/// `Closed`, or `Error(why)` when opening failed.
+fn closed_status(topology: Option<&Topology>, error: Option<&str>) -> Vec<HwBusStatus> {
+    topology
+        .into_iter()
+        .flat_map(|t| &t.buses)
+        .filter_map(|b| {
+            let hw = b.hardware.as_ref()?;
+            Some(HwBusStatus {
+                bus: b.id,
+                interface: hw.interface.clone(),
+                listen_only: hw.listen_only,
+                link: error.map_or(HwLink::Closed, |e| HwLink::Error(e.to_string())),
+                controller: Default::default(),
+                rx_frames: 0,
+                tx_frames: 0,
+            })
+        })
+        .collect()
 }
 
 fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
@@ -313,6 +338,9 @@ fn engine_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<EngineEvent>) {
                 time: Timestamp(state.virtual_ns),
                 nodes: sim.node_states(),
             });
+            if let Some(hw) = state.hw.as_ref() {
+                let _ = ev_tx.try_send(EngineEvent::HwStatus(hw.status()));
+            }
             if dropped_batches > 0 {
                 let _ = ev_tx.try_send(EngineEvent::Log(format!(
                     "dropped {dropped_batches} frame batches (consumer too slow)"
@@ -355,8 +383,15 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
                 if state.realtime_only && state.hw.is_none() {
                     let opened = state.topology.as_ref().map_or(Ok(None), HwBridge::open);
                     match opened {
-                        Ok(bridge) => state.hw = bridge,
+                        Ok(bridge) => {
+                            if let Some(b) = &bridge {
+                                let _ = ev_tx.try_send(EngineEvent::HwStatus(b.status()));
+                            }
+                            state.hw = bridge;
+                        }
                         Err(e) => {
+                            let status = closed_status(state.topology.as_ref(), Some(&e));
+                            let _ = ev_tx.try_send(EngineEvent::HwStatus(status));
                             let _ = ev_tx.try_send(EngineEvent::Error(e));
                             return true;
                         }
@@ -369,7 +404,10 @@ fn handle_command(cmd: Command, state: &mut EngineState, ev_tx: &Sender<EngineEv
             }
         }
         Command::Stop => {
-            state.hw = None;
+            if state.hw.take().is_some() {
+                let status = closed_status(state.topology.as_ref(), None);
+                let _ = ev_tx.try_send(EngineEvent::HwStatus(status));
+            }
             state.paused_at = None;
             if let Some(topology) = &state.topology {
                 state.sim = Simulation::new(topology).ok();

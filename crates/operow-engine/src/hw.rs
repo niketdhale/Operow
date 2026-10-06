@@ -31,6 +31,33 @@ pub enum HwNotice {
     Error(String),
 }
 
+/// Whether a hardware bus's channel is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HwLink {
+    /// Opened and serviced by its worker.
+    Open,
+    /// Not open (the measurement is stopped).
+    Closed,
+    /// Could not be opened, or failed while running.
+    Error(String),
+}
+
+/// Live state of one hardware bus, reported with every statistics update
+/// (see `EngineEvent::HwStatus`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HwBusStatus {
+    pub bus: BusId,
+    pub interface: String,
+    pub listen_only: bool,
+    pub link: HwLink,
+    /// Controller fault-confinement state and counters, as last polled.
+    pub controller: HwBusState,
+    /// Frames received from the real bus (echoes excluded).
+    pub rx_frames: u64,
+    /// Frames handed to the adapter for transmission.
+    pub tx_frames: u64,
+}
+
 enum WorkerMsg {
     Rx(BusId, RxFrame, Instant),
     State(BusId, HwBusState),
@@ -46,6 +73,12 @@ struct Worker {
     thread: Option<JoinHandle<()>>,
     state: NodeErrorState,
     dead: bool,
+    interface: String,
+    listen_only: bool,
+    controller: HwBusState,
+    error: Option<String>,
+    rx_frames: u64,
+    tx_frames: u64,
 }
 
 /// Opened hardware channels of a topology and their worker threads. Dropping
@@ -92,6 +125,12 @@ impl HwBridge {
                 thread: Some(thread),
                 state: NodeErrorState::ErrorActive,
                 dead: false,
+                interface: hw.interface.clone(),
+                listen_only: hw.listen_only,
+                controller: HwBusState::default(),
+                error: None,
+                rx_frames: 0,
+                tx_frames: 0,
             });
         }
         if workers.is_empty() {
@@ -136,10 +175,16 @@ impl HwBridge {
                     if rx.is_echo {
                         continue; // recorded when it was sent
                     }
+                    if let Some(w) = self.worker_mut(bus) {
+                        w.rx_frames += 1;
+                    }
                     let at_ns = at.saturating_duration_since(self.epoch).as_nanos() as u64;
                     sim.hw_rx(bus, rx.frame, at_ns.min(now), rx.error);
                 }
                 WorkerMsg::State(bus, st) => {
+                    if let Some(w) = self.worker_mut(bus) {
+                        w.controller = st;
+                    }
                     if let Some(w) = self.worker_mut(bus)
                         && w.state != st.state
                     {
@@ -161,6 +206,7 @@ impl HwBridge {
                 WorkerMsg::Failed(bus, e) => {
                     if let Some(w) = self.worker_mut(bus) {
                         w.dead = true;
+                        w.error = Some(e.clone());
                         notices.push(HwNotice::Error(format!("{}: {e}", w.label)));
                     }
                 }
@@ -171,10 +217,30 @@ impl HwBridge {
             if let Some(w) = self.worker_mut(bus)
                 && !w.dead
             {
+                w.tx_frames += 1;
                 let _ = w.tx.send(frame);
             }
         }
         (now, notices)
+    }
+
+    /// Live state of every hardware bus.
+    pub fn status(&self) -> Vec<HwBusStatus> {
+        self.workers
+            .iter()
+            .map(|w| HwBusStatus {
+                bus: w.bus,
+                interface: w.interface.clone(),
+                listen_only: w.listen_only,
+                link: match &w.error {
+                    Some(e) => HwLink::Error(e.clone()),
+                    None => HwLink::Open,
+                },
+                controller: w.controller,
+                rx_frames: w.rx_frames,
+                tx_frames: w.tx_frames,
+            })
+            .collect()
     }
 
     /// Stop the workers and close the channels.

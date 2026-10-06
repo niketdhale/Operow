@@ -34,6 +34,8 @@ pub struct Inspector {
     project_dir: Option<std::path::PathBuf>,
     replay_channels:
         std::collections::HashMap<FlowId, (std::path::PathBuf, Result<Vec<u8>, String>)>,
+    /// Adapters found by the last scan, for the bus Connection section.
+    hw_groups: Option<Vec<crate::hw_ui::DriverGroup>>,
 }
 
 /// Send-type discriminant without its parameters, for the combo box.
@@ -263,6 +265,7 @@ impl Inspector {
                             );
                         });
                     });
+                    crate::hw_ui::connection_ui(ui, sel, bus, &mut self.hw_groups);
                 });
             }
             GraphNode::Ecu(ecu) => {

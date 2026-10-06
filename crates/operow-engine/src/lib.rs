@@ -14,7 +14,7 @@ mod timing;
 pub use diag::DiagEcu;
 pub use ecu::{Ecu, EcuCommand, EcuCtx, FrameMeta, PeriodicEcu};
 pub use gateway::GatewayEcu;
-pub use hw::{HwBridge, HwNotice};
+pub use hw::{HwBridge, HwBusStatus, HwLink, HwNotice};
 pub use replay::{LARGE_LOG_RECORDS, ReplayEcu};
 pub use runner::{Command, Engine, EngineEvent, EngineHandle, RunState};
 pub use script::{ScriptEcu, check_script};
