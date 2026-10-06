@@ -136,7 +136,9 @@ A bus can be bound to a real CAN adapter (`"hardware": {"interface": "socketcan:
   For testing without hardware: `sudo modprobe vcan; sudo ip link add dev vcan0 type vcan; sudo ip link set up vcan0`, then `cargo test -p operow-hw -- --ignored`.
 - **`virtual:<name>`**: in-process loopback, all platforms (tests, demos).
 - **`udp:<name>`**: connects Operow processes on one machine over loopback multicast (no admin rights; works on Windows). The datagram format is documented in `crates/operow-hw/src/udp.rs`.
-- PCAN and Vector XL drivers are planned.
+- **Vector XL (Windows).** `vector:<channel name>` (e.g. `vector:VN1630 Channel 1`, `vector:Virtual Channel 1`) or `vector:<channelIndex>`; the names are listed in the interface chooser. The XL Driver Library (`vxlapi64.dll`) is loaded at run time, so Operow starts without it and the driver just reports itself unavailable. Classic and CAN FD (FD needs a channel with FD support); Operow sets the bitrate, and listen-only selects the controller's silent mode (the default). If another application holds init access to the channel, Operow still opens it but cannot set the bitrate (the channel description says so). Vector virtual channels count as virtual in the app (no LIVE warning).
+  **Testing without hardware:** install *Vector Driver Setup* (it includes the XL Driver Library and the virtual CAN channels, "Virtual Channel 1/2" and so on), then bind one bus to `vector:Virtual Channel 1` and run a second tool, or a second Operow bus bound to `vector:Virtual Channel 2`, against the other end. **Status: tested only against a mock, never with the real library or hardware; please report issues.** The mock tests run everywhere: `cargo test -p operow-hw vector`.
+- PCAN driver is planned.
 
 ## Architecture
 

@@ -78,6 +78,7 @@ impl Driver for VirtualDriver {
                 name: format!("{DRIVER}:{n}"),
                 description: "In-process virtual bus".into(),
                 fd_capable: true,
+                is_virtual: true,
             })
             .collect()
     }
@@ -195,6 +196,7 @@ impl CanChannel for VirtualChannel {
             name: format!("{DRIVER}:{}", self.name),
             description: "In-process virtual bus".into(),
             fd_capable: true,
+            is_virtual: true,
         }
     }
 }

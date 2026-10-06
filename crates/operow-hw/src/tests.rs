@@ -108,6 +108,8 @@ fn registry() {
     let names: Vec<String> = drivers().iter().map(|d| d.name().to_string()).collect();
     assert!(names.contains(&"virtual".to_string()));
     assert!(names.contains(&"udp".to_string()));
+    #[cfg(feature = "vector")]
+    assert!(names.contains(&"vector".to_string()));
     #[cfg(all(target_os = "linux", feature = "socketcan"))]
     assert!(names.contains(&"socketcan".to_string()));
     assert!(driver("virtual").is_some());

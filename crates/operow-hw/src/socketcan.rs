@@ -101,6 +101,7 @@ impl Driver for SocketCanDriver {
                     name: format!("{DRIVER}:{name}"),
                     description: format!("SocketCAN interface {name}"),
                     fd_capable: mtu >= CANFD_MTU,
+                    is_virtual: false,
                 })
             })
             .collect();
@@ -423,6 +424,7 @@ impl CanChannel for SocketCanChannel {
             name: format!("{DRIVER}:{}", self.name),
             description: format!("SocketCAN interface {}", self.name),
             fd_capable: self.fd_mode,
+            is_virtual: false,
         }
     }
 }

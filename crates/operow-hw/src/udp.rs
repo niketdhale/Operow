@@ -204,6 +204,7 @@ impl Driver for UdpDriver {
             name: "udp:operow0".into(),
             description: "Cross-process virtual bus; use any name: udp:<bus-name>".into(),
             fd_capable: true,
+            is_virtual: true,
         }]
     }
 
@@ -339,6 +340,7 @@ impl CanChannel for UdpChannel {
             name: format!("{DRIVER}:{}", self.name),
             description: format!("UDP virtual bus {}", self.name),
             fd_capable: self.fd,
+            is_virtual: true,
         }
     }
 }

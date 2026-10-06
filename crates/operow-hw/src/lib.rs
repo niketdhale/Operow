@@ -1,8 +1,8 @@
 //! CAN hardware abstraction for Operow.
 //!
 //! A [`Driver`] knows how to list and open channels of one kind of adapter
-//! (`socketcan:can0`, `virtual:bench`, later PCAN and Vector XL, whose vendor
-//! libraries are C libraries loaded at runtime). An opened channel is a
+//! (`socketcan:can0`, `virtual:bench`, `vector:Virtual Channel 1`; the Vector XL
+//! vendor library is a C library loaded at runtime). An opened channel is a
 //! `Box<dyn CanChannel>`. [`drivers`] returns the drivers usable on this
 //! operating system and [`open_channel`] opens a channel by its
 //! `driver:channel` name.
@@ -18,6 +18,11 @@ mod virtual_driver;
 #[cfg(all(target_os = "linux", feature = "socketcan"))]
 mod socketcan;
 
+// The driver logic compiles everywhere (it is tested against a mock); only
+// its DLL loader is Windows-only. Elsewhere the driver is unavailable.
+#[cfg(feature = "vector")]
+mod vector;
+
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -31,6 +36,8 @@ pub use virtual_driver::{VirtualDriver, virtual_inject_error};
 
 #[cfg(all(target_os = "linux", feature = "socketcan"))]
 pub use socketcan::SocketCanDriver;
+#[cfg(feature = "vector")]
+pub use vector::VectorDriver;
 
 /// How to open a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +94,9 @@ pub struct ChannelInfo {
     pub name: String,
     pub description: String,
     pub fd_capable: bool,
+    /// The channel never touches a vehicle bus: the virtual and UDP drivers
+    /// and virtual channels of adapter drivers (e.g. Vector virtual channels).
+    pub is_virtual: bool,
 }
 
 /// A frame (or error frame) received from hardware.
@@ -168,6 +178,8 @@ pub fn drivers() -> Vec<Box<dyn Driver>> {
     let mut v: Vec<Box<dyn Driver>> = Vec::new();
     #[cfg(all(target_os = "linux", feature = "socketcan"))]
     v.push(Box::new(SocketCanDriver));
+    #[cfg(feature = "vector")]
+    v.push(Box::new(VectorDriver::new()));
     v.push(Box::new(UdpDriver));
     v.push(Box::new(VirtualDriver));
     v

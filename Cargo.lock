@@ -2604,6 +2604,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
+ "libloading",
  "operow-core",
  "socket2",
  "thiserror 2.0.21",

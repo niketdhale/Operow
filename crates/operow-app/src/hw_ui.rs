@@ -3,6 +3,9 @@
 //! confirmation and the status texts. The helpers are pure so they can be
 //! tested without a display.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use operow_core::{CanBusConfig, HwBinding, Topology};
 use operow_engine::{HwBusStatus, HwLink};
 use operow_hw::ChannelInfo;
@@ -17,9 +20,35 @@ pub fn driver_of(interface: &str) -> &str {
     interface.split_once(':').map_or(interface, |(d, _)| d)
 }
 
+/// Interfaces the last scan reported as virtual (`ChannelInfo::is_virtual`),
+/// e.g. Vector virtual channels.
+static VIRTUAL_INTERFACES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Remembers which of `channels` are virtual, replacing the previous scan.
+pub fn remember_virtual(channels: &[ChannelInfo]) {
+    let set = channels
+        .iter()
+        .filter(|c| c.is_virtual)
+        .map(|c| c.name.clone())
+        .collect();
+    if let Ok(mut g) = VIRTUAL_INTERFACES.lock() {
+        *g = Some(set);
+    }
+}
+
 /// Whether `interface` is a real adapter (SocketCAN, PCAN, Vector, ...) as
-/// opposed to the `udp` and `virtual` drivers, which never touch a vehicle.
+/// opposed to virtual ones that never touch a vehicle. Channels of the last
+/// scan are classified by `ChannelInfo::is_virtual`; names typed in by hand
+/// (`udp:anything`) fall back on the `udp` / `virtual` prefixes.
 pub fn is_real_interface(interface: &str) -> bool {
+    if VIRTUAL_INTERFACES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(interface)))
+        .unwrap_or(false)
+    {
+        return false;
+    }
     !matches!(driver_of(interface).trim(), "udp" | "virtual" | "")
 }
 
@@ -261,6 +290,7 @@ pub fn scan_drivers() -> Vec<DriverGroup> {
         .map(|d| (d.name().to_string(), d.available()))
         .collect();
     let channels = operow_hw::list_all_channels();
+    remember_virtual(&channels);
     group_channels(&status, &channels)
 }
 
@@ -279,11 +309,7 @@ pub fn connection_ui(
         if ui.radio_value(&mut hardware, false, "Simulated").clicked() {
             bus.hardware = None;
         }
-        if ui
-            .radio_value(&mut hardware, true, "Hardware radio")
-            .clicked()
-            && bus.hardware.is_none()
-        {
+        if ui.radio_value(&mut hardware, true, "Hardware").clicked() && bus.hardware.is_none() {
             bus.hardware = Some(HwBinding::new(""));
         }
     });
@@ -417,6 +443,22 @@ mod tests {
         assert!(is_real_interface("vector:0"));
         assert!(!is_real_interface("udp:bus"));
         assert!(!is_real_interface("virtual:x"));
+        // A scanned virtual channel of an adapter driver is not real.
+        let vch = |name: &str, is_virtual| ChannelInfo {
+            driver: "vector".into(),
+            name: name.into(),
+            description: String::new(),
+            fd_capable: true,
+            is_virtual,
+        };
+        assert!(is_real_interface("vector:Virtual Channel 1"));
+        remember_virtual(&[
+            vch("vector:Virtual Channel 1", true),
+            vch("vector:VN1630 Channel 1", false),
+        ]);
+        assert!(!is_real_interface("vector:Virtual Channel 1"));
+        assert!(is_real_interface("vector:VN1630 Channel 1"));
+        remember_virtual(&[]);
         assert!(!driver_sets_bitrate("socketcan:can0"));
         assert!(driver_sets_bitrate("pcan:USB1"));
         assert_eq!(short_name("socketcan:can0"), "can0");
@@ -499,6 +541,7 @@ mod tests {
             name: n.into(),
             description: String::new(),
             fd_capable: false,
+            is_virtual: d == "virtual",
         };
         let drivers = vec![
             ("socketcan".to_string(), Err("no".to_string())),
