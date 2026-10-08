@@ -214,7 +214,7 @@ impl Inspector {
         let Some(key) = graph.wire_key(edge) else {
             return;
         };
-        let mut style = graph.wire_styles.get(&key).cloned().unwrap_or_default();
+        let mut style = graph.wire_style(key);
         ui.strong("Wire");
         let changed = ui
             .add_enabled_ui(!running, |ui| {
@@ -228,6 +228,9 @@ impl Inspector {
             .inner;
         if changed {
             graph.set_wire_style(key, style);
+        }
+        if crate::wire_ui::edit_finished(ui, changed) {
+            graph.editor.commit(&graph.state);
         }
     }
 

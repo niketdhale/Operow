@@ -119,7 +119,7 @@ impl Reconnect {
 /// `NodeId`/`BusId` values for new nodes. The selection lives in the flow
 /// state, so the properties inspector reads it from there.
 pub struct Graph {
-    pub state: FlowState<GraphNode, ()>,
+    pub state: FlowState<GraphNode, WireStyle>,
     next_node_id: u32,
     next_bus_id: u32,
     /// DBC files referenced by the project; round-tripped through the
@@ -142,10 +142,8 @@ pub struct Graph {
     bus_domain: Vec<(FlowId, FlowId)>,
     /// Style of every wire without an override of its own.
     pub wire_default: Option<WireStyle>,
-    /// Per-wire overrides, by the simulation ids of the link.
-    pub wire_styles: HashMap<(NodeId, BusId), WireStyle>,
     /// Undo/redo history and clipboard of the canvas.
-    pub editor: Editor<GraphNode, ()>,
+    pub editor: Editor<GraphNode, WireStyle>,
 }
 
 impl Graph {
@@ -167,7 +165,6 @@ impl Graph {
             next_domain_id: 1,
             bus_domain: Vec::new(),
             wire_default: None,
-            wire_styles: HashMap::new(),
         }
     }
 
@@ -214,7 +211,7 @@ impl Graph {
         }
 
         for ecu in [engine, brake, gateway] {
-            g.state.connect(ecu, bus, ());
+            g.state.connect(ecu, bus, Default::default());
         }
         g.capture_active();
         g.view = NetworkView::BusLine;
@@ -303,7 +300,7 @@ impl Graph {
         }
         for bus in wanted.difference(&have) {
             if let Some(target) = bus_flow(self, *bus) {
-                self.state.connect(id, target, ());
+                self.state.connect(id, target, Default::default());
                 changed = true;
             }
         }
@@ -428,13 +425,11 @@ impl Graph {
         }
 
         let mut wires: Vec<WireOverride> = self
-            .wire_styles
-            .iter()
-            .filter(|(k, s)| !s.is_empty() && links.iter().any(|l| (l.node, l.bus) == **k))
-            .map(|(&(node, bus), style)| WireOverride {
-                node,
-                bus,
-                style: style.clone(),
+            .wire_map()
+            .into_iter()
+            .filter_map(|((node, bus), id)| {
+                let style = self.state.edge(id)?.data.clone();
+                (!style.is_empty()).then_some(WireOverride { node, bus, style })
             })
             .collect();
         wires.sort_by_key(|w| (w.bus, w.node));
@@ -501,11 +496,6 @@ impl Graph {
         g.user_signals = topo.user_signals.clone();
         g.tests = topo.tests.clone();
         g.wire_default = topo.wire_default.clone();
-        g.wire_styles = topo
-            .wires
-            .iter()
-            .map(|w| ((w.node, w.bus), w.style.clone()))
-            .collect();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 
@@ -524,8 +514,11 @@ impl Graph {
         }
         for link in &topo.links {
             if let (Some(&ecu), Some(&bus)) = (ecu_map.get(&link.node), bus_map.get(&link.bus)) {
-                g.state.connect(ecu, bus, ());
+                g.state.connect(ecu, bus, Default::default());
             }
+        }
+        for w in &topo.wires {
+            g.set_wire_style((w.node, w.bus), w.style.clone());
         }
         let mut dom_map = HashMap::new();
         for d in &topo.domains {
@@ -969,13 +962,34 @@ impl Graph {
         }
     }
 
-    /// Store `style` as the override of a wire (an empty one removes it).
+    /// The override of a wire (empty when it has none).
+    pub fn wire_style(&self, key: (NodeId, BusId)) -> WireStyle {
+        let edge = self
+            .wire_map()
+            .get(&key)
+            .and_then(|&id| self.state.edge(id));
+        edge.map(|e| e.data.clone()).unwrap_or_default()
+    }
+
+    /// Store `style` as the override of a wire, in its edge so that undo
+    /// covers it. Does not record history; call `editor.commit` when the
+    /// edit is finished.
     pub fn set_wire_style(&mut self, key: (NodeId, BusId), style: WireStyle) {
-        if style.is_empty() {
-            self.wire_styles.remove(&key);
-        } else {
-            self.wire_styles.insert(key, style);
+        if let Some(e) = self
+            .wire_map()
+            .get(&key)
+            .and_then(|&id| self.state.edge_mut(id))
+        {
+            e.data = style;
         }
+    }
+
+    /// Drop every per-wire override and record one history step.
+    pub fn clear_wire_styles(&mut self) {
+        for e in &mut self.state.edges {
+            e.data = WireStyle::default();
+        }
+        self.editor.commit(&self.state);
     }
 
     // ---- per-frame upkeep ----------------------------------------------
@@ -1024,7 +1038,7 @@ impl Graph {
             NetworkView::BusLine => network_view::plan_bus_line(&self.state),
             NetworkView::FreeForm => HandlePlan::default(),
         };
-        let looks: Vec<(EdgeId, EdgeLook, (NodeId, BusId))> = self
+        let looks: Vec<(EdgeId, EdgeLook)> = self
             .state
             .edges
             .iter()
@@ -1034,10 +1048,10 @@ impl Graph {
                 else {
                     return None;
                 };
-                Some((e.id, network_view::edge_look(ecu, bus.id), (ecu.id, bus.id)))
+                Some((e.id, network_view::edge_look(ecu, bus.id)))
             })
             .collect();
-        for (id, look, key) in looks {
+        for (id, look) in looks {
             let handles = plan
                 .edges
                 .get(&id)
@@ -1068,9 +1082,7 @@ impl Graph {
                 color: Some(theme.gateway_color()),
                 background: None,
             };
-            if let Some(style) =
-                resolved_wire_style(self.wire_styles.get(&key), self.wire_default.as_ref())
-            {
+            if let Some(style) = resolved_wire_style(Some(&e.data), self.wire_default.as_ref()) {
                 apply_wire_style(e, &style);
             }
         }
@@ -1294,7 +1306,7 @@ impl Graph {
     /// Apply a frame's canvas events: keep the topology consistent with
     /// wires the user drew or moved, then record history and run the
     /// undo/redo/copy/paste shortcuts. Returns log lines to show.
-    pub fn process_events(&mut self, events: &[FlowEvent<GraphNode, ()>]) -> Vec<String> {
+    pub fn process_events(&mut self, events: &[FlowEvent<GraphNode, WireStyle>]) -> Vec<String> {
         let mut log = Vec::new();
         let mut kept = Vec::with_capacity(events.len());
         for ev in events {
@@ -1355,7 +1367,7 @@ pub fn resolved_wire_style(
 }
 
 /// Write the fields `style` sets into `edge`, leaving the rest as they are.
-pub fn apply_wire_style(edge: &mut Edge<()>, style: &WireStyle) {
+pub fn apply_wire_style(edge: &mut Edge<WireStyle>, style: &WireStyle) {
     if let Some(k) = style.kind {
         edge.kind = Some(match k {
             WireKind::Bezier => EdgeKind::Bezier,
@@ -1559,7 +1571,7 @@ pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String
     format!("{}{hw} \u{b7} {rate} \u{b7} {load}{err}", b.name)
 }
 
-impl FlowViewer<GraphNode, ()> for GraphViewer {
+impl FlowViewer<GraphNode, WireStyle> for GraphViewer {
     fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
         if let GraphNode::Domain(d) = &node.data {
             // Room on the right for the collapse toggle the canvas draws.
@@ -1806,7 +1818,7 @@ mod tests {
             e.tx.push(tx("A", 1, 10, &[1]));
             e.script = Some("x".into());
         }
-        g.state.connect(ecu, b1, ()).unwrap();
+        g.state.connect(ecu, b1, Default::default()).unwrap();
         (g, ecu, b1, b2, ecu)
     }
 
@@ -1835,8 +1847,8 @@ mod tests {
                 }],
             };
         }
-        g.state.connect(ecu, bus, ()).unwrap();
-        g.state.connect(gw, bus, ()).unwrap();
+        g.state.connect(ecu, bus, Default::default()).unwrap();
+        g.state.connect(gw, bus, Default::default()).unwrap();
         g.state.select_all();
         assert!(g.copy());
         assert!(g.paste());
@@ -1918,7 +1930,7 @@ mod tests {
     #[test]
     fn reconnect_to_a_non_bus_or_duplicate_is_reverted() {
         let (mut g, ecu, b1, b2, _) = wired_graph();
-        g.state.connect(ecu, b2, ()).unwrap();
+        g.state.connect(ecu, b2, Default::default()).unwrap();
         let edge = g.state.edges[0].id;
         let old = g.state.edge(edge).unwrap().connection();
         g.state.edge_mut(edge).unwrap().target = b2;
@@ -2052,10 +2064,10 @@ mod tests {
         let shared = g.add_ecu(Pos2::new(100.0, -100.0), "Shared");
         let gw = g.add_gateway(Pos2::new(200.0, -100.0));
         let loose = g.add_ecu(Pos2::new(300.0, -100.0), "Loose");
-        g.state.connect(a, b1, ()).unwrap();
-        g.state.connect(shared, b1, ()).unwrap();
-        g.state.connect(shared, b2, ()).unwrap();
-        g.state.connect(gw, b1, ()).unwrap();
+        g.state.connect(a, b1, Default::default()).unwrap();
+        g.state.connect(shared, b1, Default::default()).unwrap();
+        g.state.connect(shared, b2, Default::default()).unwrap();
+        g.state.connect(gw, b1, Default::default()).unwrap();
         assert_eq!(g.per_bus_groups(), vec![("CAN1".to_string(), vec![a])]);
         assert_eq!(g.create_domains_per_bus(), 1);
         assert!(g.state.node(a).unwrap().parent.is_some());
@@ -2135,10 +2147,30 @@ mod tests {
         let topo = g.to_topology();
         assert_eq!(topo.wires.len(), 1, "style of a missing link is dropped");
         let g2 = Graph::from_topology(&topo);
-        assert_eq!(g2.wire_styles.get(&(link.node, link.bus)), Some(&style));
+        assert_eq!(g2.wire_style((link.node, link.bus)), style);
         assert_eq!(g2.wire_default, g.wire_default);
         g.set_wire_style((link.node, link.bus), WireStyle::default());
         assert!(g.to_topology().wires.is_empty());
+    }
+
+    #[test]
+    fn wire_style_edit_is_undoable() {
+        let mut g = Graph::default_demo();
+        let key = {
+            let l = g.links()[0];
+            (l.node, l.bus)
+        };
+        let style = WireStyle {
+            width: Some(4.0),
+            ..Default::default()
+        };
+        g.set_wire_style(key, style.clone());
+        g.editor.commit(&g.state);
+        assert_eq!(g.wire_style(key), style);
+        assert!(g.undo());
+        assert_eq!(g.wire_style(key), WireStyle::default());
+        assert!(g.redo());
+        assert_eq!(g.wire_style(key), style);
     }
 
     #[test]

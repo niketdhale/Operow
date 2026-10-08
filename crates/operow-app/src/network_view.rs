@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use egui::{Pos2, Vec2, pos2, vec2};
 use egui_flow::{EdgeId, FlowState, Handle, HandleId, NodeId as FlowId, Side};
-use operow_core::{BusId, EcuConfig, IdFilter, NodeKind, RouteRule};
+use operow_core::{BusId, EcuConfig, IdFilter, NodeKind, RouteRule, WireStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::GraphNode;
@@ -146,12 +146,12 @@ struct Wire {
 }
 
 /// Vertical centre of a node in flow space, whatever group it sits in.
-fn center_y(state: &FlowState<GraphNode, ()>, n: &egui_flow::Node<GraphNode>) -> f32 {
+fn center_y(state: &FlowState<GraphNode, WireStyle>, n: &egui_flow::Node<GraphNode>) -> f32 {
     state.abs_rect(n.id).unwrap_or_else(|| n.rect()).center().y
 }
 
 /// Which wires of `state` run ECU -> bus, in a stable order.
-fn wires(state: &FlowState<GraphNode, ()>) -> Vec<Wire> {
+fn wires(state: &FlowState<GraphNode, WireStyle>) -> Vec<Wire> {
     let mut out = Vec::new();
     for e in &state.edges {
         let (Some(a), Some(b)) = (state.node(e.source), state.node(e.target)) else {
@@ -176,7 +176,7 @@ fn wires(state: &FlowState<GraphNode, ()>) -> Vec<Wire> {
 /// Handles for bus-line mode: one handle on a bar per attached node (top
 /// side for nodes above, bottom for below), offset to the node's x; one
 /// handle per bus on each ECU, spread along the side facing that bus.
-pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
+pub fn plan_bus_line(state: &FlowState<GraphNode, WireStyle>) -> HandlePlan {
     let mut plan = HandlePlan::default();
     let wires = wires(state);
     let mut bus_handles: HashMap<FlowId, Vec<Handle>> = HashMap::new();
@@ -248,7 +248,7 @@ pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
 /// Lays the nodes out for bus-line mode: buses stacked vertically (in
 /// canvas order), each ECU in a row above its first bus, gateways in the
 /// row between the buses they bridge, unconnected ECUs below the last bus.
-pub fn auto_arrange(state: &mut FlowState<GraphNode, ()>) {
+pub fn auto_arrange(state: &mut FlowState<GraphNode, WireStyle>) {
     let buses: Vec<(FlowId, u32)> = state
         .nodes
         .iter()
@@ -288,10 +288,10 @@ pub fn auto_arrange(state: &mut FlowState<GraphNode, ()>) {
         band.extend(gws);
     }
 
-    let size_of = |state: &FlowState<GraphNode, ()>, id: FlowId| {
+    let size_of = |state: &FlowState<GraphNode, WireStyle>, id: FlowId| {
         state.node(id).map_or(FALLBACK_NODE, |n| n.size)
     };
-    let row_width = |state: &FlowState<GraphNode, ()>, row: &[FlowId]| {
+    let row_width = |state: &FlowState<GraphNode, WireStyle>, row: &[FlowId]| {
         row.iter().map(|id| size_of(state, *id).x).sum::<f32>()
             + NODE_GAP * row.len().saturating_sub(1) as f32
     };
@@ -303,7 +303,7 @@ pub fn auto_arrange(state: &mut FlowState<GraphNode, ()>) {
     let bar_w = (widest + 2.0 * MARGIN_X).clamp(BUS_DEFAULT_WIDTH, BUS_MAX_WIDTH);
 
     let mut y = 0.0;
-    let place_row = |state: &mut FlowState<GraphNode, ()>, row: &[FlowId], y: f32| -> f32 {
+    let place_row = |state: &mut FlowState<GraphNode, WireStyle>, row: &[FlowId], y: f32| -> f32 {
         let h = row
             .iter()
             .map(|id| size_of(state, *id).y)
@@ -337,7 +337,7 @@ pub fn auto_arrange(state: &mut FlowState<GraphNode, ()>) {
 /// Gives nodes without a saved bus-line position a sensible spot without
 /// moving the placed ones: a new bus below everything, a new ECU beside the
 /// others above its first bus, an unconnected ECU below everything.
-pub fn place_missing(state: &mut FlowState<GraphNode, ()>, missing: &[FlowId]) {
+pub fn place_missing(state: &mut FlowState<GraphNode, WireStyle>, missing: &[FlowId]) {
     let is_missing = |id: FlowId| missing.contains(&id);
     for &id in missing {
         let Some(node) = state.node(id) else {
@@ -345,7 +345,7 @@ pub fn place_missing(state: &mut FlowState<GraphNode, ()>, missing: &[FlowId]) {
         };
         let size = node.size;
         let is_bus = matches!(node.data, GraphNode::Bus(_));
-        let placed = |s: &FlowState<GraphNode, ()>| {
+        let placed = |s: &FlowState<GraphNode, WireStyle>| {
             s.nodes
                 .iter()
                 .filter(|n| n.id != id && !is_missing(n.id))
@@ -503,7 +503,7 @@ mod tests {
         let gw = g.add_gateway(Pos2::ZERO);
         let lone = g.add_ecu(Pos2::ZERO, "Lone");
         for (a, b) in [(e1, b1), (e2, b1), (e3, b2), (gw, b1), (gw, b2)] {
-            g.state.connect(a, b, ()).unwrap();
+            g.state.connect(a, b, Default::default()).unwrap();
         }
         (g, vec![e1, e2, e3, lone], gw, b1, b2)
     }
@@ -574,8 +574,8 @@ mod tests {
         let b1 = g.add_bus(Pos2::ZERO);
         let b2 = g.add_bus(Pos2::ZERO);
         let gw = g.add_gateway(Pos2::ZERO);
-        g.state.connect(gw, b1, ()).unwrap();
-        g.state.connect(gw, b2, ()).unwrap();
+        g.state.connect(gw, b1, Default::default()).unwrap();
+        g.state.connect(gw, b2, Default::default()).unwrap();
         // Both bars above the gateway.
         g.state.node_mut(b1).unwrap().position = pos2(0.0, 0.0);
         g.state.node_mut(b2).unwrap().position = pos2(0.0, 100.0);
@@ -646,7 +646,7 @@ mod tests {
         auto_arrange(&mut g.state);
         let before = rect_of(&g, ecus[0]);
         let extra = g.add_ecu(Pos2::ZERO, "Extra");
-        g.state.connect(extra, b1, ()).unwrap();
+        g.state.connect(extra, b1, Default::default()).unwrap();
         let bus3 = g.add_bus(Pos2::ZERO);
         place_missing(&mut g.state, &[extra, bus3]);
         assert_eq!(rect_of(&g, ecus[0]), before);
