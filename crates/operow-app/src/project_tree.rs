@@ -110,6 +110,37 @@ pub fn ui(ui: &mut egui::Ui, graph: &Graph, dbcs: &DbcStore, tests_busy: bool) -
                     }
                 });
 
+            let domains = graph.domains();
+            if !domains.is_empty() {
+                CollapsingHeader::new(RichText::new("Domains").strong())
+                    .icon(crate::icons::disclosure)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (group, d) in domains {
+                            let resp = CollapsingHeader::new(&d.name)
+                                .id_salt(("tree_domain", d.id))
+                                .icon(crate::icons::disclosure)
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for m in graph.domain_members(group) {
+                                        let Some(node) = graph.node(m) else {
+                                            continue;
+                                        };
+                                        if ui
+                                            .selectable_label(selected == Some(m), node.name())
+                                            .clicked()
+                                        {
+                                            picked = Some(m);
+                                        }
+                                    }
+                                });
+                            if resp.header_response.clicked() {
+                                picked = picked.or(Some(group));
+                            }
+                        }
+                    });
+            }
+
             CollapsingHeader::new(RichText::new("Databases").strong())
                 .icon(crate::icons::disclosure)
                 .default_open(true)

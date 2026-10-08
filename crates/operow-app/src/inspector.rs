@@ -182,7 +182,11 @@ impl Inspector {
         }
 
         let Some(sel) = graph.selected() else {
-            ui.label("Select a node to edit its properties.");
+            if let Some(edge) = graph.state.selected_edges().first().copied() {
+                Self::wire_ui(ui, graph, edge, running);
+            } else {
+                ui.label("Select a node or wire to edit its properties.");
+            }
             return cmds;
         };
 
@@ -203,6 +207,28 @@ impl Inspector {
             extra(ui, graph, sel);
         });
         cmds
+    }
+
+    /// The Wire section: the style of the selected wire.
+    fn wire_ui(ui: &mut egui::Ui, graph: &mut Graph, edge: egui_flow::EdgeId, running: bool) {
+        let Some(key) = graph.wire_key(edge) else {
+            return;
+        };
+        let mut style = graph.wire_styles.get(&key).cloned().unwrap_or_default();
+        ui.strong("Wire");
+        let changed = ui
+            .add_enabled_ui(!running, |ui| {
+                let mut changed = crate::wire_ui::wire_style_ui(ui, &mut style, true);
+                if ui.button("Reset to default").clicked() {
+                    style = Default::default();
+                    changed = true;
+                }
+                changed
+            })
+            .inner;
+        if changed {
+            graph.set_wire_style(key, style);
+        }
     }
 
     fn node_ui(
@@ -231,6 +257,23 @@ impl Inspector {
         }
         let node = graph.node_mut(sel).expect("selected node exists");
         match node {
+            GraphNode::Domain(d) => {
+                ui.strong("Domain");
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut d.name);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Colour:");
+                    let mut custom = d.color.is_some();
+                    if ui.checkbox(&mut custom, "").changed() {
+                        d.color = custom.then_some([110, 160, 220]);
+                    }
+                    if let Some(c) = &mut d.color {
+                        ui.color_edit_button_srgb(c);
+                    }
+                });
+            }
             GraphNode::Bus(bus) => {
                 ui.add_enabled_ui(!running, |ui| {
                     ui.horizontal(|ui| {

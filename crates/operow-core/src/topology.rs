@@ -402,6 +402,108 @@ pub struct Topology {
     /// crate does not interpret it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<serde_json::Value>,
+    /// Network domains: named groups of nodes (and buses) on the canvas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<Domain>,
+    /// Style of every wire that has no override of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_default: Option<WireStyle>,
+    /// Per-wire style overrides (kept beside `links` so `Link` stays `Copy`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wires: Vec<WireOverride>,
+}
+
+/// A named group of nodes on the canvas; purely organisational.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Domain {
+    pub id: u32,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    #[serde(default)]
+    pub members: Vec<NodeId>,
+    /// Buses placed in the domain (free-form view only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bus_members: Vec<BusId>,
+    #[serde(default)]
+    pub collapsed: bool,
+    /// The domain this one is nested in.
+    #[serde(default)]
+    pub parent: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireKind {
+    Bezier,
+    Straight,
+    Step,
+    SmoothStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireLine {
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireArrow {
+    None,
+    Triangle,
+    Open,
+    Circle,
+    Diamond,
+}
+
+/// How a wire is drawn. Every field is optional: unset fields fall back to
+/// the project default, then to the automatic styling.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WireStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WireKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<WireLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrow: Option<WireArrow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrow_at_source: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl WireStyle {
+    /// This style, with unset fields taken from `base`.
+    pub fn over(&self, base: &WireStyle) -> WireStyle {
+        WireStyle {
+            kind: self.kind.or(base.kind),
+            line: self.line.or(base.line),
+            color: self.color.or(base.color),
+            width: self.width.or(base.width),
+            arrow: self.arrow.or(base.arrow),
+            arrow_at_source: self.arrow_at_source.or(base.arrow_at_source),
+            animated: self.animated.or(base.animated),
+            label: self.label.clone().or_else(|| base.label.clone()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == WireStyle::default()
+    }
+}
+
+/// Style override of the wire between `node` and `bus`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireOverride {
+    pub node: NodeId,
+    pub bus: BusId,
+    pub style: WireStyle,
 }
 
 /// Errors returned by [`Topology::validate`].
@@ -427,6 +529,20 @@ pub enum TopologyError {
     ReplayBusNotLinked { node: NodeId, bus: BusId },
     #[error("node {node:?} serves diagnostics on bus {bus:?} which it is not linked to")]
     DiagBusNotLinked { node: NodeId, bus: BusId },
+    #[error("domain {0} appears more than once")]
+    DuplicateDomain(u32),
+    #[error("domain {domain} contains unknown node {node:?}")]
+    DomainUnknownNode { domain: u32, node: NodeId },
+    #[error("domain {domain} contains unknown bus {bus:?}")]
+    DomainUnknownBus { domain: u32, bus: BusId },
+    #[error("node {0:?} is in more than one domain")]
+    NodeInTwoDomains(NodeId),
+    #[error("bus {0:?} is in more than one domain")]
+    BusInTwoDomains(BusId),
+    #[error("domain {domain} has unknown parent {parent}")]
+    DomainUnknownParent { domain: u32, parent: u32 },
+    #[error("domain {0} is nested inside itself")]
+    DomainCycle(u32),
 }
 
 /// Errors returned by [`Topology::from_json`].
@@ -508,6 +624,60 @@ impl Topology {
                         });
                     }
                 }
+            }
+        }
+        self.validate_domains()
+    }
+
+    fn validate_domains(&self) -> Result<(), TopologyError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut nodes = std::collections::HashSet::new();
+        let mut buses = std::collections::HashSet::new();
+        for d in &self.domains {
+            if !seen.insert(d.id) {
+                return Err(TopologyError::DuplicateDomain(d.id));
+            }
+            for &node in &d.members {
+                if !self.nodes.iter().any(|n| n.id == node) {
+                    return Err(TopologyError::DomainUnknownNode { domain: d.id, node });
+                }
+                if !nodes.insert(node) {
+                    return Err(TopologyError::NodeInTwoDomains(node));
+                }
+            }
+            for &bus in &d.bus_members {
+                if !self.buses.iter().any(|b| b.id == bus) {
+                    return Err(TopologyError::DomainUnknownBus { domain: d.id, bus });
+                }
+                if !buses.insert(bus) {
+                    return Err(TopologyError::BusInTwoDomains(bus));
+                }
+            }
+        }
+        for d in &self.domains {
+            if let Some(parent) = d.parent
+                && !seen.contains(&parent)
+            {
+                return Err(TopologyError::DomainUnknownParent {
+                    domain: d.id,
+                    parent,
+                });
+            }
+            // Walk up; a chain longer than the domain count must loop.
+            let mut at = d.parent;
+            for _ in 0..self.domains.len() {
+                let Some(p) = at else { break };
+                if p == d.id {
+                    return Err(TopologyError::DomainCycle(d.id));
+                }
+                at = self
+                    .domains
+                    .iter()
+                    .find(|x| x.id == p)
+                    .and_then(|x| x.parent);
+            }
+            if at.is_some() {
+                return Err(TopologyError::DomainCycle(d.id));
             }
         }
         Ok(())

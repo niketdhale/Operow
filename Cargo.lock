@@ -1045,8 +1045,8 @@ dependencies = [
 
 [[package]]
 name = "egui-flow"
-version = "0.1.0"
-source = "git+https://github.com/niketdhale/egui-flow?rev=7c8d5a3c7bee0f2547eaca8cd5ca0014cb5cd220#7c8d5a3c7bee0f2547eaca8cd5ca0014cb5cd220"
+version = "0.2.0"
+source = "git+https://github.com/niketdhale/egui-flow?rev=ce28d5cb9a6033bd955a757ca098af2582a3de42#ce28d5cb9a6033bd955a757ca098af2582a3de42"
 dependencies = [
  "egui",
 ]

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use egui_dock::TabViewer;
-use egui_flow::{Flow, FlowOptions};
+use egui_flow::{Flow, FlowOptions, HandleVisibility, NodeId as FlowId};
 use operow_core::{BusId, CanErrorKind, NodeErrorState};
 use operow_engine::{Command, NodeErrorInfo, RunState};
 
@@ -60,6 +60,21 @@ pub struct WindowViewer<'a> {
     pub open_request: Option<WindowKind>,
 }
 
+/// The open name prompt for a domain, kept in egui's memory.
+#[derive(Clone)]
+pub enum DomainPrompt {
+    Group(String),
+    Rename(FlowId, String),
+}
+
+fn prompt_id() -> egui::Id {
+    egui::Id::new("domain_prompt")
+}
+
+pub fn request_domain_prompt(ctx: &egui::Context, prompt: DomainPrompt) {
+    ctx.data_mut(|d| d.insert_temp(prompt_id(), prompt));
+}
+
 impl WindowViewer<'_> {
     fn running(&self) -> bool {
         self.run_state != RunState::Stopped
@@ -97,14 +112,20 @@ impl WindowViewer<'_> {
                 self.graph.set_view(view);
             }
             let bus_line = view == NetworkView::BusLine;
-            if ui
-                .add_enabled(bus_line, egui::Button::new("Auto-arrange"))
-                .on_hover_text("Stack the buses, put ECUs above their bus and gateways between")
-                .on_disabled_hover_text("Available in the bus-line view")
-                .clicked()
-            {
-                self.graph.auto_arrange();
+            let hint = if bus_line {
+                "Stack the buses, put ECUs above their bus and gateways between"
+            } else {
+                "Arrange the nodes top to bottom along their wires"
+            };
+            if ui.button("Auto-arrange").on_hover_text(hint).clicked() {
+                if bus_line {
+                    self.graph.auto_arrange();
+                } else {
+                    self.graph.auto_layout(true);
+                }
             }
+            self.domains_menu(ui, running);
+            self.wires_menu(ui, running);
             if running {
                 if ui
                     .button("Faults")
@@ -133,6 +154,8 @@ impl WindowViewer<'_> {
             alignment_guides: true,
             keyboard_nudge: true,
             highlight_connected: true,
+            handle_visibility: HandleVisibility::OnHover,
+            theme: self.theme.flow_theme(),
             connection_radius: if view == NetworkView::BusLine {
                 36.0
             } else {
@@ -169,6 +192,7 @@ impl WindowViewer<'_> {
             self.runtime_node_menus(&out);
             return;
         }
+        self.domain_prompt_ui(ui.ctx());
         if out.pane.secondary_clicked() {
             *self.menu_pos = out.pane.interact_pointer_pos();
         }
@@ -195,6 +219,17 @@ impl WindowViewer<'_> {
                 self.graph.select(id);
                 ui.close();
             }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    self.graph.has_selection(),
+                    egui::Button::new("Group selection as domain\u{2026}"),
+                )
+                .clicked()
+            {
+                request_domain_prompt(ui.ctx(), DomainPrompt::Group("Domain".into()));
+                ui.close();
+            }
         });
         let mut delete = None;
         for (id, resp) in &out.nodes {
@@ -204,7 +239,38 @@ impl WindowViewer<'_> {
                     self.graph.select(*id);
                     ui.close();
                 }
-                if ui.button("Delete").clicked() {
+                let domain = match self.graph.node(*id) {
+                    Some(GraphNode::Domain(d)) => Some(d.name.clone()),
+                    _ => None,
+                };
+                if let Some(name) = domain {
+                    if ui.button("Rename domain\u{2026}").clicked() {
+                        request_domain_prompt(ui.ctx(), DomainPrompt::Rename(*id, name));
+                        ui.close();
+                    }
+                } else {
+                    if ui.button("Group selection as domain\u{2026}").clicked() {
+                        self.graph.select(*id);
+                        request_domain_prompt(ui.ctx(), DomainPrompt::Group("Domain".into()));
+                        ui.close();
+                    }
+                    if self
+                        .graph
+                        .state
+                        .node(*id)
+                        .is_some_and(|n| n.parent.is_some())
+                        && ui.button("Ungroup").clicked()
+                    {
+                        self.graph.ungroup(*id);
+                        ui.close();
+                    }
+                }
+                let delete_label = if self.graph.domain_name(*id).is_some() {
+                    "Delete domain (keep members)"
+                } else {
+                    "Delete"
+                };
+                if ui.button(delete_label).clicked() {
                     delete = Some(*id);
                     ui.close();
                 }
@@ -213,6 +279,108 @@ impl WindowViewer<'_> {
         if let Some(id) = delete {
             self.graph.remove(id);
         }
+    }
+
+    /// Toolbar menu for network domains.
+    fn domains_menu(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.add_enabled_ui(!running, |ui| {
+            ui.menu_button("Domains", |ui| {
+                let selected = self.graph.has_selection();
+                if ui
+                    .add_enabled(
+                        selected,
+                        egui::Button::new("Group selection as domain\u{2026}"),
+                    )
+                    .clicked()
+                {
+                    request_domain_prompt(ui.ctx(), DomainPrompt::Group("Domain".into()));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(selected, egui::Button::new("Ungroup"))
+                    .clicked()
+                {
+                    self.graph.ungroup_selection();
+                    ui.close();
+                }
+                if ui
+                    .button("Create domains per bus")
+                    .on_hover_text("One domain per bus with the nodes attached only to it")
+                    .clicked()
+                {
+                    let n = self.graph.create_domains_per_bus();
+                    self.status_log.push(format!("created {n} domain(s)"));
+                    ui.close();
+                }
+            });
+        });
+    }
+
+    /// Toolbar menu editing the style every wire without an override gets.
+    fn wires_menu(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.add_enabled_ui(!running, |ui| {
+            ui.menu_button("Wires", |ui| {
+                ui.set_min_width(220.0);
+                ui.strong("Default wire style");
+                let mut style = self.graph.wire_default.clone().unwrap_or_default();
+                if crate::wire_ui::wire_style_ui(ui, &mut style, false) {
+                    self.graph.wire_default = Some(style).filter(|s| !s.is_empty());
+                }
+                ui.separator();
+                if ui
+                    .button("Apply to all")
+                    .on_hover_text("Drop every per-wire override so all wires follow the default")
+                    .clicked()
+                {
+                    self.graph.wire_styles.clear();
+                }
+                if ui.button("Reset all").clicked() {
+                    self.graph.wire_styles.clear();
+                    self.graph.wire_default = None;
+                }
+            });
+        });
+    }
+
+    /// The name prompt of "Group selection as domain" and "Rename domain".
+    fn domain_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = ctx.data(|d| d.get_temp::<DomainPrompt>(prompt_id())) else {
+            return;
+        };
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("Domain name")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let (DomainPrompt::Group(text) | DomainPrompt::Rename(_, text)) = &mut prompt;
+                let edit = ui.text_edit_singleline(text);
+                edit.request_focus();
+                ok = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    ok |= ui.button("OK").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if ok {
+            match &prompt {
+                DomainPrompt::Group(name) => {
+                    if self.graph.group_selection(name.trim()).is_none() {
+                        self.status_log
+                            .push("select the nodes to group first".to_string());
+                    }
+                }
+                DomainPrompt::Rename(id, name) => self.graph.rename_domain(*id, name.trim()),
+            }
+        }
+        ctx.data_mut(|d| {
+            if ok || cancel {
+                d.remove::<DomainPrompt>(prompt_id());
+            } else {
+                d.insert_temp(prompt_id(), prompt);
+            }
+        });
     }
 
     /// Right-click menu of a node while running: online/offline and
