@@ -589,7 +589,7 @@ impl Worker {
                     .iter()
                     .map(|e| {
                         longest.fetch_max(e.time.0, Ordering::Relaxed);
-                        let mut e = *e;
+                        let mut e = e.clone();
                         e.time.0 += shift;
                         e
                     })
