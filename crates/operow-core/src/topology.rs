@@ -267,11 +267,23 @@ fn default_data_bitrate() -> u32 {
     2_000_000
 }
 
-/// Static configuration of a CAN bus.
+/// The network type of a bus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BusKind {
+    #[default]
+    Can,
+    Ethernet,
+}
+
+/// Static configuration of a bus (CAN unless `kind` says otherwise).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanBusConfig {
     pub id: BusId,
     pub name: String,
+    /// Network type. Ethernet reuses `bitrate`; the CAN-only fields below
+    /// must stay at their defaults for it.
+    #[serde(default)]
+    pub kind: BusKind,
     /// Arbitration/nominal bitrate (bit/s). Also the only bitrate used when
     /// `fd_enabled` is `false`.
     pub bitrate: u32,
@@ -517,6 +529,8 @@ pub enum TopologyError {
     DatabaseUnknownBus { path: String, bus: BusId },
     #[error("bus {0:?} has a non-positive bitrate")]
     InvalidBitrate(BusId),
+    #[error("bus {0:?} is not CAN but sets fd_enabled, simulate_ack or hardware")]
+    CanOnlyOption(BusId),
     #[error("bus {0:?} has FD enabled but a non-positive data bitrate")]
     InvalidDataBitrate(BusId),
     #[error("node {node:?} transmits on bus {bus:?} which it is not linked to")]
@@ -570,6 +584,11 @@ impl Topology {
         for bus in &self.buses {
             if bus.bitrate == 0 {
                 return Err(TopologyError::InvalidBitrate(bus.id));
+            }
+            if bus.kind == BusKind::Ethernet
+                && (bus.fd_enabled || bus.simulate_ack || bus.hardware.is_some())
+            {
+                return Err(TopologyError::CanOnlyOption(bus.id));
             }
             if bus.fd_enabled && bus.data_bitrate == 0 {
                 return Err(TopologyError::InvalidDataBitrate(bus.id));

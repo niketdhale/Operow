@@ -83,7 +83,7 @@ impl FrameStore {
             if self.reject_when_full && self.is_full() {
                 return;
             }
-            self.events.push_back(*ev);
+            self.events.push_back(ev.clone());
             self.trim();
         }
     }
@@ -135,13 +135,15 @@ mod tests {
             dir: Direction::Tx,
             frame_uid: 0,
             hop: 0,
-            frame: CanFrame::new(id, false, &[1, 2, 3]).unwrap(),
+            frame: CanFrame::new(id, false, &[1, 2, 3]).unwrap().into(),
             kind: Default::default(),
         }
     }
 
     fn ids(s: &FrameStore, from: u64) -> Vec<(u64, u32)> {
-        s.iter_from(from).map(|(q, e)| (q, e.frame.id)).collect()
+        s.iter_from(from)
+            .map(|(q, e)| (q, e.frame.as_can().unwrap().id))
+            .collect()
     }
 
     #[test]
@@ -149,7 +151,7 @@ mod tests {
         let mut s = FrameStore::new(10);
         s.push_batch(&[ev(1, 0), ev(2, 1), ev(3, 2)]);
         assert_eq!((s.len(), s.total_pushed(), s.capacity()), (3, 3, 10));
-        assert_eq!(s.get(1).unwrap().frame.id, 2);
+        assert_eq!(s.get(1).unwrap().frame.as_can().unwrap().id, 2);
         assert!(s.get(3).is_none());
         assert_eq!(ids(&s, 1), [(1, 2), (2, 3)]);
         assert!(ids(&s, 99).is_empty());
@@ -199,9 +201,15 @@ mod tests {
         let mut s = FrameStore::new(10);
         s.push_batch(&[ev(1, 0), ev(2, 1), ev(1, 2), ev(3, 3)]);
         assert_eq!(
-            s.find_latest(10, |e| e.frame.id == 1).unwrap().time.0,
+            s.find_latest(10, |e| e.frame.as_can().unwrap().id == 1)
+                .unwrap()
+                .time
+                .0,
             2_000_000
         );
-        assert!(s.find_latest(1, |e| e.frame.id == 1).is_none());
+        assert!(
+            s.find_latest(1, |e| e.frame.as_can().unwrap().id == 1)
+                .is_none()
+        );
     }
 }

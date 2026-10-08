@@ -40,6 +40,11 @@ pub(crate) enum Abort {
     Stopped,
 }
 
+/// The CAN frame of an event; `advance` drops all others before they get here.
+fn can(ev: &BusEvent) -> &CanFrame {
+    ev.frame.as_can().expect("non-CAN events are filtered out")
+}
+
 fn err<T>(msg: impl Into<String>) -> Result<T, Abort> {
     Err(Abort::Error(msg.into()))
 }
@@ -470,12 +475,13 @@ impl Ctx {
         if self.ring.len() >= RING_CAP {
             self.ring.pop_front();
         }
-        self.ring.push_back(ev);
         if ev.is_error() {
+            self.ring.push_back(ev);
             return;
         }
-        let (id, ext) = (ev.frame.id, ev.frame.extended);
-        self.last_frames.insert((ev.bus, id), ev);
+        let (id, ext) = (can(&ev).id, can(&ev).extended);
+        self.ring.push_back(ev.clone());
+        self.last_frames.insert((ev.bus, id), ev.clone());
         if let Some(msg) = self
             .dbcs
             .by_bus
@@ -483,7 +489,7 @@ impl Ctx {
             .and_then(|d| d.message(id, ext))
         {
             let vals = self.signal_values.entry((ev.bus, id, ext)).or_default();
-            for (n, v) in msg.decode(&ev.frame) {
+            for (n, v) in msg.decode(can(&ev)) {
                 vals.insert(n, v);
             }
         }
@@ -518,8 +524,9 @@ impl Ctx {
             {
                 sink(&buf);
             }
-            for ev in buf.drain(..) {
-                self.ingest(ev);
+            // ponytail: Ethernet frames are not exposed to scripts yet
+            for ev in buf.drain(..).filter(|e| e.frame.as_can().is_some()) {
+                self.ingest(ev.clone());
                 if found.is_none() {
                     found = pred(self, &ev);
                 }
@@ -541,16 +548,15 @@ impl Ctx {
 
     fn frame_map(&self, ev: &BusEvent) -> Map {
         let mut m = Map::new();
-        m.insert("id".into(), Dynamic::from(ev.frame.id as i64));
-        m.insert("extended".into(), Dynamic::from(ev.frame.extended));
-        let data: Array = ev
-            .frame
+        m.insert("id".into(), Dynamic::from(can(ev).id as i64));
+        m.insert("extended".into(), Dynamic::from(can(ev).extended));
+        let data: Array = can(ev)
             .payload()
             .iter()
             .map(|&b| Dynamic::from(b as i64))
             .collect();
         m.insert("data".into(), Dynamic::from(data));
-        m.insert("dlc".into(), Dynamic::from(ev.frame.dlc as i64));
+        m.insert("dlc".into(), Dynamic::from(can(ev).dlc as i64));
         m.insert("bus".into(), Dynamic::from(self.bus_name(ev.bus)));
         m.insert("sender".into(), Dynamic::from(self.sender_name(ev.sender)));
         m.insert("time_ms".into(), Dynamic::from(ms(ev.time.0)));
@@ -562,8 +568,8 @@ impl Ctx {
         let id = can_id(id)?;
         let target = self.now_ns + ms_to_ns(timeout_ms as f64)?;
         let hit = self.advance(target, |_, ev| {
-            (!ev.is_error() && ev.frame.id == id && bus_id.is_none_or(|b| b == ev.bus))
-                .then_some(*ev)
+            (!ev.is_error() && can(ev).id == id && bus_id.is_none_or(|b| b == ev.bus))
+                .then(|| ev.clone())
         })?;
         let on = bus.map(|b| format!(" on {b}")).unwrap_or_default();
         match hit {
@@ -574,7 +580,7 @@ impl Ctx {
                     format!(
                         "got message 0x{id:X}{on} at {:.3} ms [{}]",
                         ms(ev.time.0),
-                        hex(ev.frame.payload())
+                        hex(can(&ev).payload())
                     ),
                     true,
                 );
@@ -608,7 +614,7 @@ impl Ctx {
         }
         let target = self.now_ns + ms_to_ns(timeout_ms as f64)?;
         let hit = self.advance(target, |c, ev| {
-            if ev.is_error() || (ev.bus, ev.frame.id, ev.frame.extended) != k.msg_key() {
+            if ev.is_error() || (ev.bus, can(ev).id, can(ev).extended) != k.msg_key() {
                 return None;
             }
             c.latest(&k).filter(|v| op.apply(*v, want))
@@ -702,8 +708,8 @@ impl Ctx {
         let id = can_id(id)?;
         let target = self.now_ns + ms_to_ns(window_ms as f64)?;
         let hit = self.advance(target, |_, ev| {
-            (!ev.is_error() && ev.frame.id == id && bus_id.is_none_or(|b| b == ev.bus))
-                .then_some(*ev)
+            (!ev.is_error() && can(ev).id == id && bus_id.is_none_or(|b| b == ev.bus))
+                .then(|| ev.clone())
         })?;
         let on = bus.map(|b| format!(" on {b}")).unwrap_or_default();
         match hit {
@@ -743,7 +749,7 @@ impl Ctx {
         let mut times: Vec<u64> = Vec::new();
         let mut first_bus: Option<BusId> = bus_id;
         self.advance(target, |_, ev| {
-            if !ev.is_error() && ev.frame.id == id && first_bus.is_none_or(|b| b == ev.bus) {
+            if !ev.is_error() && can(ev).id == id && first_bus.is_none_or(|b| b == ev.bus) {
                 first_bus = Some(ev.bus);
                 times.push(ev.time.0);
             }
@@ -815,7 +821,7 @@ impl Ctx {
         let mut data = match self.payloads.get(&key) {
             Some(p) => p.clone(),
             None => match self.last_frames.get(&(k.bus, k.id)) {
-                Some(ev) => ev.frame.payload().to_vec(),
+                Some(ev) => can(ev).payload().to_vec(),
                 None => {
                     let mut d = vec![0u8; len];
                     for s in &msg.signals {
@@ -1139,10 +1145,10 @@ impl Ctx {
                     Direction::Rx => "Rx",
                 }
                 .into(),
-                id: e.frame.id,
-                ext: e.frame.extended,
-                dlc: e.frame.dlc,
-                data: e.frame.payload().to_vec(),
+                id: can(e).id,
+                ext: can(e).extended,
+                dlc: can(e).dlc,
+                data: can(e).payload().to_vec(),
                 sender: self.sender_name(e.sender),
                 error: e.error_kind().map(|k| k.label().to_string()),
             })

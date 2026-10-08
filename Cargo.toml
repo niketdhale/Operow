@@ -20,7 +20,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"
 crossbeam-channel = "0.5"
 operow-core = { path = "crates/operow-core" }

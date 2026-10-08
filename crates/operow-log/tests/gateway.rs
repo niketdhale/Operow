@@ -51,7 +51,7 @@ fn gateway_run_round_trips_through_asc() {
             time: operow_core::Timestamp(ev.time.0 / 1000 * 1000),
             channel: channel[&ev.bus],
             dir: ev.dir,
-            kind: RecordKind::Frame(ev.frame),
+            kind: RecordKind::Frame(*ev.frame.as_can().unwrap()),
         };
         w.write(&r).unwrap();
         expected.push(r);
@@ -71,7 +71,10 @@ fn gateway_run_round_trips_through_asc() {
             RecordKind::ErrorFrame => unreachable!(),
         })
         .collect();
-    let want: Vec<u32> = events.iter().map(|e| e.frame.id).collect();
+    let want: Vec<u32> = events
+        .iter()
+        .map(|e| e.frame.as_can().unwrap().id)
+        .collect();
     assert_eq!(ids, want);
 }
 
@@ -92,7 +95,7 @@ fn gateway_run_converts_asc_to_blf_and_back() {
             time: ev.time,
             channel: channel[&ev.bus],
             dir: ev.dir,
-            kind: RecordKind::Frame(ev.frame),
+            kind: RecordKind::Frame(*ev.frame.as_can().unwrap()),
         })
         .unwrap();
     }

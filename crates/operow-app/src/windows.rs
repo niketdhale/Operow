@@ -752,7 +752,7 @@ impl TabViewer for WindowViewer<'_> {
             WindowKind::Properties => self.properties_ui(ui),
             WindowKind::Trace => {
                 if let Some(trace) = self.traces.get_mut(&id) {
-                    let actions = trace.ui(ui, self.store, self.names);
+                    let actions = trace.ui(ui, self.store, self.names, &self.graph.user_signals);
                     self.trace_actions.extend(actions);
                 }
             }

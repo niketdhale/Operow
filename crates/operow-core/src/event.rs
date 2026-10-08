@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::frame::CanFrame;
+use crate::frame::Frame;
 use crate::ids::{BusId, NodeId, Timestamp};
 
 /// Direction of a frame from the point of view of a bus. Exactly one event
@@ -81,7 +81,7 @@ pub enum BusEventKind {
 
 /// A single frame placed onto a bus. Receivers are derivable from the
 /// topology (every other node linked to `bus`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BusEvent {
     pub time: Timestamp,
     pub bus: BusId,
@@ -96,7 +96,7 @@ pub struct BusEvent {
     pub hop: u8,
     /// For [`BusEventKind::Error`] events, the frame that was being
     /// transmitted when the error occurred.
-    pub frame: CanFrame,
+    pub frame: Frame,
     /// Frame or error frame. Defaults to `Frame` when deserializing old data.
     #[serde(default)]
     pub kind: BusEventKind,

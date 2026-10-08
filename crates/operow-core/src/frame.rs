@@ -1,6 +1,8 @@
-use serde::Deserialize;
+use std::sync::Arc;
+
 use serde::de::{self, Deserializer};
-use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur while constructing a [`CanFrame`].
@@ -218,6 +220,49 @@ impl<'de> Deserialize<'de> for CanFrame {
                 ));
             }
             CanFrame::new(shadow.id, shadow.extended, payload).map_err(de::Error::custom)
+        }
+    }
+}
+
+/// An Ethernet frame (without preamble and FCS). The payload is shared so
+/// cloning a frame never copies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EthFrame {
+    pub dst: [u8; 6],
+    pub src: [u8; 6],
+    pub ethertype: u16,
+    pub payload: Arc<[u8]>,
+}
+
+/// A frame on any supported network type.
+/// Untagged so `BusEvent` JSON written before `Frame` existed still loads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Frame {
+    Can(CanFrame),
+    Eth(EthFrame),
+}
+
+impl From<CanFrame> for Frame {
+    fn from(f: CanFrame) -> Self {
+        Frame::Can(f)
+    }
+}
+
+impl Frame {
+    /// The payload bytes of either kind of frame.
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            Frame::Can(f) => f.payload(),
+            Frame::Eth(f) => &f.payload,
+        }
+    }
+
+    /// The CAN frame, if this is one.
+    pub fn as_can(&self) -> Option<&CanFrame> {
+        match self {
+            Frame::Can(f) => Some(f),
+            Frame::Eth(_) => None,
         }
     }
 }

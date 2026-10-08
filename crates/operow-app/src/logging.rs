@@ -378,7 +378,7 @@ impl TriggerMachine {
         while seq > store.first_seq() {
             seq -= 1;
             match store.get(seq) {
-                Some(e) if e.time.0 >= from => evs.push(*e),
+                Some(e) if e.time.0 >= from => evs.push(e.clone()),
                 _ => break,
             }
         }
@@ -425,7 +425,9 @@ impl TriggerMachine {
                 seq = store.next_seq();
                 break;
             }
-            let Some(&ev) = store.get(seq) else { break };
+            let Some(ev) = store.get(seq).cloned() else {
+                break;
+            };
             if self.state == LogState::Armed {
                 let hit = matches!(&self.cfg.start, StartTrigger::OnCondition(c) if eval(c, &ev));
                 if hit {
@@ -468,7 +470,7 @@ impl TriggerMachine {
                 self.close(out);
                 return;
             }
-            out.push(Out::Record(ev));
+            out.push(Out::Record(ev.clone()));
             if ev.time >= limit {
                 self.close(out);
             }
@@ -498,8 +500,10 @@ pub fn eval_condition(
         Condition::IdSeen { bus, id, ext } => {
             !ev.is_error()
                 && bus.is_none_or(|b| b == ev.bus)
-                && ev.frame.id == *id
-                && ev.frame.extended == *ext
+                && ev
+                    .frame
+                    .as_can()
+                    .is_some_and(|f| f.id == *id && f.extended == *ext)
         }
         Condition::Signal { signal, cmp } => signal
             .sample_with_prev(ev, None, dbcs, users)
@@ -823,6 +827,10 @@ impl LogRuntime {
                     let Some(&channel) = self.channels.get(&ev.bus) else {
                         continue;
                     };
+                    // ponytail: Ethernet not logged yet
+                    let Some(&frame) = ev.frame.as_can() else {
+                        continue;
+                    };
                     if self.tx.is_none() {
                         continue;
                     }
@@ -837,7 +845,7 @@ impl LogRuntime {
                         kind: if ev.is_error() {
                             RecordKind::ErrorFrame
                         } else {
-                            RecordKind::Frame(ev.frame)
+                            RecordKind::Frame(frame)
                         },
                     });
                     self.last_time = ev.time;
@@ -954,7 +962,7 @@ mod tests {
             dir: Direction::Tx,
             frame_uid: 0,
             hop: 0,
-            frame: CanFrame::new(id, false, &[b0, 0]).unwrap(),
+            frame: CanFrame::new(id, false, &[b0, 0]).unwrap().into(),
             kind: Default::default(),
         }
     }
@@ -990,7 +998,7 @@ mod tests {
         out.iter()
             .map(|o| match o {
                 Out::Open { .. } => -1,
-                Out::Record(e) => i64::from(e.frame.id),
+                Out::Record(e) => i64::from(e.frame.as_can().unwrap().id),
                 Out::Close => -2,
             })
             .collect()

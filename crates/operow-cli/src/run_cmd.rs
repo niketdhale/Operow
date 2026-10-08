@@ -84,6 +84,10 @@ pub fn run(a: &RunArgs) -> Result<ExitCode, String> {
                 let Some(&channel) = channels.get(&ev.bus) else {
                     continue;
                 };
+                // ponytail: Ethernet not logged yet
+                let Some(&frame) = ev.frame.as_can() else {
+                    continue;
+                };
                 w.write(&LogRecord {
                     time: ev.time,
                     channel,
@@ -91,7 +95,7 @@ pub fn run(a: &RunArgs) -> Result<ExitCode, String> {
                     kind: if ev.is_error() {
                         RecordKind::ErrorFrame
                     } else {
-                        RecordKind::Frame(ev.frame)
+                        RecordKind::Frame(frame)
                     },
                 })
                 .map_err(|e| format!("cannot write the log: {e}"))?;

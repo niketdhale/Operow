@@ -62,6 +62,7 @@ fn main() -> eframe::Result<()> {
             "--demo-wires" => opts.demo_wires = true,
             "--light" => light = true,
             "--demo-graph" => opts.demo_graph = true,
+            "--demo-trace-columns" => opts.demo_trace_columns = true,
             "--demo-generator" => opts.demo_generator = true,
             "--demo-diag" => opts.demo_diag = true,
             "--demo-diag-dtcs" => {
