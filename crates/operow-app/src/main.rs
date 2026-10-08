@@ -31,6 +31,7 @@ mod tests_window;
 mod theme;
 mod trace;
 mod windows;
+mod wire_ui;
 mod workspace;
 
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ use std::path::PathBuf;
 fn main() -> eframe::Result<()> {
     let mut screenshot_path: Option<PathBuf> = None;
     let mut opts = app::StartupOptions::default();
+    let mut light = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -55,6 +57,10 @@ fn main() -> eframe::Result<()> {
             "--layout-demo" => opts.layout_demo = true,
             "--demo-filters" => opts.demo_filters = true,
             "--open-new-signal" => opts.open_new_signal = true,
+            "--auto-layout" => opts.auto_layout = true,
+            "--demo-domains" => opts.demo_domains = true,
+            "--demo-wires" => opts.demo_wires = true,
+            "--light" => light = true,
             "--demo-graph" => opts.demo_graph = true,
             "--demo-generator" => opts.demo_generator = true,
             "--demo-diag" => opts.demo_diag = true,
@@ -92,7 +98,8 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            let settings = settings::AppSettings::load(cc.storage);
+            let mut settings = settings::AppSettings::load(cc.storage);
+            settings.dark_theme &= !light;
             if settings.dark_theme {
                 theme::AppTheme::Dark.apply(&cc.egui_ctx);
             } else {

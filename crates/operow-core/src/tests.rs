@@ -1,7 +1,8 @@
 use crate::{
-    BusId, CanBusConfig, CanFrame, DbcRef, DiagConfig, DidEntry, DtcEntry, EcuConfig, IdFilter,
-    KeyAlgo, Link, NodeId, NodeKind, RouteRule, SecurityConfig, SendType, SignalByteOrder,
-    Topology, TopologyError, TxMessage, UserSignalDef, UserSignalId,
+    BusId, CanBusConfig, CanFrame, DbcRef, DiagConfig, DidEntry, Domain, DtcEntry, EcuConfig,
+    IdFilter, KeyAlgo, Link, NodeId, NodeKind, RouteRule, SecurityConfig, SendType,
+    SignalByteOrder, Topology, TopologyError, TxMessage, UserSignalDef, UserSignalId, WireArrow,
+    WireKind, WireLine, WireOverride, WireStyle,
 };
 
 #[test]
@@ -40,6 +41,7 @@ fn topology_json_roundtrip() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
 
     let json = topo.to_json();
@@ -254,6 +256,7 @@ fn validate_rejects_bad_bus_references() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     assert_eq!(
         topo.validate(),
@@ -567,4 +570,104 @@ fn bus_hardware_binding_defaults_and_roundtrips() {
     assert!(hw.listen_only && !hw.receive_own);
     let back: CanBusConfig = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
     assert_eq!(back, b);
+}
+
+fn domain(id: u32, members: &[u32], parent: Option<u32>) -> Domain {
+    Domain {
+        id,
+        name: format!("D{id}"),
+        color: None,
+        members: members.iter().map(|m| NodeId(*m)).collect(),
+        bus_members: Vec::new(),
+        collapsed: false,
+        parent,
+    }
+}
+
+fn ecu_topology(ids: &[u32]) -> Topology {
+    let nodes: Vec<String> = ids
+        .iter()
+        .map(|i| format!(r#"{{"id":{i},"name":"E{i}","tx":[]}}"#))
+        .collect();
+    Topology::from_json(&format!(r#"{{"nodes":[{}]}}"#, nodes.join(","))).unwrap()
+}
+
+#[test]
+fn domains_and_wire_styles_roundtrip_and_old_json_loads() {
+    let old = Topology::from_json(r#"{"nodes":[],"buses":[]}"#).unwrap();
+    assert!(old.domains.is_empty() && old.wire_default.is_none() && old.wires.is_empty());
+    assert!(!old.to_json().contains("domains"));
+
+    let mut topo = ecu_topology(&[1, 2]);
+    topo.domains = vec![domain(1, &[1], None), domain(2, &[2], Some(1))];
+    topo.wire_default = Some(WireStyle {
+        line: Some(WireLine::Dotted),
+        ..Default::default()
+    });
+    topo.wires = vec![WireOverride {
+        node: NodeId(1),
+        bus: BusId(1),
+        style: WireStyle {
+            kind: Some(WireKind::Step),
+            arrow: Some(WireArrow::Diamond),
+            label: Some("x".into()),
+            ..Default::default()
+        },
+    }];
+    assert_eq!(Topology::from_json(&topo.to_json()).unwrap(), topo);
+    assert_eq!(topo.validate(), Ok(()));
+}
+
+#[test]
+fn domain_validation_errors() {
+    let mut topo = ecu_topology(&[1, 2]);
+    topo.domains = vec![domain(1, &[9], None)];
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::DomainUnknownNode {
+            domain: 1,
+            node: NodeId(9)
+        })
+    );
+    topo.domains = vec![domain(1, &[1], None), domain(2, &[1], None)];
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::NodeInTwoDomains(NodeId(1)))
+    );
+    topo.domains = vec![domain(1, &[1], Some(7))];
+    assert_eq!(
+        topo.validate(),
+        Err(TopologyError::DomainUnknownParent {
+            domain: 1,
+            parent: 7
+        })
+    );
+    topo.domains = vec![domain(1, &[], Some(2)), domain(2, &[], Some(1))];
+    assert!(matches!(
+        topo.validate(),
+        Err(TopologyError::DomainCycle(_))
+    ));
+    topo.domains = vec![domain(1, &[], Some(1))];
+    assert_eq!(topo.validate(), Err(TopologyError::DomainCycle(1)));
+    topo.domains = vec![domain(1, &[], None), domain(1, &[], None)];
+    assert_eq!(topo.validate(), Err(TopologyError::DuplicateDomain(1)));
+}
+
+#[test]
+fn wire_style_unset_fields_fall_back() {
+    let default = WireStyle {
+        kind: Some(WireKind::Straight),
+        width: Some(3.0),
+        ..Default::default()
+    };
+    let link = WireStyle {
+        kind: Some(WireKind::Step),
+        ..Default::default()
+    };
+    let r = link.over(&default);
+    assert_eq!(
+        (r.kind, r.width, r.line),
+        (Some(WireKind::Step), Some(3.0), None)
+    );
+    assert!(WireStyle::default().is_empty());
 }

@@ -1,6 +1,7 @@
 //! Light/dark visual themes, loosely inspired by classic CAN bus tooling.
 
 use egui::{Color32, Visuals};
+use egui_flow::FlowTheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppTheme {
@@ -15,6 +16,21 @@ impl AppTheme {
             AppTheme::Dark => dark_visuals(),
         };
         ctx.set_visuals(visuals);
+    }
+
+    /// Canvas colours: egui-flow's preset for the mode, with the canvas and
+    /// node fill taken from our visuals so nodes keep their usual look.
+    pub fn flow_theme(self) -> FlowTheme {
+        let (preset, v) = match self {
+            AppTheme::Light => (FlowTheme::light(), light_visuals()),
+            AppTheme::Dark => (FlowTheme::dark(), dark_visuals()),
+        };
+        FlowTheme {
+            background: Some(v.extreme_bg_color),
+            node_fill: Some(v.window_fill),
+            selection: Some(v.selection.bg_fill),
+            ..preset
+        }
     }
 
     pub fn bus_color(self, index: usize) -> Color32 {
@@ -91,4 +107,25 @@ fn dark_visuals() -> Visuals {
     v.faint_bg_color = Color32::from_rgb(0x2a, 0x2d, 0x34);
     v.selection.bg_fill = Color32::from_rgb(0x6c, 0xb6, 0xff);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_theme_uses_our_visuals_over_the_preset() {
+        for (theme, preset, v) in [
+            (AppTheme::Dark, FlowTheme::dark(), dark_visuals()),
+            (AppTheme::Light, FlowTheme::light(), light_visuals()),
+        ] {
+            let t = theme.flow_theme();
+            assert_eq!(t.background, Some(v.extreme_bg_color));
+            assert_eq!(t.node_fill, Some(v.window_fill));
+            assert_eq!(t.selection, Some(v.selection.bg_fill));
+            assert_eq!(t.grid, preset.grid);
+            assert_eq!(t.text, preset.text);
+        }
+        assert_ne!(AppTheme::Dark.flow_theme(), AppTheme::Light.flow_theme());
+    }
 }

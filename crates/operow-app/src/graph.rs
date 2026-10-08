@@ -3,15 +3,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use egui::{CornerRadius, Frame, Margin, Pos2, Stroke, pos2, vec2};
+use egui::{Color32, CornerRadius, Frame, Margin, Pos2, Stroke, pos2, vec2};
 use egui_flow::{
-    ArrowStyle, Connection, EdgeId, EdgeKind, EdgeLabelStyle, Editor, FlowEvent, FlowState,
-    FlowViewer, Handle, LineStyle, Node, NodeId as FlowId, PulseOverflow, PulseStyle, Side,
+    ArrowStyle, Connection, Edge, EdgeId, EdgeKind, EdgeLabelStyle, Editor, FlowEvent, FlowState,
+    FlowViewer, Handle, LayoutDirection, LayoutOptions, LineStyle, Node, NodeId as FlowId,
+    PulseOverflow, PulseStyle, Side,
 };
 
 use operow_core::{
-    BusEvent, BusId, CanBusConfig, DbcRef, EcuConfig, Link, NodeId, NodeKind, Topology, TxMessage,
-    UserSignalDef,
+    BusEvent, BusId, CanBusConfig, DbcRef, Domain, EcuConfig, Link, NodeId, NodeKind, Topology,
+    TxMessage, UserSignalDef, WireArrow, WireKind, WireLine, WireOverride, WireStyle,
 };
 use operow_engine::GENERATOR_NODE_BASE;
 
@@ -25,6 +26,13 @@ use crate::theme::AppTheme;
 
 /// Most pulses in flight on one wire; the oldest is replaced beyond this.
 const MAX_PULSES_PER_EDGE: usize = 16;
+/// Padding and header height of a domain group around its members.
+const DOMAIN_PADDING: f32 = 16.0;
+const DOMAIN_HEADER: f32 = 30.0;
+/// Size of a domain group until it is fitted to its members.
+const DOMAIN_SIZE: egui::Vec2 = vec2(220.0, 120.0);
+/// Seconds the free-form auto layout glides.
+const LAYOUT_SECONDS: f32 = 0.4;
 /// Smallest node size, as `egui-flow` defaults it.
 const MIN_NODE_SIZE: egui::Vec2 = vec2(60.0, 30.0);
 
@@ -34,6 +42,17 @@ const MIN_NODE_SIZE: egui::Vec2 = vec2(60.0, 30.0);
 pub enum GraphNode {
     Ecu(EcuConfig),
     Bus(CanBusConfig),
+    /// A network domain: an `egui-flow` group. Its members are the nodes
+    /// whose flow parent it is.
+    Domain(DomainNode),
+}
+
+/// Canvas data of a network domain.
+#[derive(Debug, Clone)]
+pub struct DomainNode {
+    pub id: u32,
+    pub name: String,
+    pub color: Option<[u8; 3]>,
 }
 
 impl GraphNode {
@@ -41,6 +60,7 @@ impl GraphNode {
         match self {
             GraphNode::Ecu(e) => &e.name,
             GraphNode::Bus(b) => &b.name,
+            GraphNode::Domain(d) => &d.name,
         }
     }
 
@@ -49,6 +69,7 @@ impl GraphNode {
         match self {
             GraphNode::Ecu(e) => NodeKey::Ecu(e.id.0),
             GraphNode::Bus(b) => NodeKey::Bus(b.id.0),
+            GraphNode::Domain(d) => NodeKey::Domain(d.id),
         }
     }
 }
@@ -115,6 +136,14 @@ pub struct Graph {
     free: HashMap<NodeKey, Place>,
     /// Saved positions and bar sizes of the bus-line layout.
     line: HashMap<NodeKey, Place>,
+    next_domain_id: u32,
+    /// Buses that belong to a domain while the bus-line view shows (bars
+    /// stay outside groups there); the canvas holds them in free-form.
+    bus_domain: Vec<(FlowId, FlowId)>,
+    /// Style of every wire without an override of its own.
+    pub wire_default: Option<WireStyle>,
+    /// Per-wire overrides, by the simulation ids of the link.
+    pub wire_styles: HashMap<(NodeId, BusId), WireStyle>,
     /// Undo/redo history and clipboard of the canvas.
     pub editor: Editor<GraphNode, ()>,
 }
@@ -135,6 +164,10 @@ impl Graph {
             view: NetworkView::default(),
             free: HashMap::new(),
             line: HashMap::new(),
+            next_domain_id: 1,
+            bus_domain: Vec::new(),
+            wire_default: None,
+            wire_styles: HashMap::new(),
         }
     }
 
@@ -185,7 +218,7 @@ impl Graph {
         }
         g.capture_active();
         g.view = NetworkView::BusLine;
-        g.apply_active();
+        g.apply_active(Vec::new());
         g.state.fit_view();
         g.reset_history();
         g
@@ -379,6 +412,7 @@ impl Graph {
                     nodes.push(cfg);
                 }
                 GraphNode::Bus(b) => buses.push(b.clone()),
+                GraphNode::Domain(_) => {}
             }
         }
 
@@ -393,6 +427,18 @@ impl Graph {
             }
         }
 
+        let mut wires: Vec<WireOverride> = self
+            .wire_styles
+            .iter()
+            .filter(|(k, s)| !s.is_empty() && links.iter().any(|l| (l.node, l.bus) == **k))
+            .map(|(&(node, bus), style)| WireOverride {
+                node,
+                bus,
+                style: style.clone(),
+            })
+            .collect();
+        wires.sort_by_key(|w| (w.bus, w.node));
+
         Topology {
             nodes,
             buses,
@@ -401,7 +447,42 @@ impl Graph {
             user_signals: self.user_signals.clone(),
             tests: self.tests.clone(),
             workspace: None,
+            domains: self.topology_domains(),
+            wire_default: self.wire_default.clone().filter(|s| !s.is_empty()),
+            wires,
         }
+    }
+
+    /// The domains of the canvas, with their members, for the topology.
+    fn topology_domains(&self) -> Vec<Domain> {
+        let members = self.memberships();
+        let mut out = Vec::new();
+        for n in &self.state.nodes {
+            let GraphNode::Domain(d) = &n.data else {
+                continue;
+            };
+            let mut dom = Domain {
+                id: d.id,
+                name: d.name.clone(),
+                color: d.color,
+                members: Vec::new(),
+                bus_members: Vec::new(),
+                collapsed: n.collapsed,
+                parent: n.parent.and_then(|p| self.domain_id(p)),
+            };
+            for &(child, group) in &members {
+                if group != n.id {
+                    continue;
+                }
+                match self.node(child) {
+                    Some(GraphNode::Ecu(e)) => dom.members.push(e.id),
+                    Some(GraphNode::Bus(b)) => dom.bus_members.push(b.id),
+                    _ => {}
+                }
+            }
+            out.push(dom);
+        }
+        out
     }
 
     /// Rebuild the graph from a loaded `Topology`. Positions come from the
@@ -419,6 +500,12 @@ impl Graph {
         g.databases = topo.databases.clone();
         g.user_signals = topo.user_signals.clone();
         g.tests = topo.tests.clone();
+        g.wire_default = topo.wire_default.clone();
+        g.wire_styles = topo
+            .wires
+            .iter()
+            .map(|w| ((w.node, w.bus), w.style.clone()))
+            .collect();
         let mut ecu_map = std::collections::HashMap::new();
         let mut bus_map = std::collections::HashMap::new();
 
@@ -440,6 +527,36 @@ impl Graph {
                 g.state.connect(ecu, bus, ());
             }
         }
+        let mut dom_map = HashMap::new();
+        for d in &topo.domains {
+            let node = GraphNode::Domain(DomainNode {
+                id: d.id,
+                name: d.name.clone(),
+                color: d.color,
+            });
+            dom_map.insert(d.id, g.state.add_group(Pos2::ZERO, DOMAIN_SIZE, node));
+            g.next_domain_id = g.next_domain_id.max(d.id + 1);
+        }
+        for d in &topo.domains {
+            let group = dom_map[&d.id];
+            for m in &d.members {
+                if let Some(&c) = ecu_map.get(m) {
+                    g.state.set_parent(c, Some(group));
+                }
+            }
+            // The graph starts in the bus-line view, where buses wait aside.
+            for b in &d.bus_members {
+                if let Some(&c) = bus_map.get(b) {
+                    g.bus_domain.push((c, group));
+                }
+            }
+            if let Some(&p) = d.parent.and_then(|p| dom_map.get(&p)) {
+                g.state.set_parent(group, Some(p));
+            }
+        }
+        for d in &topo.domains {
+            g.state.set_collapsed(dom_map[&d.id], d.collapsed);
+        }
         g.apply_layout(&old.network_layout());
         g
     }
@@ -455,21 +572,23 @@ impl Graph {
     /// view is showing, else the saved one, else the ECU's stored position.
     fn free_position(&self, node: &Node<GraphNode>) -> Pos2 {
         if self.view == NetworkView::FreeForm {
-            return node.position;
+            return self.state.abs_position(node.id).unwrap_or(node.position);
         }
         match self.free.get(&node.data.key()) {
             Some(p) => p.pos(),
             None => match &node.data {
                 GraphNode::Ecu(e) => pos2(e.pos.0, e.pos.1),
-                GraphNode::Bus(_) => node.position,
+                _ => node.position,
             },
         }
     }
 
-    fn place_of(node: &Node<GraphNode>) -> Place {
+    /// Where `node` is in flow space, whatever group it sits in.
+    fn place_of(&self, node: &Node<GraphNode>) -> Place {
+        let pos = self.state.abs_position(node.id).unwrap_or(node.position);
         Place {
-            x: node.position.x,
-            y: node.position.y,
+            x: pos.x,
+            y: pos.y,
             w: node.fixed_size.map(|s| s.x),
             h: node.fixed_size.map(|s| s.y),
         }
@@ -479,7 +598,7 @@ impl Graph {
         self.state
             .nodes
             .iter()
-            .map(|n| (n.data.key(), Self::place_of(n)))
+            .map(|n| (n.data.key(), self.place_of(n)))
             .collect()
     }
 
@@ -496,13 +615,18 @@ impl Graph {
 
     /// Put the nodes where the active view's saved layout says. Nodes it
     /// does not know get a free-form fallback, or are laid out for bus-line.
-    fn apply_active(&mut self) {
+    /// `members` is the (child, group) membership to restore afterwards;
+    /// the layout itself works on flow-space positions, outside any group.
+    fn apply_active(&mut self, members: Vec<(FlowId, FlowId)>) {
+        self.flatten();
         let view = self.view;
         let saved = match view {
             NetworkView::FreeForm => &self.free,
             NetworkView::BusLine => &self.line,
         };
         let mut missing = Vec::new();
+        // Domains without a saved place are fitted to their members below.
+        let mut unplaced = Vec::new();
         let mut bus_index = 0;
         for n in &mut self.state.nodes {
             let is_bus = matches!(n.data, GraphNode::Bus(_));
@@ -513,10 +637,11 @@ impl Graph {
                     n.position = p.pos();
                     n.fixed_size = p.size();
                 }
+                None if matches!(n.data, GraphNode::Domain(_)) => unplaced.push(n.id),
                 None if view == NetworkView::FreeForm => {
                     n.position = match &n.data {
                         GraphNode::Ecu(e) => pos2(e.pos.0, e.pos.1),
-                        GraphNode::Bus(_) => default_free_bus_pos(index),
+                        _ => default_free_bus_pos(index),
                     };
                     n.fixed_size = None;
                 }
@@ -529,12 +654,94 @@ impl Graph {
                 n.size = f;
             }
         }
+        let placeable = self
+            .state
+            .nodes
+            .iter()
+            .filter(|n| !matches!(n.data, GraphNode::Domain(_)))
+            .count();
         if view == NetworkView::BusLine && !missing.is_empty() {
-            if missing.len() == self.state.nodes.len() {
+            if missing.len() == placeable {
                 network_view::auto_arrange(&mut self.state);
             } else {
                 network_view::place_missing(&mut self.state, &missing);
             }
+        }
+        self.regroup(&members);
+        self.fit_domains(&unplaced);
+    }
+
+    /// Every (child, group) pair: from the canvas, plus the buses set aside
+    /// while the bus-line view shows.
+    fn memberships(&self) -> Vec<(FlowId, FlowId)> {
+        let mut v: Vec<_> = self
+            .state
+            .nodes
+            .iter()
+            .filter_map(|n| n.parent.map(|p| (n.id, p)))
+            .collect();
+        if self.view == NetworkView::BusLine {
+            v.extend(
+                self.bus_domain.iter().filter(|(c, g)| {
+                    self.state.node(*c).is_some() && self.state.node(*g).is_some()
+                }),
+            );
+        }
+        v
+    }
+
+    /// Take every node out of its group, keeping it where it is on screen.
+    fn flatten(&mut self) {
+        let ids: Vec<FlowId> = self.state.nodes.iter().map(|n| n.id).collect();
+        for id in ids {
+            self.state.set_parent(id, None);
+        }
+    }
+
+    /// Put `members` back into their groups. Bus bars stay outside groups in
+    /// the bus-line view (a group around a bar would wreck its row layout);
+    /// they are remembered for the free-form view.
+    fn regroup(&mut self, members: &[(FlowId, FlowId)]) {
+        self.bus_domain.clear();
+        for &(child, group) in members {
+            let is_bus = matches!(self.node(child), Some(GraphNode::Bus(_)));
+            if is_bus && self.view == NetworkView::BusLine {
+                self.bus_domain.push((child, group));
+            } else {
+                self.state.set_parent(child, Some(group));
+            }
+        }
+    }
+
+    /// Fit groups to their members, innermost first.
+    fn fit_domains(&mut self, groups: &[FlowId]) {
+        let mut groups = groups.to_vec();
+        groups.sort_by_key(|g| std::cmp::Reverse(self.state.depth(*g)));
+        for g in groups {
+            self.state.fit_group(g, DOMAIN_PADDING, DOMAIN_HEADER);
+        }
+    }
+
+    fn domain_nodes(&self) -> Vec<FlowId> {
+        self.state
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.data, GraphNode::Domain(_)))
+            .map(|n| n.id)
+            .collect()
+    }
+
+    pub fn domain_name(&self, flow: FlowId) -> Option<&str> {
+        match self.node(flow)? {
+            GraphNode::Domain(d) => Some(&d.name),
+            _ => None,
+        }
+    }
+
+    fn domain_id(&self, flow: FlowId) -> Option<u32> {
+        match self.node(flow)? {
+            GraphNode::Domain(d) => Some(d.id),
+            _ => None,
         }
     }
 
@@ -546,8 +753,9 @@ impl Graph {
             return;
         }
         self.capture_active();
+        let members = self.memberships();
         self.view = view;
-        self.apply_active();
+        self.apply_active(members);
         self.state.fit_view();
         self.reset_history();
     }
@@ -576,10 +784,11 @@ impl Graph {
 
     /// Restore a saved layout: both position sets and the active view.
     pub fn apply_layout(&mut self, layout: &NetworkLayout) {
+        let members = self.memberships();
         self.free = layout.free.iter().copied().collect();
         self.line = layout.line.iter().copied().collect();
         self.view = layout.mode;
-        self.apply_active();
+        self.apply_active(members);
         self.state.fit_view();
         self.reset_history();
     }
@@ -587,14 +796,186 @@ impl Graph {
     /// Lay the bus-line view out: buses stacked, ECUs above their bus,
     /// gateways between the buses they bridge.
     pub fn auto_arrange(&mut self) {
+        let members = self.memberships();
+        self.flatten();
         network_view::auto_arrange(&mut self.state);
+        self.regroup(&members);
+        let groups = self.domain_nodes();
+        self.fit_domains(&groups);
         self.state.fit_view();
         self.editor.commit(&self.state);
+    }
+
+    /// Free-form view: arrange the nodes top to bottom along their wires,
+    /// gliding there. The canvas sends `LayoutFinished` when it arrives.
+    pub fn auto_layout(&mut self, animate: bool) {
+        let options = LayoutOptions {
+            direction: LayoutDirection::TopToBottom,
+            ..Default::default()
+        };
+        if animate {
+            self.state.auto_layout_animated(&options, LAYOUT_SECONDS);
+        } else {
+            self.state.auto_layout(&options);
+            self.state.fit_view();
+        }
     }
 
     /// Forget undo history (after the canvas content was replaced).
     pub fn reset_history(&mut self) {
         self.editor = Editor::new(&self.state);
+    }
+
+    // ---- domains ---------------------------------------------------------
+
+    /// Every domain on the canvas, with the number of nodes it holds directly.
+    pub fn domains(&self) -> Vec<(FlowId, &DomainNode)> {
+        self.state
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                GraphNode::Domain(d) => Some((n.id, d)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Direct members of a domain (nodes and nested domains), in canvas order.
+    pub fn domain_members(&self, group: FlowId) -> Vec<FlowId> {
+        self.memberships()
+            .into_iter()
+            .filter(|m| m.1 == group)
+            .map(|m| m.0)
+            .collect()
+    }
+
+    fn new_domain(&mut self, name: &str) -> DomainNode {
+        let id = self.next_domain_id;
+        self.next_domain_id += 1;
+        DomainNode {
+            id,
+            name: name.to_string(),
+            color: None,
+        }
+    }
+
+    /// Wrap the selected nodes in a new domain. Bus bars are left out in the
+    /// bus-line view. `None` when nothing suitable is selected.
+    pub fn group_selection(&mut self, name: &str) -> Option<FlowId> {
+        if self.view == NetworkView::BusLine {
+            for n in &mut self.state.nodes {
+                n.selected &= !matches!(n.data, GraphNode::Bus(_));
+            }
+        }
+        let data = self.new_domain(name);
+        let group =
+            self.state
+                .group_selected(GraphNode::Domain(data), DOMAIN_PADDING, DOMAIN_HEADER);
+        if group.is_some() {
+            self.editor.commit(&self.state);
+        } else {
+            self.next_domain_id -= 1;
+        }
+        group
+    }
+
+    /// Take `id` out of its domain, or dissolve it if it is one (its
+    /// members stay where they are).
+    pub fn ungroup(&mut self, id: FlowId) {
+        let done = if self.domain_id(id).is_some() {
+            self.state.ungroup(id)
+        } else {
+            self.state.node(id).is_some_and(|n| n.parent.is_some())
+                && self.state.set_parent(id, None)
+        };
+        if done {
+            self.editor.commit(&self.state);
+        }
+    }
+
+    pub fn ungroup_selection(&mut self) {
+        let selected = self.state.selected_nodes();
+        for id in selected {
+            self.ungroup(id);
+        }
+    }
+
+    pub fn rename_domain(&mut self, group: FlowId, name: &str) {
+        if let Some(GraphNode::Domain(d)) = self.node_mut(group) {
+            d.name = name.to_string();
+            self.editor.commit(&self.state);
+        }
+    }
+
+    /// Nodes attached to exactly one bus, per bus, that are not in a domain
+    /// yet: `(bus name, members)`. Gateways stay out.
+    fn per_bus_groups(&self) -> Vec<(String, Vec<FlowId>)> {
+        let mut out = Vec::new();
+        for bus in &self.state.nodes {
+            let GraphNode::Bus(b) = &bus.data else {
+                continue;
+            };
+            let members: Vec<FlowId> = self
+                .state
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.parent.is_none()
+                        && matches!(&n.data, GraphNode::Ecu(e)
+                            if !matches!(e.kind, NodeKind::Gateway { .. }))
+                })
+                .filter(|n| {
+                    let mut targets = self.state.edges.iter().filter(|e| e.source == n.id);
+                    targets.next().is_some_and(|e| e.target == bus.id)
+                        && targets.all(|e| e.target == bus.id)
+                })
+                .map(|n| n.id)
+                .collect();
+            if !members.is_empty() {
+                out.push((b.name.clone(), members));
+            }
+        }
+        out
+    }
+
+    /// One domain per bus holding the nodes attached only to that bus.
+    /// Returns how many were made.
+    pub fn create_domains_per_bus(&mut self) -> usize {
+        let groups = self.per_bus_groups();
+        for (name, members) in &groups {
+            let data = self.new_domain(name);
+            let group = self
+                .state
+                .add_group(Pos2::ZERO, DOMAIN_SIZE, GraphNode::Domain(data));
+            for m in members {
+                self.state.set_parent(*m, Some(group));
+            }
+            self.state.fit_group(group, DOMAIN_PADDING, DOMAIN_HEADER);
+        }
+        if !groups.is_empty() {
+            self.editor.commit(&self.state);
+        }
+        groups.len()
+    }
+
+    // ---- wire styles -----------------------------------------------------
+
+    /// The link an edge stands for.
+    pub fn wire_key(&self, edge: EdgeId) -> Option<(NodeId, BusId)> {
+        let e = self.state.edge(edge)?;
+        match (self.node(e.source)?, self.node(e.target)?) {
+            (GraphNode::Ecu(n), GraphNode::Bus(b)) => Some((n.id, b.id)),
+            _ => None,
+        }
+    }
+
+    /// Store `style` as the override of a wire (an empty one removes it).
+    pub fn set_wire_style(&mut self, key: (NodeId, BusId), style: WireStyle) {
+        if style.is_empty() {
+            self.wire_styles.remove(&key);
+        } else {
+            self.wire_styles.insert(key, style);
+        }
     }
 
     // ---- per-frame upkeep ----------------------------------------------
@@ -643,7 +1024,7 @@ impl Graph {
             NetworkView::BusLine => network_view::plan_bus_line(&self.state),
             NetworkView::FreeForm => HandlePlan::default(),
         };
-        let looks: Vec<(EdgeId, EdgeLook)> = self
+        let looks: Vec<(EdgeId, EdgeLook, (NodeId, BusId))> = self
             .state
             .edges
             .iter()
@@ -653,10 +1034,10 @@ impl Graph {
                 else {
                     return None;
                 };
-                Some((e.id, network_view::edge_look(ecu, bus.id)))
+                Some((e.id, network_view::edge_look(ecu, bus.id), (ecu.id, bus.id)))
             })
             .collect();
-        for (id, look) in looks {
+        for (id, look, key) in looks {
             let handles = plan
                 .edges
                 .get(&id)
@@ -687,6 +1068,11 @@ impl Graph {
                 color: Some(theme.gateway_color()),
                 background: None,
             };
+            if let Some(style) =
+                resolved_wire_style(self.wire_styles.get(&key), self.wire_default.as_ref())
+            {
+                apply_wire_style(e, &style);
+            }
         }
         (plan, pruned)
     }
@@ -698,16 +1084,19 @@ impl Graph {
     pub fn fix_duplicate_ids(&mut self) -> bool {
         let mut seen_ecu = HashSet::new();
         let mut seen_bus = HashSet::new();
+        let mut seen_domain = HashSet::new();
+        let mut domain_dups = Vec::new();
         let mut ecu_dups = Vec::new();
         let mut bus_dups = Vec::new();
         for (i, n) in self.state.nodes.iter().enumerate() {
             match &n.data {
                 GraphNode::Ecu(e) if !seen_ecu.insert(e.id) => ecu_dups.push(i),
                 GraphNode::Bus(b) if !seen_bus.insert(b.id) => bus_dups.push(i),
+                GraphNode::Domain(d) if !seen_domain.insert(d.id) => domain_dups.push(i),
                 _ => {}
             }
         }
-        if ecu_dups.is_empty() && bus_dups.is_empty() {
+        if ecu_dups.is_empty() && bus_dups.is_empty() && domain_dups.is_empty() {
             return false;
         }
         let mut names: HashSet<String> = self
@@ -716,6 +1105,15 @@ impl Graph {
             .iter()
             .map(|n| n.data.name().to_string())
             .collect();
+        for i in domain_dups {
+            let new = self.next_domain_id;
+            self.next_domain_id += 1;
+            if let GraphNode::Domain(d) = &mut self.state.nodes[i].data {
+                d.id = new;
+                d.name = copy_name(&d.name, &names);
+                names.insert(d.name.clone());
+            }
+        }
         // New bus node -> (id it was copied with, id it has now).
         let mut bus_map: HashMap<FlowId, (BusId, BusId)> = HashMap::new();
         for i in bus_dups {
@@ -914,6 +1312,18 @@ impl Graph {
                         continue;
                     }
                 }
+                FlowEvent::ParentChanged {
+                    node,
+                    parent: Some(_),
+                } if self.view == NetworkView::BusLine
+                    && matches!(self.node(*node), Some(GraphNode::Bus(_))) =>
+                {
+                    // Bars stay outside domains in the bus-line view.
+                    self.state.set_parent(*node, None);
+                    log.push("bus bars cannot join a domain in the bus-line view".to_string());
+                    continue;
+                }
+                FlowEvent::LayoutFinished => self.capture_active(),
                 _ => {}
             }
             kept.push(ev.clone());
@@ -927,6 +1337,63 @@ impl Graph {
             self.restore_data(data);
         }
         log
+    }
+}
+
+/// The style a wire gets from its override and the project default, `None`
+/// when neither sets anything (the automatic look stays).
+pub fn resolved_wire_style(
+    own: Option<&WireStyle>,
+    default: Option<&WireStyle>,
+) -> Option<WireStyle> {
+    let style = match (own, default) {
+        (Some(o), Some(d)) => o.over(d),
+        (Some(s), None) | (None, Some(s)) => s.clone(),
+        (None, None) => return None,
+    };
+    (!style.is_empty()).then_some(style)
+}
+
+/// Write the fields `style` sets into `edge`, leaving the rest as they are.
+pub fn apply_wire_style(edge: &mut Edge<()>, style: &WireStyle) {
+    if let Some(k) = style.kind {
+        edge.kind = Some(match k {
+            WireKind::Bezier => EdgeKind::Bezier,
+            WireKind::Straight => EdgeKind::Straight,
+            WireKind::Step => EdgeKind::Step,
+            WireKind::SmoothStep => EdgeKind::SmoothStep,
+        });
+    }
+    if let Some(l) = style.line {
+        edge.line_style = match l {
+            WireLine::Solid => LineStyle::Solid,
+            WireLine::Dashed => LineStyle::Dashed,
+            WireLine::Dotted => LineStyle::Dotted,
+        };
+    }
+    if let Some([r, g, b]) = style.color {
+        edge.color = Some(Color32::from_rgb(r, g, b));
+    }
+    if let Some(w) = style.width {
+        edge.width = Some(w);
+    }
+    if let Some(a) = style.arrow {
+        edge.arrow = a != WireArrow::None;
+        edge.arrow_style = match a {
+            WireArrow::Open => ArrowStyle::Open,
+            WireArrow::Circle => ArrowStyle::Circle,
+            WireArrow::Diamond => ArrowStyle::Diamond,
+            WireArrow::None | WireArrow::Triangle => ArrowStyle::Triangle,
+        };
+    }
+    if let Some(a) = style.arrow_at_source {
+        edge.arrow_at_source = a;
+    }
+    if let Some(a) = style.animated {
+        edge.animated = a;
+    }
+    if let Some(l) = &style.label {
+        edge.label = Some(l.clone()).filter(|l| !l.is_empty());
     }
 }
 
@@ -1062,7 +1529,7 @@ impl GraphViewer {
     fn badge_of(&self, data: &GraphNode) -> Option<NodeBadge> {
         match data {
             GraphNode::Ecu(e) => self.badges.get(&e.id).copied(),
-            GraphNode::Bus(_) => None,
+            GraphNode::Bus(_) | GraphNode::Domain(_) => None,
         }
     }
 }
@@ -1094,6 +1561,18 @@ pub fn bus_bar_label(b: &CanBusConfig, load: Option<f64>, errors: u64) -> String
 
 impl FlowViewer<GraphNode, ()> for GraphViewer {
     fn node_ui(&mut self, ui: &mut egui::Ui, node: &mut Node<GraphNode>) {
+        if let GraphNode::Domain(d) = &node.data {
+            // Room on the right for the collapse toggle the canvas draws.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&d.name)
+                        .strong()
+                        .color(self.accent(&node.data)),
+                );
+                ui.add_space(28.0);
+            });
+            return;
+        }
         if let (NetworkView::BusLine, GraphNode::Bus(b)) = (self.view, &node.data) {
             ui.horizontal(|ui| {
                 ui.add(icons::icon_image(ui, icons::bus()));
@@ -1114,6 +1593,7 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
                 (icons::replay(), node.data.name().to_string())
             }
             GraphNode::Ecu(_) => (icons::ecu(), node.data.name().to_string()),
+            GraphNode::Domain(_) => unreachable!("handled above"),
             GraphNode::Bus(b) if b.fd_enabled => (
                 icons::bus(),
                 format!(
@@ -1171,6 +1651,7 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
         match node.data {
             GraphNode::Ecu(_) => vec![Handle::source(Handle::DEFAULT_SOURCE, Side::Bottom)],
             GraphNode::Bus(_) => vec![Handle::target(Handle::DEFAULT_TARGET, Side::Top)],
+            GraphNode::Domain(_) => Vec::new(),
         }
     }
 
@@ -1180,6 +1661,14 @@ impl FlowViewer<GraphNode, ()> for GraphViewer {
 
     fn node_frame(&self, ui: &egui::Ui, node: &Node<GraphNode>) -> Frame {
         let accent = self.accent(&node.data);
+        if let GraphNode::Domain(_) = &node.data {
+            let [r, g, b, _] = accent.to_array();
+            return Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(r, g, b, 30))
+                .stroke(Stroke::new(1.5_f32, accent))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(12, 6));
+        }
         if let (NetworkView::BusLine, GraphNode::Bus(_)) = (self.view, &node.data) {
             return Frame::new()
                 .fill(ui.visuals().window_fill.lerp_to_gamma(accent, 0.2))
@@ -1240,6 +1729,10 @@ impl GraphViewer {
             }
             GraphNode::Ecu(_) => self.theme.bus_color(1),
             GraphNode::Bus(_) => self.theme.bus_color(0),
+            GraphNode::Domain(d) => d.color.map_or_else(
+                || self.theme.bus_color(d.id as usize + 2),
+                |[r, g, b]| Color32::from_rgb(r, g, b),
+            ),
         }
     }
 }
@@ -1455,6 +1948,197 @@ mod tests {
         g.set_view(NetworkView::BusLine);
         let pos = g.to_topology().nodes[0].pos;
         assert_eq!(pos, (5.0, 6.0));
+    }
+
+    /// The demo graph in free-form, with Engine and Brake in a domain.
+    fn grouped() -> (Graph, FlowId, FlowId, FlowId) {
+        let mut g = Graph::default_demo();
+        g.set_view(NetworkView::FreeForm);
+        let ids: Vec<FlowId> = g.state.nodes.iter().map(|n| n.id).collect();
+        let (bus, engine, brake) = (ids[0], ids[1], ids[2]);
+        g.state.clear_selection();
+        g.state.node_mut(engine).unwrap().selected = true;
+        g.state.node_mut(brake).unwrap().selected = true;
+        let group = g.group_selection("Drive").unwrap();
+        (g, group, engine, bus)
+    }
+
+    #[test]
+    fn domains_round_trip_through_the_topology() {
+        let (mut g, group, engine, bus) = grouped();
+        g.state.set_parent(bus, Some(group));
+        g.state.set_collapsed(group, true);
+        let topo = g.to_topology();
+        assert_eq!(topo.validate(), Ok(()));
+        let d = &topo.domains[0];
+        assert_eq!(
+            (d.name.as_str(), d.collapsed, d.parent),
+            ("Drive", true, None)
+        );
+        assert_eq!((d.members.len(), d.bus_members.len()), (2, 1));
+        let g2 = Graph::from_topology(&topo);
+        let again = g2.to_topology();
+        assert_eq!(again.domains, topo.domains);
+        // Collapse and membership follow the canvas (ParentChanged / GroupToggled).
+        let mut g3 = Graph::from_topology(&topo);
+        let (group3, _) = g3.domains().first().map(|(i, d)| (*i, d.id)).unwrap();
+        let e3 = g3
+            .state
+            .nodes
+            .iter()
+            .find(|n| n.parent == Some(group3))
+            .unwrap()
+            .id;
+        g3.state.set_parent(e3, None);
+        g3.state.set_collapsed(group3, false);
+        let d3 = &g3.to_topology().domains[0];
+        assert!(!d3.collapsed && d3.members.len() + d3.bus_members.len() == 2);
+        let _ = engine;
+    }
+
+    #[test]
+    fn positions_survive_groups_in_both_views() {
+        let (mut g, group, engine, _) = grouped();
+        let abs = g.state.abs_position(engine).unwrap();
+        g.state.node_mut(group).unwrap().position += vec2(100.0, 50.0);
+        let moved = g.state.abs_position(engine).unwrap();
+        assert_eq!(moved, abs + vec2(100.0, 50.0));
+        // Relative position differs from the absolute one, but the topology
+        // and the saved layout store flow-space positions.
+        assert_ne!(g.state.node(engine).unwrap().position, moved);
+        assert_eq!(g.to_topology().nodes[0].pos, (moved.x, moved.y));
+        g.set_view(NetworkView::BusLine);
+        g.set_view(NetworkView::FreeForm);
+        assert_eq!(g.state.abs_position(engine), Some(moved));
+        assert_eq!(g.state.node(engine).unwrap().parent, Some(group));
+        let layout = g.network_layout();
+        let g2 = {
+            let mut g2 = Graph::from_topology(&g.to_topology());
+            g2.apply_layout(&layout);
+            g2
+        };
+        let e2 = g2
+            .state
+            .nodes
+            .iter()
+            .find(|n| n.data.name() == "Engine")
+            .unwrap();
+        assert_eq!(g2.state.abs_position(e2.id), Some(moved));
+    }
+
+    #[test]
+    fn buses_stay_out_of_domains_in_bus_line_but_keep_membership() {
+        let (mut g, group, _, bus) = grouped();
+        g.state.set_parent(bus, Some(group));
+        g.set_view(NetworkView::BusLine);
+        assert_eq!(g.state.node(bus).unwrap().parent, None);
+        assert_eq!(g.to_topology().domains[0].bus_members.len(), 1);
+        // Dropping a bar into a group is reverted.
+        g.process_events(&[FlowEvent::ParentChanged {
+            node: bus,
+            parent: Some(group),
+        }]);
+        assert_eq!(g.state.node(bus).unwrap().parent, None);
+        g.set_view(NetworkView::FreeForm);
+        assert_eq!(g.state.node(bus).unwrap().parent, Some(group));
+    }
+
+    #[test]
+    fn domains_per_bus_leave_gateways_and_shared_nodes_out() {
+        let mut g = Graph::new();
+        let b1 = g.add_bus(Pos2::ZERO);
+        let b2 = g.add_bus(Pos2::new(0.0, 200.0));
+        let a = g.add_ecu(Pos2::new(0.0, -100.0), "A");
+        let shared = g.add_ecu(Pos2::new(100.0, -100.0), "Shared");
+        let gw = g.add_gateway(Pos2::new(200.0, -100.0));
+        let loose = g.add_ecu(Pos2::new(300.0, -100.0), "Loose");
+        g.state.connect(a, b1, ()).unwrap();
+        g.state.connect(shared, b1, ()).unwrap();
+        g.state.connect(shared, b2, ()).unwrap();
+        g.state.connect(gw, b1, ()).unwrap();
+        assert_eq!(g.per_bus_groups(), vec![("CAN1".to_string(), vec![a])]);
+        assert_eq!(g.create_domains_per_bus(), 1);
+        assert!(g.state.node(a).unwrap().parent.is_some());
+        for n in [shared, gw, loose] {
+            assert_eq!(g.state.node(n).unwrap().parent, None);
+        }
+        // Running it again finds nothing new.
+        assert_eq!(g.create_domains_per_bus(), 0);
+    }
+
+    #[test]
+    fn pasted_domains_get_fresh_ids() {
+        let (mut g, group, _, _) = grouped();
+        let copy = g
+            .state
+            .add_group(Pos2::ZERO, DOMAIN_SIZE, g.node(group).unwrap().clone());
+        assert!(g.fix_duplicate_ids());
+        let ids: HashSet<u32> = g.domains().iter().map(|(_, d)| d.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(g.domain_name(copy), Some("Drive (copy)"));
+    }
+
+    #[test]
+    fn wire_style_resolves_link_then_default_then_automatic() {
+        let mut edge = Graph::default_demo().state.edges[0].clone();
+        edge.width = Some(9.0);
+        let default = WireStyle {
+            width: Some(2.0),
+            line: Some(WireLine::Dotted),
+            ..Default::default()
+        };
+        let own = WireStyle {
+            line: Some(WireLine::Dashed),
+            arrow: Some(WireArrow::Diamond),
+            color: Some([1, 2, 3]),
+            animated: Some(true),
+            label: Some("x".into()),
+            kind: Some(WireKind::SmoothStep),
+            ..Default::default()
+        };
+        assert_eq!(resolved_wire_style(None, None), None);
+        let r = resolved_wire_style(Some(&own), Some(&default)).unwrap();
+        assert_eq!((r.line, r.width), (Some(WireLine::Dashed), Some(2.0)));
+        apply_wire_style(&mut edge, &r);
+        assert_eq!(edge.line_style, LineStyle::Dashed);
+        assert_eq!(edge.width, Some(2.0));
+        assert_eq!(edge.kind, Some(EdgeKind::SmoothStep));
+        assert_eq!(edge.color, Some(Color32::from_rgb(1, 2, 3)));
+        assert!(edge.arrow && edge.animated);
+        assert_eq!(edge.arrow_style, ArrowStyle::Diamond);
+        assert_eq!(edge.label.as_deref(), Some("x"));
+        // Unset fields keep the automatic look; "no arrow" hides it.
+        let mut edge = Graph::default_demo().state.edges[0].clone();
+        edge.width = Some(9.0);
+        let none = WireStyle {
+            arrow: Some(WireArrow::None),
+            ..Default::default()
+        };
+        apply_wire_style(&mut edge, &none);
+        assert_eq!((edge.width, edge.arrow), (Some(9.0), false));
+    }
+
+    #[test]
+    fn wire_styles_round_trip_and_drop_with_their_link() {
+        let mut g = Graph::default_demo();
+        let link = g.links()[0];
+        let style = WireStyle {
+            width: Some(4.0),
+            ..Default::default()
+        };
+        g.set_wire_style((link.node, link.bus), style.clone());
+        g.wire_default = Some(WireStyle {
+            line: Some(WireLine::Dotted),
+            ..Default::default()
+        });
+        g.set_wire_style((NodeId(99), BusId(99)), style.clone());
+        let topo = g.to_topology();
+        assert_eq!(topo.wires.len(), 1, "style of a missing link is dropped");
+        let g2 = Graph::from_topology(&topo);
+        assert_eq!(g2.wire_styles.get(&(link.node, link.bus)), Some(&style));
+        assert_eq!(g2.wire_default, g.wire_default);
+        g.set_wire_style((link.node, link.bus), WireStyle::default());
+        assert!(g.to_topology().wires.is_empty());
     }
 
     #[test]

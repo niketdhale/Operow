@@ -67,6 +67,7 @@ impl NetworkView {
 pub enum NodeKey {
     Ecu(u32),
     Bus(u32),
+    Domain(u32),
 }
 
 /// Saved position (and size, when resized) of one node.
@@ -144,6 +145,11 @@ struct Wire {
     above: bool,
 }
 
+/// Vertical centre of a node in flow space, whatever group it sits in.
+fn center_y(state: &FlowState<GraphNode, ()>, n: &egui_flow::Node<GraphNode>) -> f32 {
+    state.abs_rect(n.id).unwrap_or_else(|| n.rect()).center().y
+}
+
 /// Which wires of `state` run ECU -> bus, in a stable order.
 fn wires(state: &FlowState<GraphNode, ()>) -> Vec<Wire> {
     let mut out = Vec::new();
@@ -160,7 +166,7 @@ fn wires(state: &FlowState<GraphNode, ()>) -> Vec<Wire> {
             bus: b.id,
             ecu_id: ecu.id.0,
             bus_id: bus.id.0,
-            above: a.rect().center().y < b.rect().center().y,
+            above: center_y(state, a) < center_y(state, b),
         });
     }
     out.sort_by_key(|w| (w.ecu, w.bus_id));
@@ -195,7 +201,8 @@ pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
                 .entry(w.ecu)
                 .or_default()
                 .push(Handle::source(src, ecu_side).with_offset(off));
-            let anchor = ecu.position.x + ecu.size.x * off;
+            let ecu_x = state.abs_position(ecu.id).unwrap_or(ecu.position).x;
+            let anchor = ecu_x + ecu.size.x * off;
             let boff = bus_handle_offset(bus.position.x, bus.size.x, anchor);
             bus_handles
                 .entry(w.bus)
@@ -209,7 +216,7 @@ pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
         .nodes
         .iter()
         .filter(|n| matches!(n.data, GraphNode::Bus(_)))
-        .map(|n| n.rect().center().y)
+        .map(|n| center_y(state, n))
         .fold(f32::NEG_INFINITY, f32::max);
     for n in &state.nodes {
         match &n.data {
@@ -218,7 +225,7 @@ pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
                 hs.sort_by_key(|h| h.id);
                 if hs.is_empty() {
                     // Not wired yet: one handle facing the nearest bar.
-                    let below_all = n.rect().center().y > lowest_bus;
+                    let below_all = center_y(state, n) > lowest_bus;
                     let side = if below_all { Side::Top } else { Side::Bottom };
                     hs.push(Handle::source(Handle::DEFAULT_SOURCE, side));
                 }
@@ -232,6 +239,7 @@ pub fn plan_bus_line(state: &FlowState<GraphNode, ()>) -> HandlePlan {
                 hs.push(Handle::target(BUS_SPARE_BOTTOM, Side::Bottom).with_offset(0.02));
                 plan.nodes.insert(n.id, hs);
             }
+            GraphNode::Domain(_) => {}
         }
     }
     plan
@@ -341,6 +349,7 @@ pub fn place_missing(state: &mut FlowState<GraphNode, ()>, missing: &[FlowId]) {
             s.nodes
                 .iter()
                 .filter(|n| n.id != id && !is_missing(n.id))
+                .filter(|n| !matches!(n.data, GraphNode::Domain(_)))
                 .map(|n| n.rect())
                 .reduce(|a, b| a.union(b))
         };

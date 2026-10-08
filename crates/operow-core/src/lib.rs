@@ -12,9 +12,10 @@ pub use frame::{CanFrame, FrameError, dlc_to_len, is_valid_fd_len, len_to_dlc};
 pub use idexpr::IdExpr;
 pub use ids::{BusId, NodeId, Timestamp};
 pub use topology::{
-    CanBusConfig, DbcRef, DiagConfig, DidEntry, DtcEntry, EcuConfig, HwBinding, IdFilter, KeyAlgo,
-    Link, NodeKind, RouteRule, SecurityConfig, SendType, SignalByteOrder, Topology, TopologyError,
-    TopologyJsonError, TxMessage, UserSignalDef, UserSignalId,
+    CanBusConfig, DbcRef, DiagConfig, DidEntry, Domain, DtcEntry, EcuConfig, HwBinding, IdFilter,
+    KeyAlgo, Link, NodeKind, RouteRule, SecurityConfig, SendType, SignalByteOrder, Topology,
+    TopologyError, TopologyJsonError, TxMessage, UserSignalDef, UserSignalId, WireArrow, WireKind,
+    WireLine, WireOverride, WireStyle,
 };
 
 #[cfg(test)]

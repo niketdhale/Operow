@@ -96,6 +96,12 @@ pub struct StartupOptions {
     pub demo_diag_dtcs: bool,
     /// `--network-view freeform|busline`: the Network window layout.
     pub network_view: Option<NetworkView>,
+    /// `--auto-layout`: arrange the free-form view top to bottom.
+    pub auto_layout: bool,
+    /// `--demo-domains`: one domain per bus, the last one collapsed.
+    pub demo_domains: bool,
+    /// `--demo-wires`: a few customised wires.
+    pub demo_wires: bool,
     /// `--demo-logging`: open the Logging window with a signal trigger and
     /// log into the temp folder while the measurement runs.
     pub demo_logging: bool,
@@ -597,6 +603,18 @@ impl OperowApp {
         if let Some(view) = opts.network_view {
             self.graph.set_view(view);
         }
+        if opts.auto_layout {
+            self.graph.auto_layout(false);
+        }
+        if opts.demo_domains {
+            self.graph.create_domains_per_bus();
+            if let Some((last, _)) = self.graph.domains().last().copied() {
+                self.graph.state.set_collapsed(last, true);
+            }
+        }
+        if opts.demo_wires {
+            self.demo_wires();
+        }
         if let Some(path) = opts.open_log.as_deref() {
             self.open_log_auto(path);
         }
@@ -815,6 +833,34 @@ impl OperowApp {
         self.logging.trigger.pre_trigger_s = 0.5;
         self.logging.trigger.post_trigger_s = 1.0;
         self.show_logging = true;
+    }
+
+    /// `--demo-wires`: restyle the first two wires and the project default.
+    fn demo_wires(&mut self) {
+        use operow_core::{WireArrow, WireKind, WireLine, WireStyle};
+        let links = self.graph.links();
+        let styles = [
+            WireStyle {
+                color: Some([255, 140, 0]),
+                width: Some(3.0),
+                animated: Some(true),
+                ..Default::default()
+            },
+            WireStyle {
+                kind: Some(WireKind::SmoothStep),
+                line: Some(WireLine::Dotted),
+                arrow: Some(WireArrow::Diamond),
+                label: Some("diag".into()),
+                ..Default::default()
+            },
+        ];
+        for (link, style) in links.iter().zip(styles) {
+            self.graph.set_wire_style((link.node, link.bus), style);
+        }
+        self.graph.wire_default = Some(WireStyle {
+            width: Some(2.0),
+            ..Default::default()
+        });
     }
 
     /// `--demo-graph`: EngineSpeed on Y1, Throttle on Y2 and Running as a
@@ -2555,6 +2601,46 @@ impl OperowApp {
                 {
                     self.graph.add_bus(egui::pos2(40.0, 200.0));
                     ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        selected,
+                        egui::Button::new("Group selection as domain\u{2026}"),
+                    )
+                    .clicked()
+                {
+                    let prompt = crate::windows::DomainPrompt::Group("Domain".into());
+                    crate::windows::request_domain_prompt(ui.ctx(), prompt);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(selected, egui::Button::new("Ungroup"))
+                    .clicked()
+                {
+                    self.graph.ungroup_selection();
+                    ui.close();
+                }
+                let one_domain = self
+                    .graph
+                    .selected()
+                    .and_then(|id| self.graph.domain_name(id).map(|n| (id, n.to_string())));
+                if let Some((id, name)) = one_domain {
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Rename domain\u{2026}"))
+                        .clicked()
+                    {
+                        let prompt = crate::windows::DomainPrompt::Rename(id, name);
+                        crate::windows::request_domain_prompt(ui.ctx(), prompt);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Delete domain (keep members)"))
+                        .clicked()
+                    {
+                        self.graph.remove(id);
+                        ui.close();
+                    }
                 }
             });
             ui.menu_button("Window", |ui| {

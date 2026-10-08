@@ -73,6 +73,7 @@ fn topo_with_two_senders() -> Topology {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 
@@ -135,6 +136,7 @@ fn periodic_message_produces_expected_frame_count() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
 
     let mut sim = Simulation::new(&topo).unwrap();
@@ -215,6 +217,7 @@ fn sender_does_not_receive_its_own_frame() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
 
     let sender_count = Arc::new(AtomicU32::new(0));
@@ -308,6 +311,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 
@@ -412,6 +416,7 @@ fn gateway_topo(routes: Vec<RouteRule>) -> Topology {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 
@@ -432,6 +437,7 @@ fn send_on_only_hits_chosen_bus() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     let out = run_ms(&topo, 5);
     assert_eq!(out.len(), 1);
@@ -459,6 +465,7 @@ fn send_fans_out_with_shared_uid() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     let out = run_ms(&topo, 5);
     assert_eq!(out.len(), 2);
@@ -553,6 +560,7 @@ fn gateways_forwarding_to_each_other_stop_at_max_hops() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     let mut sim = Simulation::new(&topo).unwrap();
     let mut out = Vec::new();
@@ -580,6 +588,7 @@ fn send_type_sim(send_type: SendType, enabled: bool) -> Simulation {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     Simulation::new(&topo).unwrap()
 }
@@ -724,6 +733,7 @@ fn set_payload_keeps_id_and_ignores_extra_bytes() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     let mut sim = Simulation::new(&topo).unwrap();
     // Shorter keeps the rest; longer is truncated to the frame length.
@@ -762,6 +772,7 @@ fn gateway_delegates_commands_to_own_tx() {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     };
     let mut sim = Simulation::new(&topo).unwrap();
     assert_eq!(run_to(&mut sim, 50).len(), 0);
@@ -786,6 +797,7 @@ fn script_topo(script: &str, tx: Vec<TxMessage>) -> Topology {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 
@@ -1312,6 +1324,7 @@ fn err_topo(nodes: &[(u32, u32, u32)], bitrate: u32, simulate_ack: bool) -> Topo
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 
@@ -1745,6 +1758,7 @@ fn ctl_topo() -> Topology {
         user_signals: vec![],
         tests: vec![],
         workspace: None,
+        ..Default::default()
     }
 }
 

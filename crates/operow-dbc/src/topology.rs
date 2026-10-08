@@ -248,6 +248,7 @@ impl Database {
             user_signals: Vec::new(),
             tests: Vec::new(),
             workspace: None,
+            ..Default::default()
         }
     }
 }
