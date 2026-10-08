@@ -22,7 +22,7 @@ fn replay_demo_feeds_powertrain_and_gateway_forwards_to_body() {
     sim.run_until(Timestamp::from_ms(500), &mut out);
     let on = |bus: u32, id: u32| {
         out.iter()
-            .filter(|e| e.bus == BusId(bus) && e.frame.id == id)
+            .filter(|e| e.bus == BusId(bus) && e.frame.as_can().unwrap().id == id)
             .count()
     };
     assert!(on(1, 0x100) >= 45, "replayed EngineData on Powertrain");

@@ -145,7 +145,7 @@ impl Grouper {
         if ev.hop != 0 || ev.is_error() {
             return None;
         }
-        let f = &ev.frame;
+        let f = ev.frame.as_can()?;
         self.channels.iter().find_map(|c| {
             if c.bus != ev.bus || c.extended != f.extended {
                 return None;
@@ -162,11 +162,11 @@ impl Grouper {
 
     /// Add the next event.
     pub fn feed(&mut self, seq: u64, ev: &BusEvent) {
-        let Some((req_id, resp_id, kind)) = self.classify(ev) else {
+        let (Some((req_id, resp_id, kind)), Some(f)) = (self.classify(ev), ev.frame.as_can())
+        else {
             self.items.push_back(Item::Frame(seq));
             return;
         };
-        let f = &ev.frame;
         let key: Key = (ev.bus, f.id, f.extended);
         let other = match kind {
             MsgKind::Request => (ev.bus, resp_id, f.extended),
@@ -358,7 +358,7 @@ mod tests {
             dir: Direction::Tx,
             frame_uid: 0,
             hop: 0,
-            frame: CanFrame::new(id, false, data).unwrap(),
+            frame: CanFrame::new(id, false, data).unwrap().into(),
             kind: Default::default(),
         }
     }

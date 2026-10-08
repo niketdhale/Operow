@@ -2,8 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use operow_core::{
-    BusEvent, BusEventKind, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, NodeErrorState,
-    NodeId, NodeKind, Timestamp, Topology, TopologyError,
+    BusEvent, BusEventKind, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, Frame,
+    NodeErrorState, NodeId, NodeKind, Timestamp, Topology, TopologyError,
 };
 
 use crate::diag::DiagEcu;
@@ -363,7 +363,7 @@ enum EventKind {
     TxComplete {
         bus: BusId,
         meta: FrameMeta,
-        frame: CanFrame,
+        frame: Frame,
         duration_ns: u64,
     },
     /// An error is detected `elapsed_ns` into a transmission: the error event
@@ -371,7 +371,7 @@ enum EventKind {
     TxError {
         bus: BusId,
         meta: FrameMeta,
-        frame: CanFrame,
+        frame: Frame,
         error: CanErrorKind,
         elapsed_ns: u64,
     },
@@ -380,7 +380,7 @@ enum EventKind {
     ErrorEnd {
         bus: BusId,
         meta: FrameMeta,
-        frame: CanFrame,
+        frame: Frame,
         busy_ns: u64,
     },
     /// A bus-off node may rejoin the bus (stale unless `recover_at` matches).
@@ -392,7 +392,7 @@ enum EventKind {
     DelayedEnqueue {
         bus: BusId,
         meta: FrameMeta,
-        frame: CanFrame,
+        frame: Frame,
     },
     /// A frame sent onto a hardware bus has been on the wire long enough for
     /// the simulated nodes of that bus to see it.
@@ -443,7 +443,11 @@ impl Ord for Scheduled {
 /// identifiers are shifted up 18 bits so they compare against extended
 /// (29-bit) ids as real CAN arbitration would; on an exact tie the standard
 /// frame wins.
-fn arbitration_key(frame: &CanFrame) -> (u32, bool) {
+fn arbitration_key(frame: &Frame) -> (u32, bool) {
+    // Ethernet has no arbitration: first come, first served.
+    let Frame::Can(frame) = frame else {
+        return (0, false);
+    };
     if frame.extended {
         (frame.id, true)
     } else {
@@ -470,7 +474,7 @@ pub struct Simulation {
     heap: BinaryHeap<Reverse<Scheduled>>,
     seq: u64,
     bus_busy: HashMap<BusId, bool>,
-    bus_pending: HashMap<BusId, Vec<(CanFrame, FrameMeta)>>,
+    bus_pending: HashMap<BusId, Vec<(Frame, FrameMeta)>>,
     next_uid: u64,
     stats: HashMap<BusId, BusStats>,
     started: bool,
@@ -951,16 +955,16 @@ impl Simulation {
     /// Inject a one-off frame transmission from `node`, outside of any ECU
     /// callback (e.g. from a UI "send" button). `bus` selects a single bus;
     /// `None` sends on every bus the node is linked to.
-    pub fn send_once(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame) {
+    pub fn send_once(&mut self, node: NodeId, bus: Option<BusId>, frame: impl Into<Frame>) {
         self.ensure_started();
-        self.enqueue_origin(node, bus, frame);
+        self.enqueue_origin(node, bus, frame.into());
     }
 
     /// Send one frame from generator `gen_id` on `bus` (`None` = every bus).
     /// The frame takes part in normal arbitration and gateway forwarding.
     pub fn gen_send(&mut self, gen_id: GeneratorId, bus: Option<BusId>, frame: CanFrame) {
         self.ensure_started();
-        self.enqueue_origin(gen_id.node(), bus, frame);
+        self.enqueue_origin(gen_id.node(), bus, frame.into());
     }
 
     /// Start (`Some(period_ns)`, first frame immediately) or stop (`None`)
@@ -990,7 +994,7 @@ impl Simulation {
                 chain,
             },
         );
-        self.enqueue_origin(gen_id.node(), bus, frame);
+        self.enqueue_origin(gen_id.node(), bus, frame.into());
         self.schedule(
             self.now + period_ns,
             EventKind::GenTimer { gen_id, row, chain },
@@ -1072,7 +1076,7 @@ impl Simulation {
         };
         self.node_buses.insert(TESTER_PRESENT_NODE, vec![spec.bus]);
         self.tester_present = Some((spec.bus, frame, period, chain));
-        self.enqueue_origin(TESTER_PRESENT_NODE, Some(spec.bus), frame);
+        self.enqueue_origin(TESTER_PRESENT_NODE, Some(spec.bus), frame.into());
         self.schedule(self.now + period, EventKind::TpTimer { chain });
     }
 
@@ -1084,7 +1088,7 @@ impl Simulation {
 
     /// Queue a newly originated frame (fresh uid, hop 0) on `bus`, or on all
     /// of the node's buses when `bus` is `None`. Unlinked buses are ignored.
-    fn enqueue_origin(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame) {
+    fn enqueue_origin(&mut self, node: NodeId, bus: Option<BusId>, frame: Frame) {
         let uid = self.next_uid;
         self.next_uid += 1;
         let meta = FrameMeta {
@@ -1096,7 +1100,7 @@ impl Simulation {
         self.enqueue(node, bus, frame, meta);
     }
 
-    fn enqueue(&mut self, node: NodeId, bus: Option<BusId>, frame: CanFrame, meta: FrameMeta) {
+    fn enqueue(&mut self, node: NodeId, bus: Option<BusId>, frame: Frame, meta: FrameMeta) {
         let linked = if GeneratorId::from_node(node).is_some() {
             self.all_buses.clone()
         } else {
@@ -1116,9 +1120,10 @@ impl Simulation {
                 self.stats.entry(bus).or_default().dropped_bus_off += 1;
                 continue;
             }
-            if let Some(ctl) = self
-                .msg_controls
-                .get(&(meta.sender, frame.id, frame.extended))
+            // Message controls are CAN-only.
+            if let Some(ctl) = frame
+                .as_can()
+                .and_then(|f| self.msg_controls.get(&(meta.sender, f.id, f.extended)))
                 .copied()
             {
                 if ctl.paused
@@ -1133,17 +1138,26 @@ impl Simulation {
                 }
                 if delay_ms > 0.0 {
                     let at = self.now + (delay_ms * 1_000_000.0) as u64;
-                    self.schedule(at, EventKind::DelayedEnqueue { bus, meta, frame });
+                    self.schedule(
+                        at,
+                        EventKind::DelayedEnqueue {
+                            bus,
+                            meta,
+                            frame: frame.clone(),
+                        },
+                    );
                     continue;
                 }
             }
-            self.push_pending(bus, frame, meta);
+            self.push_pending(bus, frame.clone(), meta);
         }
     }
 
-    fn push_pending(&mut self, bus: BusId, frame: CanFrame, meta: FrameMeta) {
+    fn push_pending(&mut self, bus: BusId, frame: Frame, meta: FrameMeta) {
         if self.hw_buses.contains_key(&bus) {
-            self.hw_transmit(bus, frame, meta);
+            if let Frame::Can(frame) = frame {
+                self.hw_transmit(bus, frame, meta);
+            }
             return;
         }
         self.bus_pending.entry(bus).or_default().push((frame, meta));
@@ -1182,7 +1196,7 @@ impl Simulation {
             }
             return;
         }
-        let duration_ns = frame_duration_ns_any(&frame, nominal, data_rate);
+        let duration_ns = frame_duration_ns_any(&Frame::Can(frame), nominal, data_rate);
         let st = self.stats.entry(bus).or_default();
         st.frames += 1;
         st.busy_ns += duration_ns;
@@ -1199,7 +1213,7 @@ impl Simulation {
             },
             frame_uid: meta.uid,
             hop: meta.hop,
-            frame,
+            frame: frame.into(),
             kind: BusEventKind::Frame,
         });
         self.count_tx_ok(meta.sender, bus);
@@ -1258,7 +1272,7 @@ impl Simulation {
     fn apply_ctx(&mut self, node: NodeId, ctx: EcuCtx) {
         for out in ctx.sends {
             match out.forward_of {
-                None => self.enqueue_origin(node, out.bus, out.frame),
+                None => self.enqueue_origin(node, out.bus, out.frame.into()),
                 Some(prev) => {
                     let meta = FrameMeta {
                         sender: node,
@@ -1272,7 +1286,7 @@ impl Simulation {
                         }
                         continue;
                     }
-                    self.enqueue(node, out.bus, out.frame, meta);
+                    self.enqueue(node, out.bus, out.frame.into(), meta);
                 }
             }
         }
@@ -1330,7 +1344,7 @@ impl Simulation {
                 .get(&bus)
                 .map(|c| c.fd_enabled)
                 .unwrap_or(false);
-            if frame.fd && !fd_enabled {
+            if frame.as_can().is_some_and(|f| f.fd) && !fd_enabled {
                 // Dropped: this bus does not carry CAN FD frames.
                 self.stats.entry(bus).or_default().error_frames += 1;
                 continue;
@@ -1343,7 +1357,9 @@ impl Simulation {
                 .unwrap_or((500_000, 500_000));
             let duration_ns = frame_duration_ns_any(&frame, nominal, data_rate);
             self.bus_busy.insert(bus, true);
-            match self.pick_error(bus, &frame, &meta) {
+            // No error model for Ethernet.
+            let error = frame.as_can().and_then(|f| self.pick_error(bus, f, &meta));
+            match error {
                 None => self.schedule(
                     self.now + duration_ns,
                     EventKind::TxComplete {
@@ -1396,7 +1412,7 @@ impl Simulation {
                 if c != chain {
                     return;
                 }
-                self.enqueue_origin(TESTER_PRESENT_NODE, Some(bus), frame);
+                self.enqueue_origin(TESTER_PRESENT_NODE, Some(bus), frame.into());
                 self.schedule(self.now + period_ns, EventKind::TpTimer { chain });
             }
             EventKind::GenTimer { gen_id, row, chain } => {
@@ -1407,7 +1423,7 @@ impl Simulation {
                     return;
                 }
                 let (bus, frame, period_ns) = (r.bus, r.frame, r.period_ns);
-                self.enqueue_origin(gen_id.node(), bus, frame);
+                self.enqueue_origin(gen_id.node(), bus, frame.into());
                 self.schedule(
                     self.now + period_ns,
                     EventKind::GenTimer { gen_id, row, chain },
@@ -1447,7 +1463,7 @@ impl Simulation {
                     },
                     frame_uid: meta.uid,
                     hop: meta.hop,
-                    frame,
+                    frame: frame.clone(),
                     kind: BusEventKind::Frame,
                 });
 
@@ -1455,7 +1471,12 @@ impl Simulation {
                 self.suspend_if_passive(meta.sender, bus, self.now);
                 for node in self.receivers(bus, meta.sender) {
                     self.count_rx_ok(node, bus);
-                    self.run_callback(node, Some(meta), |ecu, ctx| ecu.on_frame(bus, &frame, ctx));
+                    // ECUs only see CAN frames.
+                    if let Frame::Can(frame) = &frame {
+                        self.run_callback(node, Some(meta), |ecu, ctx| {
+                            ecu.on_frame(bus, frame, ctx)
+                        });
+                    }
                 }
 
                 self.try_arbitrate(bus);
@@ -1488,7 +1509,7 @@ impl Simulation {
                     },
                     frame_uid: meta.uid,
                     hop: meta.hop,
-                    frame,
+                    frame: frame.clone(),
                     kind: BusEventKind::Error {
                         error,
                         node: sender,
@@ -1572,7 +1593,7 @@ impl Simulation {
                         dir: Direction::Rx,
                         frame_uid: uid,
                         hop: 0,
-                        frame,
+                        frame: frame.into(),
                         kind: BusEventKind::Error { error, node },
                     });
                     return;
@@ -1583,7 +1604,7 @@ impl Simulation {
                 }
                 let st = self.stats.entry(bus).or_default();
                 st.frames += 1;
-                st.busy_ns += frame_duration_ns_any(&frame, nominal, data_rate);
+                st.busy_ns += frame_duration_ns_any(&Frame::Can(frame), nominal, data_rate);
                 out.push(BusEvent {
                     time: Timestamp(self.now),
                     bus,
@@ -1592,7 +1613,7 @@ impl Simulation {
                     dir: Direction::Rx,
                     frame_uid: uid,
                     hop: 0,
-                    frame,
+                    frame: frame.into(),
                     kind: BusEventKind::Frame,
                 });
                 for n in self.receivers(bus, node) {

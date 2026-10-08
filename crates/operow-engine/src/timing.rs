@@ -1,4 +1,4 @@
-use operow_core::CanFrame;
+use operow_core::{CanFrame, EthFrame, Frame};
 
 /// Worst-case on-wire bit length of a classic CAN frame, including bit
 /// stuffing and the inter-frame space.
@@ -92,13 +92,21 @@ pub fn frame_duration_ns_fd(frame: &CanFrame, nominal_bitrate: u32, data_bitrate
         + ceil_div(data_bits as u64 * 1_000_000_000, data_rate as u64)
 }
 
-/// Worst-case bus-occupation time, in nanoseconds, of any `frame` (classic
-/// or FD), given the bus's nominal and data bitrates.
-pub fn frame_duration_ns_any(frame: &CanFrame, nominal_bitrate: u32, data_bitrate: u32) -> u64 {
-    if frame.fd {
-        frame_duration_ns_fd(frame, nominal_bitrate, data_bitrate)
-    } else {
-        frame_duration_ns(frame, nominal_bitrate)
+/// Time, in nanoseconds, that an Ethernet `frame` occupies the wire at
+/// `bitrate`: payload (padded to 46 bytes) plus 38 bytes of preamble, header,
+/// FCS and inter-frame gap.
+pub fn frame_duration_ns_eth(frame: &EthFrame, bitrate: u32) -> u64 {
+    let bytes = frame.payload.len().max(46) as u64 + 38;
+    ceil_div(bytes * 8 * 1_000_000_000, bitrate as u64)
+}
+
+/// Bus-occupation time, in nanoseconds, of any `frame` (CAN classic/FD or
+/// Ethernet), given the bus's nominal and data bitrates.
+pub fn frame_duration_ns_any(frame: &Frame, nominal_bitrate: u32, data_bitrate: u32) -> u64 {
+    match frame {
+        Frame::Can(f) if f.fd => frame_duration_ns_fd(f, nominal_bitrate, data_bitrate),
+        Frame::Can(f) => frame_duration_ns(f, nominal_bitrate),
+        Frame::Eth(f) => frame_duration_ns_eth(f, nominal_bitrate),
     }
 }
 

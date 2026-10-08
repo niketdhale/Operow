@@ -138,6 +138,7 @@ impl Database {
                     fd_enabled: false,
                     data_bitrate: 2_000_000,
                     simulate_ack: false,
+                    kind: Default::default(),
                     hardware: None,
                 });
                 (id, topo.buses.len() - 1)
@@ -241,6 +242,7 @@ impl Database {
                 fd_enabled: self.messages.iter().any(|m| m.dlc > 8),
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
+                kind: Default::default(),
                 hardware: None,
             }],
             links,

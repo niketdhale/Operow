@@ -31,6 +31,7 @@ fn topology_json_roundtrip() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![Link {
@@ -245,6 +246,7 @@ fn validate_rejects_bad_bus_references() {
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
+                kind: Default::default(),
                 hardware: None,
             })
             .collect(),
@@ -406,6 +408,7 @@ fn replay_topology(map: Vec<(u8, BusId)>) -> Topology {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![Link {
@@ -455,13 +458,13 @@ fn bus_event_without_kind_deserializes_as_frame() {
         dir: Direction::Tx,
         frame_uid: 0,
         hop: 0,
-        frame: CanFrame::new(0x10, false, &[1]).unwrap(),
+        frame: CanFrame::new(0x10, false, &[1]).unwrap().into(),
         kind: BusEventKind::Error {
             error: CanErrorKind::Ack,
             node: NodeId(1),
         },
     };
-    let mut v = serde_json::to_value(ev).unwrap();
+    let mut v = serde_json::to_value(ev.clone()).unwrap();
     assert!(v.get("kind").is_some());
     let back: BusEvent = serde_json::from_value(v.clone()).unwrap();
     assert_eq!(back, ev);
@@ -530,6 +533,7 @@ fn diag_bus_must_be_linked() {
         fd_enabled: false,
         data_bitrate: 2_000_000,
         simulate_ack: false,
+        kind: Default::default(),
         hardware: None,
     });
     topo.nodes.push(EcuConfig {
@@ -670,4 +674,18 @@ fn wire_style_unset_fields_fall_back() {
         (Some(WireKind::Step), Some(3.0), None)
     );
     assert!(WireStyle::default().is_empty());
+}
+
+#[test]
+fn bus_without_kind_loads_as_can_and_ethernet_rejects_can_options() {
+    let b: CanBusConfig = serde_json::from_str(r#"{"id":1,"name":"A","bitrate":500000}"#).unwrap();
+    assert_eq!(b.kind, crate::BusKind::Can);
+    let mut topo = Topology::default();
+    topo.buses.push(CanBusConfig {
+        kind: crate::BusKind::Ethernet,
+        ..b
+    });
+    assert_eq!(topo.validate(), Ok(()));
+    topo.buses[0].fd_enabled = true;
+    assert_eq!(topo.validate(), Err(TopologyError::CanOnlyOption(BusId(1))));
 }

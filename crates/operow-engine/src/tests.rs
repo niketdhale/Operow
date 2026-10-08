@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use operow_core::{
-    BusEvent, BusId, CanBusConfig, CanErrorKind, CanFrame, Direction, EcuConfig, IdFilter, Link,
-    NodeErrorState, NodeId, NodeKind, RouteRule, SendType, Timestamp, Topology, TxMessage,
+    BusEvent, BusId, BusKind, CanBusConfig, CanErrorKind, CanFrame, Direction, EcuConfig, EthFrame,
+    Frame, IdFilter, Link, NodeErrorState, NodeId, NodeKind, RouteRule, SendType, Timestamp,
+    Topology, TxMessage,
 };
 
 use crate::ecu::{Ecu, EcuCommand, EcuCtx};
@@ -57,6 +58,7 @@ fn topo_with_two_senders() -> Topology {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![
@@ -86,10 +88,11 @@ fn arbitration_lowest_id_wins() {
 
     assert_eq!(out.len(), 2, "both frames should have gone out by t=1ms");
     assert_eq!(
-        out[0].frame.id, 0x100,
+        out[0].frame.as_can().unwrap().id,
+        0x100,
         "the lower arbitration id (0x100) must win and be transmitted first"
     );
-    assert_eq!(out[1].frame.id, 0x200);
+    assert_eq!(out[1].frame.as_can().unwrap().id, 0x200);
 }
 
 #[test]
@@ -126,6 +129,7 @@ fn periodic_message_produces_expected_frame_count() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![Link {
@@ -201,6 +205,7 @@ fn sender_does_not_receive_its_own_frame() {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![
@@ -301,6 +306,7 @@ fn topo_single_node(fd_enabled: bool) -> Topology {
             fd_enabled,
             data_bitrate: 2_000_000,
             simulate_ack: false,
+            kind: Default::default(),
             hardware: None,
         }],
         links: vec![Link {
@@ -342,7 +348,7 @@ fn fd_frame_transmitted_on_fd_enabled_bus() {
     sim.run_until(Timestamp::from_ms(10), &mut out);
 
     assert_eq!(out.len(), 1);
-    assert!(out[0].frame.fd);
+    assert!(out[0].frame.as_can().unwrap().fd);
     let stats = sim.stats().get(&BusId(1)).unwrap();
     assert_eq!(stats.error_frames, 0);
     assert_eq!(stats.frames, 1);
@@ -358,6 +364,7 @@ fn bus(id: u32, name: &str) -> CanBusConfig {
         fd_enabled: false,
         data_bitrate: 2_000_000,
         simulate_ack: false,
+        kind: Default::default(),
         hardware: None,
     }
 }
@@ -452,7 +459,7 @@ fn send_on_only_hits_chosen_bus() {
         CanFrame::new(0x10, false, &[]).unwrap(),
     );
     sim.run_until(Timestamp::from_ms(1), &mut out);
-    assert!(out.iter().all(|e| e.frame.id != 0x10));
+    assert!(out.iter().all(|e| e.frame.as_can().unwrap().id != 0x10));
 }
 
 #[test]
@@ -488,7 +495,7 @@ fn gateway_forwards_exact_and_preserves_meta() {
     assert_eq!(rx.frame_uid, tx.frame_uid);
     assert_eq!(rx.origin, NodeId(1));
     assert_eq!(rx.sender, NodeId(3));
-    assert_eq!(rx.frame.id, 0x100);
+    assert_eq!(rx.frame.as_can().unwrap().id, 0x100);
 }
 
 #[test]
@@ -517,8 +524,8 @@ fn gateway_remaps_id() {
         &gateway_topo(vec![route(1, 2, IdFilter::Any, Some(0x555), 0)]),
         5,
     );
-    assert_eq!(out[0].frame.id, 0x100);
-    assert_eq!(out[1].frame.id, 0x555);
+    assert_eq!(out[0].frame.as_can().unwrap().id, 0x100);
+    assert_eq!(out[1].frame.as_can().unwrap().id, 0x555);
 }
 
 #[test]
@@ -746,7 +753,7 @@ fn set_payload_keeps_id_and_ignores_extra_bytes() {
     );
     sim.command(NodeId(1), EcuCommand::Trigger { msg: 0 });
     let out = run_to(&mut sim, 1);
-    assert_eq!(out[0].frame.id, 0x321);
+    assert_eq!(out[0].frame.as_can().unwrap().id, 0x321);
     assert_eq!(out[0].frame.payload(), [9, 2, 3]);
     sim.command(
         NodeId(1),
@@ -802,7 +809,10 @@ fn script_topo(script: &str, tx: Vec<TxMessage>) -> Topology {
 }
 
 fn ids(events: &[operow_core::BusEvent]) -> Vec<(u32, u32)> {
-    events.iter().map(|e| (e.bus.0, e.frame.id)).collect()
+    events
+        .iter()
+        .map(|e| (e.bus.0, e.frame.as_can().unwrap().id))
+        .collect()
 }
 
 #[test]
@@ -832,7 +842,7 @@ fn script_timer_periodic_send() {
     let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
     let out: Vec<_> = run_to(&mut sim, 35)
         .into_iter()
-        .filter(|e| e.frame.id == 0x301)
+        .filter(|e| e.frame.as_can().unwrap().id == 0x301)
         .collect();
     assert_eq!(out.len(), 3);
     assert_eq!(out[2].frame.payload(), [30]);
@@ -851,7 +861,7 @@ fn script_state_persists_across_calls() {
     let mut sim = Simulation::new(&script_topo(script, vec![])).unwrap();
     let out: Vec<_> = run_to(&mut sim, 35)
         .into_iter()
-        .filter(|e| e.frame.id == 0x400)
+        .filter(|e| e.frame.as_can().unwrap().id == 0x400)
         .collect();
     let counts: Vec<u8> = out.iter().map(|e| e.frame.payload()[0]).collect();
     assert_eq!(counts, [1, 2, 3]);
@@ -892,7 +902,10 @@ fn script_set_payload_applies() {
     let script = "fn on_message(msg) { set_payload(0, [9]); }";
     let mut sim = Simulation::new(&script_topo(script, vec![msg])).unwrap();
     let out = run_to(&mut sim, 5);
-    let last = out.iter().rfind(|e| e.frame.id == 0x600).unwrap();
+    let last = out
+        .iter()
+        .rfind(|e| e.frame.as_can().unwrap().id == 0x600)
+        .unwrap();
     assert_eq!(last.frame.payload(), [9]);
 }
 
@@ -935,7 +948,9 @@ fn script_infinite_loop_is_stopped() {
 }
 
 fn gen_events(out: &[operow_core::BusEvent]) -> Vec<&operow_core::BusEvent> {
-    out.iter().filter(|e| e.frame.id >= 0x500).collect()
+    out.iter()
+        .filter(|e| e.frame.as_can().unwrap().id >= 0x500)
+        .collect()
 }
 
 fn gen_frame(id: u32, b: u8) -> CanFrame {
@@ -956,20 +971,23 @@ fn generator_frame_hits_chosen_bus_only_and_gets_forwarded() {
     sim.run_until(Timestamp::from_ms(5), &mut out);
     let g = gen_events(&out);
     // 0x500: Tx on bus 1 + forwarded to bus 2; 0x501: Tx on bus 2 only.
-    let ids: Vec<(u32, u32, Direction)> = g.iter().map(|e| (e.frame.id, e.bus.0, e.dir)).collect();
+    let ids: Vec<(u32, u32, Direction)> = g
+        .iter()
+        .map(|e| (e.frame.as_can().unwrap().id, e.bus.0, e.dir))
+        .collect();
     assert!(ids.contains(&(0x500, 1, Direction::Tx)));
     assert!(ids.contains(&(0x500, 2, Direction::Rx)));
     assert!(ids.contains(&(0x501, 2, Direction::Tx)));
     assert_eq!(g.len(), 3);
     let tx = g
         .iter()
-        .find(|e| e.frame.id == 0x500 && e.hop == 0)
+        .find(|e| e.frame.as_can().unwrap().id == 0x500 && e.hop == 0)
         .unwrap();
     assert_eq!(tx.sender, GeneratorId(1).node());
     assert!(tx.sender.0 >= GENERATOR_NODE_BASE);
     let fwd = g
         .iter()
-        .find(|e| e.frame.id == 0x500 && e.hop == 1)
+        .find(|e| e.frame.as_can().unwrap().id == 0x500 && e.hop == 1)
         .unwrap();
     assert_eq!(fwd.origin, GeneratorId(1).node());
     assert_eq!(fwd.sender, NodeId(3));
@@ -983,14 +1001,27 @@ fn generators_have_distinct_sender_ids() {
     sim.gen_send(GeneratorId(1), None, gen_frame(0x510, 0));
     sim.gen_send(GeneratorId(2), None, gen_frame(0x511, 0));
     sim.run_until(Timestamp::from_ms(5), &mut out);
-    let a = out.iter().find(|e| e.frame.id == 0x510).unwrap().sender;
-    let b = out.iter().find(|e| e.frame.id == 0x511).unwrap().sender;
+    let a = out
+        .iter()
+        .find(|e| e.frame.as_can().unwrap().id == 0x510)
+        .unwrap()
+        .sender;
+    let b = out
+        .iter()
+        .find(|e| e.frame.as_can().unwrap().id == 0x511)
+        .unwrap()
+        .sender;
     assert_ne!(a, b);
     assert_eq!(GeneratorId::from_node(a), Some(GeneratorId(1)));
     assert_eq!(GeneratorId::from_node(b), Some(GeneratorId(2)));
     assert_eq!(GeneratorId::from_node(NodeId(3)), None);
     // `None` fans out to both buses.
-    assert_eq!(out.iter().filter(|e| e.frame.id == 0x510).count(), 2);
+    assert_eq!(
+        out.iter()
+            .filter(|e| e.frame.as_can().unwrap().id == 0x510)
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1033,8 +1064,8 @@ fn generator_update_frame_and_stop_all() {
     sim.run_until(Timestamp::from_ms(35), &mut out);
     let v: Vec<u8> = out
         .iter()
-        .filter(|e| e.frame.id == 0x530)
-        .map(|e| e.frame.data[0])
+        .filter(|e| e.frame.as_can().unwrap().id == 0x530)
+        .map(|e| e.frame.as_can().unwrap().data[0])
         .collect();
     assert_eq!(v, vec![9, 9]);
     sim.gen_stop_all(g);
@@ -1066,7 +1097,10 @@ fn generator_commands_through_runner() {
     let mut n = 0;
     while n < 5 && std::time::Instant::now() < deadline {
         if let Ok(EngineEvent::Frames(f)) = handle.events.recv_timeout(Duration::from_millis(100)) {
-            n += f.iter().filter(|e| e.frame.id == 0x540).count();
+            n += f
+                .iter()
+                .filter(|e| e.frame.as_can().unwrap().id == 0x540)
+                .count();
         }
     }
     assert!(n >= 5);
@@ -1145,7 +1179,9 @@ fn replay_frames_appear_on_mapped_bus_at_log_times() {
     let out = run_ms(&topo, 100);
     assert_eq!(times_ms(&out), [10, 20, 35]);
     assert_eq!(
-        out.iter().map(|e| (e.bus, e.frame.id)).collect::<Vec<_>>(),
+        out.iter()
+            .map(|e| (e.bus, e.frame.as_can().unwrap().id))
+            .collect::<Vec<_>>(),
         [(BusId(1), 0x100), (BusId(2), 0x200), (BusId(1), 0x101)]
     );
     assert!(out.iter().all(|e| e.sender == NodeId(1) && e.hop == 0));
@@ -1172,7 +1208,9 @@ fn replay_skips_unmapped_channels_error_frames_and_filtered_ids() {
     );
     let out = run_ms(&topo, 50);
     assert_eq!(
-        out.iter().map(|e| e.frame.id).collect::<Vec<_>>(),
+        out.iter()
+            .map(|e| e.frame.as_can().unwrap().id)
+            .collect::<Vec<_>>(),
         [0x100, 0x1FF]
     );
 }
@@ -1311,6 +1349,7 @@ fn err_topo(nodes: &[(u32, u32, u32)], bitrate: u32, simulate_ack: bool) -> Topo
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack,
+            kind: Default::default(),
             hardware: None,
         }],
         links: nodes
@@ -1368,7 +1407,7 @@ fn error_event_carries_the_failed_frame() {
     sim.inject_errors(inject_spec(1, CanErrorKind::Crc, InjectMode::Count(1)));
     let mut out = Vec::new();
     sim.run_until(Timestamp::from_ms(5), &mut out);
-    let err = out[0];
+    let err = out[0].clone();
     assert!(err.is_error());
     assert_eq!(err.error_kind(), Some(CanErrorKind::Crc));
     assert_eq!(
@@ -1379,13 +1418,13 @@ fn error_event_carries_the_failed_frame() {
         }
     );
     assert_eq!(
-        (err.sender, err.frame.id, err.dir),
+        (err.sender, err.frame.as_can().unwrap().id, err.dir),
         (N1, 0x100, Direction::Tx)
     );
     // The frame is retransmitted with the same uid after the error frame.
     let ok = frame_events(&out)
         .into_iter()
-        .find(|e| e.frame.id == 0x100)
+        .find(|e| e.frame.as_can().unwrap().id == 0x100)
         .unwrap();
     assert_eq!(ok.frame_uid, err.frame_uid);
     assert!(ok.time > err.time);
@@ -1938,8 +1977,8 @@ fn msg_control_applies_to_script_output_by_id() {
         },
     );
     let ev = run_span(&mut sim, 20);
-    assert!(ev.iter().any(|e| e.frame.id == 0x100));
-    assert!(!ev.iter().any(|e| e.frame.id == 0x200));
+    assert!(ev.iter().any(|e| e.frame.as_can().unwrap().id == 0x100));
+    assert!(!ev.iter().any(|e| e.frame.as_can().unwrap().id == 0x200));
     assert!(sim.stats()[&BusId(1)].dropped_msg_control >= 1);
 }
 
@@ -2022,4 +2061,36 @@ fn injected_bus_off_recovers_automatically_and_is_counted() {
     assert!(i.bus_off_events >= 1);
     assert!(i.last_bus_off_ns > 0);
     assert_ne!(i.state, NodeErrorState::BusOff, "auto recovery");
+}
+
+#[test]
+fn ethernet_frame_arrives_after_its_wire_time() {
+    let eth = CanBusConfig {
+        kind: BusKind::Ethernet,
+        bitrate: 100_000_000,
+        ..bus(1, "ETH")
+    };
+    let topo = Topology {
+        nodes: vec![
+            node(1, vec![], NodeKind::Ecu),
+            node(2, vec![], NodeKind::Ecu),
+        ],
+        buses: vec![eth],
+        links: vec![link(1, 1), link(2, 1)],
+        ..Default::default()
+    };
+    let mut sim = Simulation::new(&topo).unwrap();
+    let frame = Frame::Eth(EthFrame {
+        dst: [0xFF; 6],
+        src: [2; 6],
+        ethertype: 0x0800,
+        payload: Arc::from(&[0u8; 10][..]),
+    });
+    sim.send_once(NodeId(1), None, frame.clone());
+    let mut out = Vec::new();
+    sim.run_until(Timestamp::from_ms(1), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].frame, frame);
+    // Payload padded to 46 bytes + 38 bytes overhead = 84 bytes = 672 bits.
+    assert_eq!(out[0].time.0, 672 * 10);
 }

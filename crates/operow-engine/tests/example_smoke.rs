@@ -23,7 +23,9 @@ fn test_example_smoke() {
     // Count events by frame ID
     let mut frame_counts: HashMap<u32, usize> = HashMap::new();
     for event in &events {
-        *frame_counts.entry(event.frame.id).or_insert(0) += 1;
+        *frame_counts
+            .entry(event.frame.as_can().unwrap().id)
+            .or_insert(0) += 1;
     }
 
     // Verify frame counts
@@ -88,8 +90,14 @@ fn test_script_example_smoke() {
     let mut events = Vec::new();
     sim.run_until(Timestamp::from_ms(1_000), &mut events);
 
-    let requests = events.iter().filter(|e| e.frame.id == 0x100).count();
-    let replies = events.iter().filter(|e| e.frame.id == 0x101).count();
+    let requests = events
+        .iter()
+        .filter(|e| e.frame.as_can().unwrap().id == 0x100)
+        .count();
+    let replies = events
+        .iter()
+        .filter(|e| e.frame.as_can().unwrap().id == 0x101)
+        .count();
     assert!(requests > 0, "no 0x100 requests sent");
     assert_eq!(requests, replies, "every 0x100 should get a 0x101 reply");
 }
