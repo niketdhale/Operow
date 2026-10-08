@@ -857,6 +857,7 @@ impl OperowApp {
         for (link, style) in links.iter().zip(styles) {
             self.graph.set_wire_style((link.node, link.bus), style);
         }
+        self.graph.editor.commit(&self.graph.state);
         self.graph.wire_default = Some(WireStyle {
             width: Some(2.0),
             ..Default::default()

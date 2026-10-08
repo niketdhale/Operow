@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use egui_dock::TabViewer;
 use egui_flow::{Flow, FlowOptions, HandleVisibility, NodeId as FlowId};
-use operow_core::{BusId, CanErrorKind, NodeErrorState};
+use operow_core::{BusId, CanErrorKind, NodeErrorState, WireStyle};
 use operow_engine::{Command, NodeErrorInfo, RunState};
 
 use crate::app::LiveBusStats;
@@ -332,10 +332,10 @@ impl WindowViewer<'_> {
                     .on_hover_text("Drop every per-wire override so all wires follow the default")
                     .clicked()
                 {
-                    self.graph.wire_styles.clear();
+                    self.graph.clear_wire_styles();
                 }
                 if ui.button("Reset all").clicked() {
-                    self.graph.wire_styles.clear();
+                    self.graph.clear_wire_styles();
                     self.graph.wire_default = None;
                 }
             });
@@ -385,7 +385,7 @@ impl WindowViewer<'_> {
 
     /// Right-click menu of a node while running: online/offline and
     /// force bus-off.
-    fn runtime_node_menus(&mut self, out: &egui_flow::FlowResponse<GraphNode, ()>) {
+    fn runtime_node_menus(&mut self, out: &egui_flow::FlowResponse<GraphNode, WireStyle>) {
         let links = self.graph.links();
         let mut cmds = Vec::new();
         for (id, resp) in &out.nodes {

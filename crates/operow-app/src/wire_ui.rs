@@ -96,3 +96,19 @@ pub fn wire_style_ui(ui: &mut egui::Ui, style: &mut WireStyle, full: bool) -> bo
     }
     changed
 }
+
+/// Whether an edit that `changed` this frame or earlier is over (no mouse
+/// button held), so a drag or colour pick makes one undo step, not one per frame.
+pub fn edit_finished(ui: &egui::Ui, changed: bool) -> bool {
+    let id = egui::Id::new("wire_edit_pending");
+    let pending = ui.data_mut(|d| {
+        let p = d.get_temp_mut_or_default::<bool>(id);
+        *p |= changed;
+        *p
+    });
+    let done = pending && !ui.input(|i| i.pointer.any_down());
+    if done {
+        ui.data_mut(|d| d.insert_temp(id, false));
+    }
+    done
+}
