@@ -86,6 +86,9 @@ pub struct StartupOptions {
     /// `--demo-graph`: open a Graph with EngineSpeed, Throttle (Y2) and
     /// Running and focus it.
     pub demo_graph: bool,
+    /// `--demo-trace-columns`: Trace 1 with reordered columns and an
+    /// EngineSpeed signal column.
+    pub demo_trace_columns: bool,
     /// `--demo-generator`: open Generator 1 with four rows next to a Trace
     /// and start its cyclic rows once the measurement runs.
     pub demo_generator: bool,
@@ -671,6 +674,9 @@ impl OperowApp {
         if opts.demo_graph {
             self.demo_graph();
         }
+        if opts.demo_trace_columns {
+            self.demo_trace_columns();
+        }
         if opts.demo_generator {
             self.demo_generator();
         }
@@ -894,6 +900,43 @@ impl OperowApp {
         g.window_s = 5;
         g.set_axis(1, YAxis::Y2);
         workspace::focus(&mut self.dock, id);
+    }
+
+    /// `--demo-trace-columns`: Data moved after ID, EngineSpeed inserted
+    /// before Data, the rarely used columns hidden (needs `dbc_demo.operow.json`).
+    fn demo_trace_columns(&mut self) {
+        use crate::trace::{Col, ColKey, place_col};
+        let trace = WindowId::new(WindowKind::Trace, 1);
+        self.sync_instances();
+        let bus = self
+            .names
+            .bus_names
+            .iter()
+            .find(|(_, n)| n.as_str() == "Powertrain")
+            .map(|(b, _)| *b)
+            .or_else(|| self.names.bus_names.keys().next().copied());
+        let (Some(bus), Some(t)) = (bus, self.traces.get_mut(&trace)) else {
+            return;
+        };
+        place_col(
+            &mut t.order,
+            ColKey::Builtin(Col::Data),
+            &ColKey::Builtin(Col::Id),
+        );
+        let sig = SignalRef::Dbc {
+            bus,
+            msg_id: 0x100,
+            extended: false,
+            signal_name: "EngineSpeed".into(),
+        };
+        place_col(
+            &mut t.order,
+            ColKey::Signal(sig),
+            &ColKey::Builtin(Col::Data),
+        );
+        t.hidden
+            .extend([Col::Chn, Col::Dir, Col::Hop, Col::Type, Col::Dlc, Col::Len]);
+        workspace::focus(&mut self.dock, trace);
     }
 
     /// `--demo-generator`: Generator 1 with a cyclic raw row, a cyclic DBC

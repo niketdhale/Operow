@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui_extras::{Column, TableBuilder};
-use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, NodeId};
+use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, NodeId, UserSignalDef};
 use serde::{Deserialize, Serialize};
 
 use crate::dbcs::{self, DbcStore};
@@ -161,6 +161,26 @@ pub enum Col {
     Sender,
     /// Decoded UDS text of a grouped ISO-TP message.
     Info,
+}
+
+/// A column in a trace's order: a built-in one or a decoded signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColKey {
+    Builtin(Col),
+    Signal(SignalRef),
+}
+
+/// Drag payload of a header: the trace it belongs to and the column.
+type ColDrag = (egui::Id, ColKey);
+
+/// Put `key` (new or already in `order`) at the place of `target`: before it
+/// when new or dragged left, after it when dragged right.
+pub fn place_col(order: &mut Vec<ColKey>, key: ColKey, target: &ColKey) {
+    let Some(i) = order.iter().position(|k| k == target) else {
+        return;
+    };
+    order.retain(|k| *k != key);
+    order.insert(i.min(order.len()), key);
 }
 
 impl Col {
@@ -495,6 +515,8 @@ pub struct TraceView {
     pub title: Option<String>,
     pub mode: TraceMode,
     pub hidden: BTreeSet<Col>,
+    /// Column order, including signal columns.
+    pub order: Vec<ColKey>,
     pub filters: TraceFilters,
     /// Show each ISO-TP message of a diagnostic channel as one row.
     pub group_isotp: bool,
@@ -518,6 +540,7 @@ pub struct Trace {
     pub autoscroll: bool,
     pub mode: TraceMode,
     pub hidden: BTreeSet<Col>,
+    pub order: Vec<ColKey>,
     /// Group the ISO-TP frames of diagnostic ECUs into UDS message rows
     /// (chronological mode).
     pub group_isotp: bool,
@@ -574,6 +597,7 @@ impl Default for Trace {
             autoscroll: true,
             mode: TraceMode::default(),
             hidden: BTreeSet::new(),
+            order: Col::ALL.map(ColKey::Builtin).to_vec(),
             group_isotp: false,
             expand_multiframe: false,
             expand_all: false,
@@ -612,6 +636,7 @@ impl Trace {
             title: self.title.clone(),
             mode: self.mode,
             hidden: self.hidden.clone(),
+            order: self.order.clone(),
             filters: self.filters.clone(),
             group_isotp: self.group_isotp,
         }
@@ -621,6 +646,13 @@ impl Trace {
         self.title = v.title;
         self.mode = v.mode;
         self.hidden = v.hidden;
+        self.order = v.order;
+        // Old layouts have no order; columns added later are appended.
+        for c in Col::ALL {
+            if !self.order.contains(&ColKey::Builtin(c)) {
+                self.order.push(ColKey::Builtin(c));
+            }
+        }
         self.filters = v.filters;
         self.group_isotp = v.group_isotp;
     }
@@ -636,19 +668,38 @@ impl Trace {
         self.index.len()
     }
 
-    fn visible_cols(&self, fixed_mode: bool) -> Vec<Col> {
-        let mut v: Vec<Col> = Col::ALL
-            .into_iter()
-            .filter(|c| {
-                !self.hidden.contains(c)
-                    && (fixed_mode || !c.fixed_only())
-                    && (self.group_isotp && !fixed_mode || !c.group_only())
+    fn visible_cols(&self, fixed_mode: bool) -> Vec<ColKey> {
+        let mut v: Vec<ColKey> = self
+            .order
+            .iter()
+            .filter(|k| match k {
+                ColKey::Builtin(c) => {
+                    !self.hidden.contains(c)
+                        && (fixed_mode || !c.fixed_only())
+                        && (self.group_isotp && !fixed_mode || !c.group_only())
+                }
+                ColKey::Signal(_) => true,
             })
+            .cloned()
             .collect();
         if v.is_empty() {
-            v.push(Col::Id);
+            v.push(ColKey::Builtin(Col::Id));
         }
         v
+    }
+
+    /// Show or hide a column; signal columns are removed.
+    fn set_shown(&mut self, key: &ColKey, shown: bool) {
+        match key {
+            ColKey::Builtin(c) if shown => {
+                self.hidden.remove(c);
+            }
+            ColKey::Builtin(c) => {
+                self.hidden.insert(*c);
+            }
+            ColKey::Signal(_) if !shown => self.order.retain(|k| k != key),
+            ColKey::Signal(_) => {}
+        }
     }
 
     fn reset(&mut self, seq: u64) {
@@ -794,6 +845,7 @@ impl Trace {
         ui: &mut egui::Ui,
         store: &FrameStore,
         names: &NameLookup,
+        users: &[UserSignalDef],
         actions: &mut Vec<TraceAction>,
     ) {
         let fixed_mode = self.mode == TraceMode::Fixed;
@@ -892,21 +944,20 @@ impl Trace {
             ui.separator();
 
             columns_menu(ui, |ui| {
-                for col in Col::ALL {
-                    let mut shown = !self.hidden.contains(&col);
-                    let text = if col.fixed_only() {
-                        format!("{} (fixed mode)", col.label())
-                    } else if col.group_only() {
-                        format!("{} (grouped ISO-TP)", col.label())
-                    } else {
-                        col.label().to_string()
+                for key in self.order.clone() {
+                    let mut shown = !matches!(&key, ColKey::Builtin(c) if self.hidden.contains(c));
+                    let text = match &key {
+                        ColKey::Builtin(col) if col.fixed_only() => {
+                            format!("{} (fixed mode)", col.label())
+                        }
+                        ColKey::Builtin(col) if col.group_only() => {
+                            format!("{} (grouped ISO-TP)", col.label())
+                        }
+                        ColKey::Builtin(col) => col.label().to_string(),
+                        ColKey::Signal(s) => s.label(names, users),
                     };
                     if ui.checkbox(&mut shown, text).changed() {
-                        if shown {
-                            self.hidden.remove(&col);
-                        } else {
-                            self.hidden.insert(col);
-                        }
+                        self.set_shown(&key, shown);
                     }
                 }
             });
@@ -934,7 +985,14 @@ impl Trace {
 
     fn export_csv(&self, store: &FrameStore, names: &NameLookup, actions: &mut Vec<TraceAction>) {
         let fixed_mode = self.mode == TraceMode::Fixed;
-        let cols = self.visible_cols(fixed_mode);
+        let cols: Vec<Col> = self
+            .visible_cols(fixed_mode)
+            .into_iter()
+            .filter_map(|k| match k {
+                ColKey::Builtin(c) => Some(c),
+                ColKey::Signal(_) => None,
+            })
+            .collect();
         let csv = if fixed_mode {
             let items = fixed_items(&self.fixed, &self.compiled, names);
             to_csv(
@@ -969,10 +1027,11 @@ impl Trace {
         ui: &mut egui::Ui,
         store: &FrameStore,
         names: &NameLookup,
+        users: &[UserSignalDef],
     ) -> Vec<TraceAction> {
         let mut actions = Vec::new();
         self.update(store, names, Instant::now());
-        self.toolbar(ui, store, names, &mut actions);
+        self.toolbar(ui, store, names, users, &mut actions);
         ui.add_space(2.0);
         ui.separator();
 
@@ -1078,11 +1137,16 @@ impl Trace {
         let grouper = &self.grouper;
         let (expanded_groups, expand_multiframe) = (&self.expanded_groups, self.expand_multiframe);
         let mut toggled_group: Option<u64> = None;
-        let sig_col = if cols.contains(&Col::Name) {
-            Col::Name
+        let sig_col = if cols.contains(&ColKey::Builtin(Col::Name)) {
+            ColKey::Builtin(Col::Name)
         } else {
-            cols[0]
+            cols[0].clone()
         };
+        let tid = ui.id();
+        let users_ref = users;
+        let mut dropped_col: Option<(ColKey, ColKey)> = None;
+        let mut dropped_sig: Option<(SignalRef, ColKey)> = None;
+        let mut hide_col: Option<ColKey> = None;
 
         egui::ScrollArea::horizontal()
             .auto_shrink([false; 2])
@@ -1093,7 +1157,11 @@ impl Trace {
                     .resizable(true)
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-                for col in &cols {
+                for key in &cols {
+                    let ColKey::Builtin(col) = key else {
+                        table = table.column(Column::exact(90.0));
+                        continue;
+                    };
                     table = table.column(match col {
                         Col::Name if !grouped => Column::remainder().at_least(col.width()),
                         Col::Info => Column::remainder().at_least(160.0),
@@ -1109,13 +1177,42 @@ impl Trace {
 
                 table
                     .header(TITLE_H + FILTER_H + 6.0, |mut header| {
-                        for col in &cols {
-                            header.col(|ui| {
+                        for key in &cols {
+                            let (_, cell) = header.col(|ui| {
                                 ui.vertical(|ui| {
-                                    ui.strong(col.label());
-                                    filter_cell(ui, *col, filters, &bus_names);
+                                    let text = match key {
+                                        ColKey::Builtin(c) => c.label().to_string(),
+                                        ColKey::Signal(s) => s.label(names, users_ref),
+                                    };
+                                    let r = ui.add(
+                                        egui::Label::new(egui::RichText::new(text).strong())
+                                            .truncate()
+                                            .sense(egui::Sense::click_and_drag()),
+                                    );
+                                    r.dnd_set_drag_payload((tid, key.clone()));
+                                    r.context_menu(|ui| {
+                                        let name = if matches!(key, ColKey::Signal(_)) {
+                                            "Remove column"
+                                        } else {
+                                            "Hide column"
+                                        };
+                                        if ui.button(name).clicked() {
+                                            hide_col = Some(key.clone());
+                                            ui.close();
+                                        }
+                                    });
+                                    if let ColKey::Builtin(c) = key {
+                                        filter_cell(ui, *c, filters, &bus_names);
+                                    }
                                 });
                             });
+                            if let Some(p) = cell.dnd_release_payload::<ColDrag>()
+                                && p.0 == tid
+                            {
+                                dropped_col = Some((p.1.clone(), key.clone()));
+                            } else if let Some(sig) = cell.dnd_release_payload::<SignalRef>() {
+                                dropped_sig = Some(((*sig).clone(), key.clone()));
+                            }
                         }
                     })
                     .body(|body| {
@@ -1124,7 +1221,11 @@ impl Trace {
                                 Loc::Frame(i) => i,
                                 Loc::Signal { exp, line } if !exps[exp].frames.is_empty() => {
                                     let f = &exps[exp].frames[line];
-                                    for col in &cols {
+                                    for key in &cols {
+                                        let ColKey::Builtin(col) = key else {
+                                            row.col(|_| {});
+                                            continue;
+                                        };
                                         row.col(|ui| {
                                             ui.visuals_mut().override_text_color = Some(weak_color);
                                             match col {
@@ -1220,7 +1321,23 @@ impl Trace {
                             } else {
                                 (r.dir == Direction::Rx).then_some(rx_color)
                             };
-                            for col in &cols {
+                            for ck in &cols {
+                                let ColKey::Builtin(col) = ck else {
+                                    let ColKey::Signal(sig) = ck else {
+                                        continue;
+                                    };
+                                    row.col(|ui| {
+                                        let v =
+                                            sig.sample_with_prev(&ev, None, &names.dbcs, users_ref);
+                                        if let Some(v) = v {
+                                            let t = format!("{v:.3}");
+                                            ui.monospace(
+                                                t.trim_end_matches('0').trim_end_matches('.'),
+                                            );
+                                        }
+                                    });
+                                    continue;
+                                };
                                 row.col(|ui| {
                                     if let Some(c) = tint {
                                         ui.visuals_mut().override_text_color = Some(c);
@@ -1271,8 +1388,13 @@ impl Trace {
                                 if ui.button("Copy row").clicked() {
                                     let text = cols
                                         .iter()
-                                        .map(|c| {
-                                            cell_text(*c, &r, fixed.map(|f| (f.count, f.dt_ms)))
+                                        .filter_map(|c| match c {
+                                            ColKey::Builtin(c) => Some(cell_text(
+                                                *c,
+                                                &r,
+                                                fixed.map(|f| (f.count, f.dt_ms)),
+                                            )),
+                                            ColKey::Signal(_) => None,
                                         })
                                         .collect::<Vec<_>>()
                                         .join("\t");
@@ -1301,6 +1423,26 @@ impl Trace {
                         });
                     });
             });
+
+        // A header dragged off the header row and released hides its column.
+        if ui.input(|i| i.pointer.any_released())
+            && let Some(p) = egui::DragAndDrop::take_payload::<ColDrag>(ui.ctx())
+            && p.0 == tid
+        {
+            hide_col = Some(p.1.clone());
+        }
+        if let Some((key, target)) = dropped_col {
+            place_col(&mut self.order, key, &target);
+        }
+        if let Some((sig, target)) = dropped_sig {
+            let key = ColKey::Signal(sig);
+            if !self.order.contains(&key) {
+                place_col(&mut self.order, key, &target);
+            }
+        }
+        if let Some(key) = hide_col {
+            self.set_shown(&key, false);
+        }
 
         match ctx_action {
             Some(CtxAction::FilterId(id)) => {
@@ -1374,7 +1516,7 @@ fn columns_menu(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 /// One row of a grouped ISO-TP message.
 fn message_row(
     row: &mut egui_extras::TableRow<'_, '_>,
-    cols: &[Col],
+    cols: &[ColKey],
     m: &Message,
     names: &NameLookup,
     open: bool,
@@ -1383,7 +1525,11 @@ fn message_row(
 ) {
     let info = diag_group::message_info(m);
     let id_text = format!("{:03X}{}", m.id, if m.extended { "x" } else { "" });
-    for col in cols {
+    for key in cols {
+        let ColKey::Builtin(col) = key else {
+            row.col(|_| {});
+            continue;
+        };
         row.col(|ui| {
             if !m.complete {
                 ui.visuals_mut().override_text_color = Some(error_color);
@@ -2196,6 +2342,25 @@ mod tests {
     }
 
     #[test]
+    fn reorder_and_hide_columns() {
+        let b = ColKey::Builtin;
+        let mut t = Trace::default();
+        place_col(&mut t.order, b(Col::Time), &b(Col::Name));
+        assert_eq!(&t.order[2..4], &[b(Col::Name), b(Col::Time)]);
+        place_col(&mut t.order, b(Col::Data), &b(Col::Chn));
+        assert_eq!(t.order[0], b(Col::Data));
+        let sig = ColKey::Signal(SignalRef::User(operow_core::UserSignalId(1)));
+        place_col(&mut t.order, sig.clone(), &b(Col::Id));
+        assert!(t.visible_cols(false).contains(&sig));
+        t.set_shown(&b(Col::Chn), false);
+        assert!(!t.visible_cols(false).contains(&b(Col::Chn)));
+        t.set_shown(&b(Col::Chn), true);
+        assert!(t.visible_cols(false).contains(&b(Col::Chn)));
+        t.set_shown(&sig, false);
+        assert!(!t.order.contains(&sig));
+    }
+
+    #[test]
     fn view_round_trips_through_json() {
         let mut t = Trace {
             title: Some("Body debug".into()),
@@ -2212,8 +2377,12 @@ mod tests {
         assert!(back.mode == TraceMode::Fixed);
         assert!(back.hidden.contains(&Col::Len));
         assert_eq!(back.filters, t.filters);
-        assert!(!back.visible_cols(true).contains(&Col::Len));
-        assert!(!back.visible_cols(false).contains(&Col::Count));
+        assert!(!back.visible_cols(true).contains(&ColKey::Builtin(Col::Len)));
+        assert!(
+            !back
+                .visible_cols(false)
+                .contains(&ColKey::Builtin(Col::Count))
+        );
     }
 
     #[test]
