@@ -821,11 +821,7 @@ fn event_sink_receives_step_events() {
     );
     assert_eq!(case(&r, "test_a").status, Status::Pass);
     let seen = seen.lock().unwrap();
-    assert!(
-        seen.iter().any(|e| e.frame.as_can().unwrap().id == 0x100),
-        "{}",
-        seen.len()
-    );
+    assert!(seen.iter().any(|e| e.frame.id == 0x100), "{}", seen.len());
     // Times are those of the case's own simulation, ascending per step.
     assert!(seen.iter().all(|e| e.time.0 <= 51_000_000));
 }

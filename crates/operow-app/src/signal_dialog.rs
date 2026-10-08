@@ -260,9 +260,8 @@ impl NewSignalDialog {
             store.find_latest(LIVE_SCAN, |e| {
                 !e.is_error()
                     && e.bus == d.bus
-                    && e.frame
-                        .as_can()
-                        .is_some_and(|f| f.id == d.msg_id && f.extended == d.extended)
+                    && e.frame.id == d.msg_id
+                    && e.frame.extended == d.extended
             })
         });
 

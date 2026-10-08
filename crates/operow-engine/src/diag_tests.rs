@@ -73,7 +73,6 @@ fn topo(diag: DiagConfig, script: Option<&str>) -> Topology {
             fd_enabled: true,
             data_bitrate: 2_000_000,
             simulate_ack: false,
-            kind: Default::default(),
             hardware: None,
         }],
         links: vec![Link {
@@ -156,17 +155,13 @@ fn multi_frame_response_uses_flow_control() {
     let mut expect = vec![0x62, 0x02, 0x00];
     expect.extend(0..40u8);
     assert_eq!(resp, expect);
-    let from_ecu: Vec<_> = rig
-        .frames
-        .iter()
-        .filter(|e| e.frame.as_can().unwrap().id == 0x7E8)
-        .collect();
+    let from_ecu: Vec<_> = rig.frames.iter().filter(|e| e.frame.id == 0x7E8).collect();
     assert!(from_ecu.len() >= 7, "FF + CFs, got {}", from_ecu.len());
     assert_eq!(from_ecu[0].frame.payload()[0] >> 4, 1);
     assert!(
         rig.frames
             .iter()
-            .any(|e| e.frame.as_can().unwrap().id == 0x7E0 && e.frame.payload()[0] >> 4 == 3),
+            .any(|e| e.frame.id == 0x7E0 && e.frame.payload()[0] >> 4 == 3),
         "tester sent a flow control frame"
     );
 }
@@ -277,19 +272,13 @@ fn periodic_tester_present_keeps_session() {
     rig.ask(&[0x10, 0x03]);
     rig.sim.set_tester_present(tp_spec(true, false, false));
     rig.advance_ms(12_000);
-    let tp = rig
-        .frames
-        .iter()
-        .filter(|e| e.frame.as_can().unwrap().id == 0x7E0)
-        .count();
+    let tp = rig.frames.iter().filter(|e| e.frame.id == 0x7E0).count();
     assert!(tp >= 11, "{tp} tester present frames");
     assert_eq!(rig.ask(&[0x2E, 0x01, 0x00, 9, 8, 7, 6]), [0x6E, 0x01, 0x00]);
     assert!(
         rig.frames
             .iter()
-            .filter(
-                |e| e.frame.as_can().unwrap().id == 0x7E0 && e.frame.payload() == [2, 0x3E, 0x80]
-            )
+            .filter(|e| e.frame.id == 0x7E0 && e.frame.payload() == [2, 0x3E, 0x80])
             .all(|e| e.sender == crate::sim::TESTER_PRESENT_NODE),
         "sent by the tester identity"
     );
@@ -317,18 +306,10 @@ fn tester_present_honours_functional_and_fd() {
     let mut rig = Rig::new(diag_cfg(false), None);
     rig.sim.set_tester_present(tp_spec(true, true, true));
     rig.advance_ms(2500);
-    let tp: Vec<_> = rig
-        .frames
-        .iter()
-        .filter(|e| e.frame.as_can().unwrap().id == 0x7DF)
-        .collect();
+    let tp: Vec<_> = rig.frames.iter().filter(|e| e.frame.id == 0x7DF).collect();
     assert!(tp.len() >= 3, "{} functional frames", tp.len());
-    assert!(tp.iter().all(|e| e.frame.as_can().unwrap().fd));
-    assert!(
-        rig.frames
-            .iter()
-            .all(|e| e.frame.as_can().unwrap().id != 0x7E0)
-    );
+    assert!(tp.iter().all(|e| e.frame.fd));
+    assert!(rig.frames.iter().all(|e| e.frame.id != 0x7E0));
 }
 
 #[test]
@@ -438,9 +419,7 @@ fn response_pending_is_followed_to_final_response() {
     let pending = rig
         .frames
         .iter()
-        .filter(|e| {
-            e.frame.as_can().unwrap().id == 0x7E8 && e.frame.payload()[1..] == [0x7F, 0x22, 0x78]
-        })
+        .filter(|e| e.frame.id == 0x7E8 && e.frame.payload()[1..] == [0x7F, 0x22, 0x78])
         .count();
     assert_eq!(pending, 1);
 }

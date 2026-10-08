@@ -364,7 +364,7 @@ impl ReplaySource {
             dir: r.dir,
             frame_uid: uid,
             hop: 0,
-            frame: r.frame.into(),
+            frame: r.frame,
             kind: if r.error {
                 BusEventKind::Error {
                     error: CanErrorKind::Form,
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert!(!evs[0].is_error());
         assert_eq!(evs[1].error_kind(), Some(CanErrorKind::Form));
-        assert_eq!(evs[1].frame.as_can().unwrap().dlc, 0);
+        assert_eq!(evs[1].frame.dlc, 0);
     }
 
     #[test]
@@ -613,7 +613,7 @@ mod tests {
                     e.bus,
                     e.sender,
                     e.origin,
-                    e.frame.as_can().unwrap().id,
+                    e.frame.id,
                     e.hop,
                     e.dir,
                     e.frame_uid,

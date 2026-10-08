@@ -322,7 +322,6 @@ impl Graph {
                 fd_enabled: false,
                 data_bitrate: 2_000_000,
                 simulate_ack: false,
-                kind: Default::default(),
                 hardware: None,
             }),
         );
@@ -2183,7 +2182,6 @@ mod tests {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
-            kind: Default::default(),
             hardware: None,
         };
         assert_eq!(
@@ -2329,13 +2327,10 @@ pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> 
         }
     };
     for ev in events {
-        let Some(f) = ev.frame.as_can() else {
-            continue;
-        };
         let generator = ev.sender.0 >= GENERATOR_NODE_BASE;
         let kind = PulseKind {
             forwarded: ev.hop > 0,
-            fd: f.fd,
+            fd: ev.frame.fd,
             generator,
             error: ev.is_error(),
         };
@@ -2345,8 +2340,8 @@ pub fn pulses_for_events(events: &[BusEvent], links: &[Link]) -> Vec<PulseSpec> 
             bus: ev.bus,
             dir,
             kind,
-            id: f.id,
-            extended: f.extended,
+            id: ev.frame.id,
+            extended: ev.frame.extended,
             origin: ev.origin,
             legs,
         };
@@ -2392,7 +2387,7 @@ mod pulse_tests {
             },
             frame_uid: 1,
             hop,
-            frame: frame.into(),
+            frame,
             kind: Default::default(),
         }
     }

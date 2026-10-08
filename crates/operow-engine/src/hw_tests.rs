@@ -19,7 +19,6 @@ fn bus(id: u32, hw: Option<HwBinding>) -> CanBusConfig {
         fd_enabled: false,
         data_bitrate: 2_000_000,
         simulate_ack: false,
-        kind: Default::default(),
         hardware: hw,
     }
 }
@@ -121,11 +120,11 @@ fn external_frame_is_received_and_forwarded_by_gateway() {
     let (mut rx, mut fwd) = (None, None);
     wait_for(&h, |ev| {
         for e in frames_of(ev) {
-            if e.bus == BusId(1) && e.frame == f.into() {
-                rx = Some(e.clone());
+            if e.bus == BusId(1) && e.frame == f {
+                rx = Some(*e);
             }
-            if e.bus == BusId(2) && e.frame == f.into() {
-                fwd = Some(e.clone());
+            if e.bus == BusId(2) && e.frame == f {
+                fwd = Some(*e);
             }
         }
         rx.is_some() && fwd.is_some()
@@ -156,9 +155,9 @@ fn simulated_frames_are_transmitted_to_hardware() {
     assert_eq!(got.frame.id, 0x123);
     let mut tx_event = false;
     wait_for(&h, |ev| {
-        tx_event |= frames_of(ev).iter().any(|e| {
-            e.bus == BusId(1) && e.dir == Direction::Tx && e.frame.as_can().unwrap().id == 0x123
-        });
+        tx_event |= frames_of(ev)
+            .iter()
+            .any(|e| e.bus == BusId(1) && e.dir == Direction::Tx && e.frame.id == 0x123);
         tx_event
     });
     assert!(tx_event, "Tx event recorded");

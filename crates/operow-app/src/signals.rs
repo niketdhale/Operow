@@ -86,7 +86,7 @@ impl SignalRef {
         if ev.is_error() {
             return None;
         }
-        let f = ev.frame.as_can()?;
+        let f = &ev.frame;
         let data = f.payload();
         match self {
             SignalRef::Dbc {
@@ -252,7 +252,7 @@ mod tests {
             dir: Direction::Tx,
             frame_uid: 0,
             hop: 0,
-            frame: CanFrame::new(id, false, data).unwrap().into(),
+            frame: CanFrame::new(id, false, data).unwrap(),
             kind: Default::default(),
         }
     }

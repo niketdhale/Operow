@@ -206,12 +206,10 @@ impl Series {
             if let Some((bus, id, ext)) = timing
                 && !ev.is_error()
                 && ev.bus == bus
-                && ev
-                    .frame
-                    .as_can()
-                    .is_some_and(|f| f.id == id && f.extended == ext)
+                && ev.frame.id == id
+                && ev.frame.extended == ext
             {
-                self.prev = Some(ev.clone());
+                self.prev = Some(*ev);
             }
         }
         if n < budget {
@@ -1233,12 +1231,9 @@ fn raw_frames(
     }
     let from = store.next_seq().saturating_sub(20_000);
     for (_, ev) in store.iter_from(from) {
-        if ev.bus == bus
-            && !ev.is_error()
-            && let Some(f) = ev.frame.as_can()
-        {
-            let e = ids.entry((f.id, f.extended)).or_default();
-            *e = (*e).max(f.payload().len());
+        if ev.bus == bus && !ev.is_error() {
+            let e = ids.entry((ev.frame.id, ev.frame.extended)).or_default();
+            *e = (*e).max(ev.frame.payload().len());
         }
     }
     ids
@@ -1262,7 +1257,7 @@ mod tests {
             dir: Direction::Tx,
             frame_uid: 0,
             hop: 0,
-            frame: CanFrame::new(0x100, false, &[b0, 0]).unwrap().into(),
+            frame: CanFrame::new(0x100, false, &[b0, 0]).unwrap(),
             kind: Default::default(),
         }
     }

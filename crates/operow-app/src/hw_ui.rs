@@ -486,7 +486,6 @@ mod tests {
             fd_enabled: false,
             data_bitrate: 2_000_000,
             simulate_ack: false,
-            kind: Default::default(),
             hardware: Some(HwBinding {
                 interface: i.into(),
                 listen_only: false,

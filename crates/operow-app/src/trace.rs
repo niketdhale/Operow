@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui_extras::{Column, TableBuilder};
-use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, Frame, NodeId};
+use operow_core::{BusEvent, BusId, CanErrorKind, CanFrame, Direction, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::dbcs::{self, DbcStore};
@@ -58,25 +58,6 @@ pub struct TraceRow {
 impl TraceRow {
     pub fn from_event(ev: &BusEvent, names: &NameLookup) -> TraceRow {
         let error = ev.error_kind();
-        // Ethernet shows as a basic row: ethertype as the id, payload length in the name.
-        let (id, extended, fd, brs, dlc, data, name) = match &ev.frame {
-            Frame::Can(f) => (
-                f.id,
-                f.extended,
-                f.fd,
-                f.brs,
-                f.dlc,
-                f.data,
-                names.msg_name(ev.bus, ev.origin, f.id, f.extended),
-            ),
-            Frame::Eth(f) => {
-                let mut data = [0; 64];
-                let n = f.payload.len().min(64);
-                data[..n].copy_from_slice(&f.payload[..n]);
-                let name = format!("Eth 0x{:04X}, {} B", f.ethertype, f.payload.len());
-                (f.ethertype.into(), false, false, false, n as u8, data, name)
-            }
-        };
         TraceRow {
             time_s: ev.time.as_secs_f64(),
             bus: ev.bus,
@@ -85,16 +66,20 @@ impl TraceRow {
             origin_name: names.node_name(ev.origin),
             dir: ev.dir,
             hop: ev.hop,
-            id,
-            extended,
-            fd,
-            brs,
-            dlc: if error.is_some() { 0 } else { dlc },
-            data: if error.is_some() { [0; 64] } else { data },
+            id: ev.frame.id,
+            extended: ev.frame.extended,
+            fd: ev.frame.fd,
+            brs: ev.frame.brs,
+            dlc: if error.is_some() { 0 } else { ev.frame.dlc },
+            data: if error.is_some() {
+                [0; 64]
+            } else {
+                ev.frame.data
+            },
             msg_name: if error.is_some() {
                 "ErrorFrame".to_string()
             } else {
-                name
+                names.msg_name(ev.bus, ev.origin, ev.frame.id, ev.frame.extended)
             },
             error,
         }
@@ -359,26 +344,22 @@ impl FixedRow {
     }
 
     fn any_highlight(&self, now: Instant) -> bool {
-        (0..self.ev.frame.payload().len()).any(|i| self.is_changed(i, now))
+        (0..self.ev.frame.dlc as usize).any(|i| self.is_changed(i, now))
     }
 }
 
 fn apply_fixed(fixed: &mut HashMap<FixedKey, FixedRow>, seq: u64, ev: &BusEvent, now: Instant) {
-    // Fixed mode is CAN-only.
-    let Some(new) = ev.frame.as_can() else {
-        return;
-    };
     let key = FixedKey {
         bus: ev.bus,
-        id: new.id,
-        extended: new.extended,
+        id: ev.frame.id,
+        extended: ev.frame.extended,
         rx: ev.dir == Direction::Rx,
         error: ev.is_error(),
     };
     match fixed.get_mut(&key) {
         Some(f) => {
-            let mask = changed_mask(f.ev.frame.as_can().unwrap_or(new), new);
-            for i in 0..new.dlc as usize {
+            let mask = changed_mask(&f.ev.frame, &ev.frame);
+            for i in 0..ev.frame.dlc as usize {
                 if mask & (1 << i) != 0 {
                     f.changed_at[i] = Some(now);
                 }
@@ -386,14 +367,14 @@ fn apply_fixed(fixed: &mut HashMap<FixedKey, FixedRow>, seq: u64, ev: &BusEvent,
             f.dt_ms = Some(ev.time.0.saturating_sub(f.ev.time.0) as f64 / 1e6);
             f.count += 1;
             f.seq = seq;
-            f.ev = ev.clone();
+            f.ev = *ev;
         }
         None => {
             fixed.insert(
                 key,
                 FixedRow {
                     seq,
-                    ev: ev.clone(),
+                    ev: *ev,
                     count: 1,
                     dt_ms: None,
                     changed_at: [None; 64],
@@ -406,12 +387,8 @@ fn apply_fixed(fixed: &mut HashMap<FixedKey, FixedRow>, seq: u64, ev: &BusEvent,
 /// Whether `ev` passes `c`; resolves names only for the filters that need
 /// them.
 fn event_matches(c: &CompiledFilters, ev: &BusEvent, names: &NameLookup) -> bool {
-    let (id, ext, dlc) = match &ev.frame {
-        Frame::Can(f) => (f.id, f.extended, f.dlc_code()),
-        Frame::Eth(f) => (f.ethertype.into(), false, 0),
-    };
     let name = if c.needs_name() {
-        names.msg_name(ev.bus, ev.origin, id, ext)
+        names.msg_name(ev.bus, ev.origin, ev.frame.id, ev.frame.extended)
     } else {
         String::new()
     };
@@ -424,11 +401,11 @@ fn event_matches(c: &CompiledFilters, ev: &BusEvent, names: &NameLookup) -> bool
         time_s: ev.time.as_secs_f64(),
         bus: &names.bus_name_cow(ev.bus),
         dir: ev.dir,
-        id,
+        id: ev.frame.id,
         name: &name,
         sender: &sender,
         data: ev.frame.payload(),
-        dlc,
+        dlc: ev.frame.dlc_code(),
         hop: ev.hop,
         error: ev.is_error(),
     })
@@ -1043,9 +1020,8 @@ impl Trace {
             for (i, (k, f)) in items.iter().enumerate() {
                 if (self.expand_all || self.expanded_fixed.contains(k))
                     && let Some(def) = message_def(names, &f.ev)
-                    && let Some(frame) = f.ev.frame.as_can()
                 {
-                    exps.push(Expansion::signals(i, dbcs::decode_lines(def, frame)));
+                    exps.push(Expansion::signals(i, dbcs::decode_lines(def, &f.ev.frame)));
                 }
             }
         } else if grouped {
@@ -1076,9 +1052,8 @@ impl Trace {
             for seq in &self.expanded {
                 if let (Ok(pos), Some(ev)) = (self.index.binary_search(seq), store.get(*seq))
                     && let Some(def) = message_def(names, ev)
-                    && let Some(frame) = ev.frame.as_can()
                 {
-                    exps.push(Expansion::signals(pos, dbcs::decode_lines(def, frame)));
+                    exps.push(Expansion::signals(pos, dbcs::decode_lines(def, &ev.frame)));
                 }
             }
             exps.sort_by_key(|e| e.pos);
@@ -1203,12 +1178,12 @@ impl Trace {
                                 let Some((k, f)) = items.get(frame_idx) else {
                                     return;
                                 };
-                                (f.seq, f.ev.clone(), Some(*f), Some(**k))
+                                (f.seq, f.ev, Some(*f), Some(**k))
                             } else if grouped {
                                 match grouper.get(frame_idx) {
                                     Some(Item::Frame(s)) => {
                                         let Some(ev) = store.get(*s) else { return };
-                                        (*s, ev.clone(), None, None)
+                                        (*s, *ev, None, None)
                                     }
                                     Some(Item::Message(m)) => {
                                         let open = expand_multiframe && m.frames.len() > 1
@@ -1231,7 +1206,7 @@ impl Trace {
                                     return;
                                 };
                                 let Some(ev) = store.get(seq) else { return };
-                                (seq, ev.clone(), None, None)
+                                (seq, *ev, None, None)
                             };
                             row.set_selected(highlight == Some(seq));
                             let r = TraceRow::from_event(&ev, names);
@@ -1482,18 +1457,21 @@ fn group_frames(m: &Message, store: &FrameStore, names: &NameLookup) -> Vec<SubF
     m.frames
         .iter()
         .filter_map(|s| store.get(*s))
-        .filter_map(|ev| Some((ev, ev.frame.as_can()?)))
-        .map(|(ev, f)| {
+        .map(|ev| {
             let cfg = operow_isotp::IsoTpConfig {
-                tx_id: f.id,
-                extended_ids: f.extended,
+                tx_id: ev.frame.id,
+                extended_ids: ev.frame.extended,
                 ..operow_isotp::IsoTpConfig::default()
             };
             SubFrame {
                 time: format!("{:.6}", ev.time.as_secs_f64()),
-                id: format!("{:03X}{}", f.id, if f.extended { "x" } else { "" }),
-                pci: operow_isotp::describe_pci(f, &cfg),
-                data: hex_all(f.payload()),
+                id: format!(
+                    "{:03X}{}",
+                    ev.frame.id,
+                    if ev.frame.extended { "x" } else { "" }
+                ),
+                pci: operow_isotp::describe_pci(&ev.frame, &cfg),
+                data: hex_all(ev.frame.payload()),
                 sender: names.node_name(ev.sender),
             }
         })
@@ -1721,8 +1699,11 @@ fn filter_cell(ui: &mut egui::Ui, col: Col, f: &mut TraceFilters, bus_names: &[S
 
 /// DBC definition of the message in `ev`, via the DBC attached to its bus.
 fn message_def<'a>(names: &'a NameLookup, ev: &BusEvent) -> Option<&'a operow_dbc::MessageDef> {
-    let f = ev.frame.as_can()?;
-    names.dbcs.by_bus.get(&ev.bus)?.message(f.id, f.extended)
+    names
+        .dbcs
+        .by_bus
+        .get(&ev.bus)?
+        .message(ev.frame.id, ev.frame.extended)
 }
 
 /// Data bytes, truncated to 8 with a hover for the full payload. Bytes that
@@ -1938,7 +1919,7 @@ mod tests {
             dir,
             frame_uid: 0,
             hop: u8::from(dir == Direction::Rx),
-            frame: CanFrame::new(id, false, data).unwrap().into(),
+            frame: CanFrame::new(id, false, data).unwrap(),
             kind: Default::default(),
         }
     }
@@ -2242,11 +2223,9 @@ mod tests {
         let base = ev(1, 0, Direction::Tx, 0, &[1, 2, 3, 4, 5, 6, 7, 8]);
         let batch: Vec<BusEvent> = (0..N)
             .map(|i| {
-                let mut e = base.clone();
+                let mut e = base;
                 e.time = Timestamp(i * 1000);
-                if let Frame::Can(f) = &mut e.frame {
-                    f.id = (i % 0x400) as u32;
-                }
+                e.frame.id = (i % 0x400) as u32;
                 e
             })
             .collect();
