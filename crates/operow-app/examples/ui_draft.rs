@@ -5,8 +5,8 @@
 //! Run: `cargo run -p operow-app --example ui_draft`
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, ImageSource, Pos2, Rect, RichText, Sense, Shape,
-    Stroke, StrokeKind, Vec2, include_image, pos2, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Id, ImageSource, Pos2, Rect, RichText, Sense,
+    Shape, Stroke, StrokeKind, Vec2, include_image, pos2, vec2,
 };
 use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex, TabViewer};
 
@@ -259,6 +259,8 @@ enum Tab {
     Tests,
     Log,
     Statistics,
+    MeasurementSetup,
+    OfflineMode,
 }
 
 impl Tab {
@@ -272,6 +274,8 @@ impl Tab {
             Tab::Tests => "Tests",
             Tab::Log => "Log",
             Tab::Statistics => "Statistics",
+            Tab::MeasurementSetup => "Measurement Setup",
+            Tab::OfflineMode => "Offline Mode",
         }
     }
     fn icon(self) -> ImageSource<'static> {
@@ -284,6 +288,8 @@ impl Tab {
             Tab::Tests => icon::script(),
             Tab::Log => icon::open(),
             Tab::Statistics => icon::filter(),
+            Tab::MeasurementSetup => icon::filter(),
+            Tab::OfflineMode => icon::open(),
         }
     }
 }
@@ -323,7 +329,7 @@ impl Workspace {
                 d = DockState::new(vec![Tab::Network]);
                 let t = d.main_surface_mut();
                 let [main, _] = t.split_right(NodeIndex::root(), 0.78, vec![Tab::Properties]);
-                t.split_below(main, 0.56, vec![Tab::Trace, Tab::Log, Tab::Statistics]);
+                t.split_below(main, 0.6, vec![Tab::Trace, Tab::Log, Tab::Statistics]);
                 let w = d.add_window(vec![Tab::Graph]);
                 if let Some(s) = d.get_window_state_mut(w) {
                     s.set_position(pos2(780.0, 330.0))
@@ -502,6 +508,840 @@ fn net_color(p: &Pal, net: &str) -> Color32 {
     }
 }
 
+// ---------------------------------------------------------------- networks
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Block {
+    Ecu,
+    Gen,
+    Replay,
+}
+
+struct NetDef {
+    name: &'static str,
+    proto: Proto,
+    channel: &'static str,
+    kind: &'static str,
+    nodes: &'static [&'static str],
+    gens: &'static [&'static str],
+    replays: &'static [&'static str],
+    dbs: &'static [&'static str],
+}
+
+const NETS: [NetDef; 4] = [
+    NetDef {
+        name: "Powertrain",
+        proto: Proto::CanFd,
+        channel: "CAN 1",
+        kind: "CAN FD network",
+        nodes: &["Engine", "Central GW"],
+        gens: &["CAN IG"],
+        replays: &["drive_cycle.blf"],
+        dbs: &["powertrain.dbc"],
+    },
+    NetDef {
+        name: "Body",
+        proto: Proto::Can,
+        channel: "CAN 2",
+        kind: "CAN network",
+        nodes: &["BodyCtrl", "DoorLeft", "SeatCtrl", "Central GW"],
+        gens: &["Body IG"],
+        replays: &[],
+        dbs: &["body.dbc"],
+    },
+    NetDef {
+        name: "SeatLIN",
+        proto: Proto::Lin,
+        channel: "LIN 1",
+        kind: "LIN network",
+        nodes: &["SeatCtrl", "SeatMotor"],
+        gens: &["LIN IG"],
+        replays: &[],
+        dbs: &["seat.ldf"],
+    },
+    NetDef {
+        name: "Backbone",
+        proto: Proto::Eth,
+        channel: "Eth 1",
+        kind: "Switched Ethernet",
+        nodes: &["ADAS", "Infotainment", "Telematics", "Central GW"],
+        gens: &["Ethernet Packet Builder"],
+        replays: &[],
+        dbs: &["backbone.arxml"],
+    },
+];
+
+// ---------------------------------------------------------------- trace views
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TraceView {
+    #[default]
+    Mixed,
+    Can,
+    Lin,
+    EthIp,
+}
+
+impl TraceView {
+    const ALL: [TraceView; 4] = [
+        TraceView::Mixed,
+        TraceView::Can,
+        TraceView::Lin,
+        TraceView::EthIp,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            TraceView::Mixed => "All networks",
+            TraceView::Can => "CAN / CAN FD",
+            TraceView::Lin => "LIN",
+            TraceView::EthIp => "Ethernet IP/UDP",
+        }
+    }
+    fn headers(self) -> &'static [&'static str] {
+        match self {
+            TraceView::Mixed => &[
+                "Time (s)",
+                "Chn",
+                "ID / Addr",
+                "Proto",
+                "Name",
+                "Dir",
+                "Details",
+                "Data",
+            ],
+            TraceView::Can => &[
+                "Time (s)",
+                "Chn",
+                "ID",
+                "Name",
+                "Event type",
+                "Dir",
+                "DLC",
+                "Len",
+                "Data",
+                "BRS",
+                "ESI",
+            ],
+            TraceView::Lin => &[
+                "Time (s)", "Chn", "PID", "Name", "Dir", "Len", "Data", "Checksum", "Schedule",
+            ],
+            TraceView::EthIp => &[
+                "Time (s)",
+                "Chn",
+                "Port",
+                "VLAN",
+                "Dir",
+                "Protocol",
+                "Source IP",
+                "Destination IP",
+                "Src port",
+                "Dst port",
+                "Name",
+                "Interpretation",
+                "Len",
+                "Data",
+            ],
+        }
+    }
+}
+
+#[derive(Default)]
+struct TraceState {
+    view: TraceView,
+    sort: Option<(usize, bool)>,
+    filters: Vec<(usize, Filt)>,
+    search: String,
+    custom: Option<CustomEdit>,
+}
+
+struct TRow {
+    cells: Vec<String>,
+    proto: Proto,
+    changed: &'static [usize],
+}
+
+/// (time, port, vlan, tx, protocol, src, dst, sport, dport, name, interpretation, data, changed)
+type EthRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [usize],
+);
+
+const ETH_ROWS: &[EthRow] = &[
+    (
+        "2.331044",
+        "P1",
+        "10",
+        true,
+        "SOME/IP",
+        "192.168.1.1",
+        "192.168.1.10",
+        "30490",
+        "30509",
+        "VehicleSpeed",
+        "Notification 0x1234.0x8001",
+        "00 00 12 34 80 01 00 08",
+        &[6, 7],
+    ),
+    (
+        "2.336500",
+        "P2",
+        "10",
+        false,
+        "SOME/IP-SD",
+        "192.168.1.20",
+        "224.244.224.245",
+        "30490",
+        "30490",
+        "OfferService",
+        "Offer 0x0101 v1 TTL 3",
+        "FF FF 81 00 00 00 00 30",
+        &[],
+    ),
+    (
+        "2.352210",
+        "P2",
+        "20",
+        false,
+        "SOME/IP",
+        "192.168.1.20",
+        "192.168.1.30",
+        "40001",
+        "30509",
+        "GetRoute",
+        "Request 0x0101.0x0001",
+        "00 00 01 01 00 01 00 10",
+        &[],
+    ),
+    (
+        "2.353870",
+        "P3",
+        "20",
+        true,
+        "SOME/IP",
+        "192.168.1.30",
+        "192.168.1.20",
+        "30509",
+        "40001",
+        "GetRoute",
+        "Response 0x0101.0x0001 E_OK",
+        "00 00 01 01 00 01 00 18",
+        &[7],
+    ),
+    (
+        "2.360120",
+        "P1",
+        "10",
+        true,
+        "UDP",
+        "192.168.1.10",
+        "192.168.1.255",
+        "5000",
+        "5000",
+        "ObjectList",
+        "48 objects",
+        "30 00 A1 0C 7F 12 00 00",
+        &[2, 3],
+    ),
+    (
+        "2.371004",
+        "P4",
+        "-",
+        false,
+        "DoIP",
+        "192.168.1.99",
+        "192.168.1.1",
+        "13400",
+        "13400",
+        "RoutingActivation",
+        "Tester 0x0E00",
+        "02 FD 00 05 00 00 00 07",
+        &[],
+    ),
+];
+
+fn trace_rows(view: TraceView) -> Vec<TRow> {
+    let can_like = |r: &Row| matches!(r.proto, Proto::Can | Proto::CanFd);
+    let dir = |tx: bool| if tx { "TX" } else { "RX" }.to_string();
+    let len = |d: &str| d.split(' ').count().to_string();
+    match view {
+        TraceView::Mixed => ROWS
+            .iter()
+            .map(|r| TRow {
+                cells: vec![
+                    r.t.into(),
+                    r.net.into(),
+                    r.id.into(),
+                    String::new(),
+                    r.name.into(),
+                    dir(r.tx),
+                    r.details.into(),
+                    r.data.into(),
+                ],
+                proto: r.proto,
+                changed: r.changed,
+            })
+            .collect(),
+        TraceView::Can => ROWS
+            .iter()
+            .filter(|r| can_like(r))
+            .map(|r| {
+                let fd = r.proto == Proto::CanFd;
+                TRow {
+                    cells: vec![
+                        r.t.into(),
+                        r.net.into(),
+                        r.id.into(),
+                        r.name.into(),
+                        if fd { "CAN FD Frame" } else { "CAN Frame" }.into(),
+                        dir(r.tx),
+                        len(r.data),
+                        len(r.data),
+                        r.data.into(),
+                        if fd { "1" } else { "-" }.into(),
+                        if fd { "0" } else { "-" }.into(),
+                    ],
+                    proto: r.proto,
+                    changed: r.changed,
+                }
+            })
+            .collect(),
+        TraceView::Lin => ROWS
+            .iter()
+            .filter(|r| r.proto == Proto::Lin)
+            .map(|r| TRow {
+                cells: vec![
+                    r.t.into(),
+                    r.net.into(),
+                    r.id.into(),
+                    r.name.into(),
+                    dir(r.tx),
+                    len(r.data),
+                    r.data.into(),
+                    "Enhanced".into(),
+                    r.details.split(" · ").next().unwrap_or("").into(),
+                ],
+                proto: r.proto,
+                changed: r.changed,
+            })
+            .collect(),
+        TraceView::EthIp => ETH_ROWS
+            .iter()
+            .map(|e| TRow {
+                cells: vec![
+                    e.0.into(),
+                    "Backbone".into(),
+                    e.1.into(),
+                    e.2.into(),
+                    dir(e.3),
+                    e.4.into(),
+                    e.5.into(),
+                    e.6.into(),
+                    e.7.into(),
+                    e.8.into(),
+                    e.9.into(),
+                    e.10.into(),
+                    len(e.11),
+                    e.11.into(),
+                ],
+                proto: Proto::Eth,
+                changed: e.12,
+            })
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------- column filters
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rel {
+    Equals,
+    NotEquals,
+    Contains,
+    StartsWith,
+    Greater,
+    Less,
+}
+
+impl Rel {
+    const ALL: [Rel; 6] = [
+        Rel::Equals,
+        Rel::NotEquals,
+        Rel::Contains,
+        Rel::StartsWith,
+        Rel::Greater,
+        Rel::Less,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            Rel::Equals => "equals",
+            Rel::NotEquals => "not equals",
+            Rel::Contains => "contains",
+            Rel::StartsWith => "starts with",
+            Rel::Greater => "greater than",
+            Rel::Less => "less than",
+        }
+    }
+    fn test(self, v: &str, want: &str) -> bool {
+        let num = |s: &str| {
+            let s = s.trim().trim_start_matches("PID ");
+            s.strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok().map(|n| n as f64))
+                .or_else(|| s.parse::<f64>().ok())
+        };
+        match self {
+            Rel::Equals => v.eq_ignore_ascii_case(want),
+            Rel::NotEquals => !v.eq_ignore_ascii_case(want),
+            Rel::Contains => v.to_lowercase().contains(&want.to_lowercase()),
+            Rel::StartsWith => v.to_lowercase().starts_with(&want.to_lowercase()),
+            Rel::Greater => matches!((num(v), num(want)), (Some(a), Some(b)) if a > b),
+            Rel::Less => matches!((num(v), num(want)), (Some(a), Some(b)) if a < b),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Cond {
+    on: bool,
+    rel: Rel,
+    value: String,
+}
+
+#[derive(Clone)]
+enum Filt {
+    Eq(String),
+    Custom { and: bool, conds: Vec<Cond> },
+}
+
+impl Filt {
+    fn matches(&self, v: &str) -> bool {
+        match self {
+            Filt::Eq(s) => v == s,
+            Filt::Custom { and, conds } => {
+                let mut res = conds
+                    .iter()
+                    .filter(|c| c.on && !c.value.is_empty())
+                    .map(|c| c.rel.test(v, &c.value))
+                    .peekable();
+                if res.peek().is_none() {
+                    true
+                } else if *and {
+                    res.all(|b| b)
+                } else {
+                    res.any(|b| b)
+                }
+            }
+        }
+    }
+}
+
+/// Dialog being edited: column, AND (true) / OR (false), conditions.
+struct CustomEdit {
+    col: usize,
+    and: bool,
+    conds: Vec<Cond>,
+}
+
+/// Hex view as stored; decimal converts `0x..` tokens and data bytes.
+fn fmt_num(v: &str, hex: bool, data: bool) -> String {
+    if hex {
+        return v.to_string();
+    }
+    v.split(' ')
+        .map(|t| {
+            if let Some(h) = t.strip_prefix("0x") {
+                let parts: Vec<String> = h
+                    .split('.')
+                    .map(|x| {
+                        u64::from_str_radix(x, 16)
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|_| x.to_string())
+                    })
+                    .collect();
+                parts.join(".")
+            } else if data && t.len() == 2 {
+                u8::from_str_radix(t, 16)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| t.to_string())
+            } else {
+                t.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const RIBBON_TABS: [&str; 8] = [
+    "File",
+    "Home",
+    "Analysis",
+    "Simulation",
+    "Test",
+    "Diagnostics",
+    "Hardware",
+    "Tools",
+];
+
+/// Large ribbon button: icon over label.
+fn big(
+    ui: &mut egui::Ui,
+    p: &Pal,
+    src: ImageSource<'static>,
+    label: &str,
+    on: bool,
+    enabled: bool,
+    primary: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(66.0, 62.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hov = enabled && resp.hovered();
+    let (fill, fg) = if primary && enabled {
+        (
+            if hov {
+                p.green.gamma_multiply(0.9)
+            } else {
+                p.green
+            },
+            p.on_green,
+        )
+    } else if on {
+        (p.soft, p.green)
+    } else if hov {
+        (p.soft, p.fg)
+    } else {
+        (Color32::TRANSPARENT, if enabled { p.fg } else { p.faint })
+    };
+    ui.painter().rect_filled(rect, 8, fill);
+    if on && !primary {
+        ui.painter()
+            .rect_stroke(rect, 8, Stroke::new(1.0_f32, p.green), StrokeKind::Inside);
+    }
+    let ir = Rect::from_center_size(rect.center_top() + vec2(0.0, 20.0), Vec2::splat(22.0));
+    img(
+        src,
+        if primary && enabled {
+            p.on_green
+        } else if enabled {
+            if on { p.green } else { p.muted }
+        } else {
+            p.faint
+        },
+        22.0,
+    )
+    .paint_at(ui, ir);
+    ui.painter().text(
+        rect.center_bottom() - vec2(0.0, 12.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.5),
+        fg,
+    );
+    resp
+}
+
+/// Small stacked ribbon button.
+fn small(
+    ui: &mut egui::Ui,
+    p: &Pal,
+    src: ImageSource<'static>,
+    label: &str,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    let tint = if !enabled {
+        p.faint
+    } else if on {
+        p.green
+    } else {
+        p.muted
+    };
+    let txt = RichText::new(label).color(if !enabled {
+        p.faint
+    } else if on {
+        p.green
+    } else {
+        p.fg
+    });
+    let b = egui::Button::image_and_text(img(src, tint, 14.0), txt)
+        .frame(on)
+        .fill(p.soft)
+        .min_size(vec2(120.0, 22.0));
+    ui.add_enabled(enabled, b)
+}
+
+/// Titled ribbon group followed by a divider.
+fn group(ui: &mut egui::Ui, p: &Pal, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.set_min_height(64.0);
+            add(ui)
+        });
+        ui.label(RichText::new(title).small().color(p.muted));
+    });
+    ui.add(egui::Separator::default().vertical().spacing(14.0));
+}
+
+impl Draft {
+    fn ribbon_body(&mut self, ui: &mut egui::Ui, p: &Pal, open: &mut Option<Tab>) {
+        let is_open = |s: &Self, t: Tab| s.docks[s.ws as usize].find_tab(&t).is_some();
+        match self.ribbon {
+            0 => {
+                group(ui, p, "Project", |ui| {
+                    big(ui, p, icon::open(), "Open", false, true, false);
+                    big(ui, p, icon::save(), "Save", false, true, false);
+                    big(ui, p, icon::save(), "Save as", false, true, false);
+                });
+                group(ui, p, "Recent", |ui| {
+                    ui.vertical(|ui| {
+                        for f in [
+                            "body_gateway.operow",
+                            "powertrain_hil.operow",
+                            "eth_backbone.operow",
+                        ] {
+                            let _ = ui
+                                .add(egui::Button::new(RichText::new(f).color(p.fg)).frame(false));
+                        }
+                    });
+                });
+            }
+            1 => {
+                group(ui, p, "Measurement", |ui| {
+                    if big(ui, p, icon::play(), "Start", false, !self.running, true).clicked() {
+                        self.running = true;
+                    }
+                    if big(ui, p, icon::stop(), "Stop", false, self.running, false).clicked() {
+                        self.running = false;
+                    }
+                    ui.vertical(|ui| {
+                        small(ui, p, icon::play(), "Step", false, !self.running);
+                        small(ui, p, icon::pause(), "Break", false, self.running);
+                        if small(ui, p, icon::replay(), "Animate", self.animate, true).clicked() {
+                            self.animate = !self.animate;
+                        }
+                    });
+                });
+                group(ui, p, "Mode", |ui| {
+                    ui.vertical(|ui| {
+                        let txt = if self.online {
+                            "Online mode"
+                        } else {
+                            "Offline mode"
+                        };
+                        if small(ui, p, icon::bus(), txt, true, !self.running)
+                            .on_hover_text("Real bus or offline log replay")
+                            .clicked()
+                        {
+                            self.online = !self.online;
+                        }
+                        let txt = if self.real_bus {
+                            "Real bus"
+                        } else {
+                            "Simulated bus"
+                        };
+                        if small(ui, p, icon::ecu(), txt, self.real_bus, !self.running).clicked() {
+                            self.real_bus = !self.real_bus;
+                        }
+                        small(ui, p, icon::gateway(), "Hardware: Virtual", false, true);
+                    });
+                });
+                group(ui, p, "Appearance", |ui| {
+                    egui::Grid::new("fmt").spacing([4.0, 4.0]).show(ui, |ui| {
+                        ui.selectable_value(&mut self.hex, false, "dec");
+                        ui.selectable_value(&mut self.hex, true, "hex");
+                        ui.end_row();
+                        ui.selectable_value(&mut self.sym, true, "sym");
+                        ui.selectable_value(&mut self.sym, false, "num");
+                        ui.end_row();
+                    });
+                });
+                group(ui, p, "Windows", |ui| {
+                    big(ui, p, icon::replay(), "Sync", false, true, false)
+                        .on_hover_text("Synchronise the time cursor across windows");
+                    if big(
+                        ui,
+                        p,
+                        icon::trace(),
+                        "Trace",
+                        is_open(self, Tab::Trace),
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        *open = Some(Tab::Trace);
+                    }
+                });
+            }
+            2 => {
+                group(ui, p, "Configuration", |ui| {
+                    if big(
+                        ui,
+                        p,
+                        icon::filter(),
+                        "Measure",
+                        is_open(self, Tab::MeasurementSetup),
+                        true,
+                        false,
+                    )
+                    .on_hover_text("Measurement setup")
+                    .clicked()
+                    {
+                        *open = Some(Tab::MeasurementSetup);
+                    }
+                    if big(
+                        ui,
+                        p,
+                        icon::open(),
+                        "Offline",
+                        is_open(self, Tab::OfflineMode),
+                        true,
+                        false,
+                    )
+                    .on_hover_text("Offline mode sources")
+                    .clicked()
+                    {
+                        *open = Some(Tab::OfflineMode);
+                    }
+                    big(ui, p, icon::filter(), "Filter", false, false, false);
+                    if big(
+                        ui,
+                        p,
+                        icon::save(),
+                        "Logging",
+                        is_open(self, Tab::Log),
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        *open = Some(Tab::Log);
+                    }
+                });
+                group(ui, p, "Bus analysis", |ui| {
+                    for (t, l) in [
+                        (Tab::Trace, "Trace"),
+                        (Tab::Graph, "Graphics"),
+                        (Tab::Properties, "Data"),
+                        (Tab::Statistics, "Statistics"),
+                    ] {
+                        if big(ui, p, t.icon(), l, is_open(self, t), true, false).clicked() {
+                            *open = Some(t);
+                        }
+                    }
+                });
+            }
+            3 => {
+                group(ui, p, "Setup", |ui| {
+                    if big(
+                        ui,
+                        p,
+                        icon::bus(),
+                        "Networks",
+                        is_open(self, Tab::Network),
+                        true,
+                        false,
+                    )
+                    .on_hover_text("Simulation setup")
+                    .clicked()
+                    {
+                        *open = Some(Tab::Network);
+                    }
+                    big(ui, p, icon::ecu(), "Add ECU", false, !self.running, false);
+                    big(
+                        ui,
+                        p,
+                        icon::gateway(),
+                        "Gateway",
+                        false,
+                        !self.running,
+                        false,
+                    );
+                });
+                group(ui, p, "Stimulus", |ui| {
+                    big(ui, p, icon::send(), "Generator", false, true, false);
+                    big(ui, p, icon::replay(), "Replay", false, true, false);
+                    big(ui, p, icon::clear(), "Faults", false, true, false);
+                });
+            }
+            4 => {
+                group(ui, p, "Tests", |ui| {
+                    if big(ui, p, icon::play(), "Run all", false, true, true).clicked() {
+                        *open = Some(Tab::Tests);
+                    }
+                    if big(
+                        ui,
+                        p,
+                        icon::script(),
+                        "Modules",
+                        is_open(self, Tab::Tests),
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        *open = Some(Tab::Tests);
+                    }
+                    big(ui, p, icon::save(), "Report", false, true, false);
+                });
+            }
+            5 => {
+                group(ui, p, "Diagnostics", |ui| {
+                    if big(
+                        ui,
+                        p,
+                        icon::send(),
+                        "Console",
+                        is_open(self, Tab::Diagnostics),
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        *open = Some(Tab::Diagnostics);
+                    }
+                    big(ui, p, icon::filter(), "DTCs", false, true, false);
+                    big(ui, p, icon::ecu(), "Security", false, true, false);
+                });
+            }
+            6 => {
+                group(ui, p, "Driver", |ui| {
+                    for d in ["Virtual", "PCAN", "Vector XL", "SocketCAN", "UDP"] {
+                        big(ui, p, icon::gateway(), d, d == "Virtual", true, false);
+                    }
+                });
+                group(ui, p, "Channels", |ui| {
+                    big(ui, p, icon::bus(), "Mapping", false, true, false);
+                });
+            }
+            _ => {
+                group(ui, p, "Logs", |ui| {
+                    big(ui, p, icon::replay(), "Convert", false, true, false)
+                        .on_hover_text("ASC <> BLF");
+                });
+                group(ui, p, "App", |ui| {
+                    big(ui, p, icon::script(), "Settings", false, true, false);
+                });
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- app
 
 struct Draft {
@@ -514,8 +1354,18 @@ struct Draft {
     focus: bool,
     running: bool,
     selected: &'static str,
-    trace_filter: Option<Proto>,
+    trace: TraceState,
     name: String,
+    net_view: usize,
+    ribbon: usize,
+    ribbon_min: bool,
+    hex: bool,
+    sym: bool,
+    online: bool,
+    real_bus: bool,
+    animate: bool,
+    ms: [bool; 5],
+    offline: [bool; 3],
 }
 
 impl Draft {
@@ -529,8 +1379,18 @@ impl Draft {
             focus: false,
             running: true,
             selected: "Engine",
-            trace_filter: None,
+            trace: TraceState::default(),
             name: "Engine".into(),
+            net_view: 0,
+            ribbon: 1,
+            ribbon_min: false,
+            hex: true,
+            sym: true,
+            online: true,
+            real_bus: false,
+            animate: true,
+            ms: [false, false, false, false, true],
+            offline: [true, true, false],
         }
     }
     fn pal(&self) -> Pal {
@@ -551,6 +1411,7 @@ impl Draft {
 }
 
 enum Req {
+    Open(Tab),
     Maximise(Tab),
     Minimise(Tab),
     Float(Tab),
@@ -561,7 +1422,12 @@ struct Viewer<'a> {
     t: f64,
     running: bool,
     selected: &'a mut &'static str,
-    trace_filter: &'a mut Option<Proto>,
+    trace: &'a mut TraceState,
+    net_view: &'a mut usize,
+    hex: bool,
+    online: &'a mut bool,
+    ms: &'a mut [bool; 5],
+    offline: &'a mut [bool; 3],
     name: &'a mut String,
     req: Option<Req>,
 }
@@ -592,6 +1458,8 @@ impl TabViewer for Viewer<'_> {
                 }
             }
             Tab::Statistics => self.statistics(ui),
+            Tab::MeasurementSetup => self.measurement_setup(ui),
+            Tab::OfflineMode => self.offline_mode(ui),
         }
     }
 
@@ -616,7 +1484,9 @@ impl TabViewer for Viewer<'_> {
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         match tab {
-            Tab::Network | Tab::Trace | Tab::Graph => [false, false],
+            Tab::Network | Tab::Trace | Tab::Graph | Tab::MeasurementSetup | Tab::OfflineMode => {
+                [false, false]
+            }
             _ => [false, true],
         }
     }
@@ -665,7 +1535,18 @@ impl Viewer<'_> {
             });
         });
 
-        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        let avail = ui.available_size() - vec2(0.0, 32.0);
+        if *self.net_view > 0 {
+            self.net_detail(ui, avail, *self.net_view - 1);
+        } else {
+            self.overview(ui, avail);
+        }
+        self.net_tabs(ui);
+    }
+
+    fn overview(&mut self, ui: &mut egui::Ui, avail: Vec2) {
+        let p = self.p;
+        let (rect, resp) = ui.allocate_exact_size(avail, Sense::click());
         let painter = ui.painter_at(rect);
         gradient(&painter, rect, p.g1, p.g2);
         let step = 22.0;
@@ -682,7 +1563,7 @@ impl Viewer<'_> {
         // Design space is 900 x 540; fit it into the tab.
         let s = (rect.width() / 920.0)
             .min(rect.height() / 560.0)
-            .clamp(0.45, 1.6);
+            .clamp(0.85, 1.6);
         let o = rect.min + vec2(10.0, 10.0);
         let at = |x: f32, y: f32| o + vec2(x, y) * s;
         let r = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(at(x, y), vec2(w, h) * s);
@@ -783,7 +1664,7 @@ impl Viewer<'_> {
                 Color32::WHITE,
             );
             let m = Rect::from_center_size(
-                b.right_center() - vec2(110.0 * s, 0.0),
+                b.right_center() - vec2(130.0 * s, 0.0),
                 vec2(70.0 * s, 6.0),
             );
             painter.rect_filled(m, 3, Color32::from_white_alpha(70));
@@ -977,7 +1858,9 @@ impl Viewer<'_> {
             };
             let ir =
                 Rect::from_min_size(n.min + vec2(10.0, 9.0) * s, Vec2::splat(15.0 * s.max(0.8)));
-            img(src, if name.contains("GW") { p.gw } else { p.fg }, 15.0).paint_at(ui, ir);
+            if rect.contains_rect(ir) {
+                img(src, if name.contains("GW") { p.gw } else { p.fg }, 15.0).paint_at(ui, ir);
+            }
             painter.text(
                 n.min + vec2(32.0, 16.0) * s,
                 Align2::LEFT_CENTER,
@@ -1037,105 +1920,995 @@ impl Viewer<'_> {
         );
     }
 
-    fn trace(&mut self, ui: &mut egui::Ui) {
+    /// Sheet-style tabs under the canvas: the overview plus one view per network.
+    fn net_tabs(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
-        let mut f = *self.trace_filter;
-        self.toolbar_trace(ui, &mut f);
-        *self.trace_filter = f;
-        let filter = f;
-        let rows: Vec<&Row> = ROWS
-            .iter()
-            .filter(|r| {
-                filter.is_none_or(|f| f == r.proto || (f == Proto::Can && r.proto == Proto::CanFd))
-            })
-            .collect();
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            let mut tab = |ui: &mut egui::Ui, i: usize, label: &str, c: Option<Color32>| {
+                let on = *self.net_view == i;
+                let r = ui.add(
+                    egui::Button::new(
+                        RichText::new(label)
+                            .color(if on { p.green } else { p.muted })
+                            .strong(),
+                    )
+                    .fill(if on { p.panel } else { Color32::TRANSPARENT })
+                    .stroke(if on {
+                        Stroke::new(1.0_f32, p.line)
+                    } else {
+                        Stroke::NONE
+                    })
+                    .min_size(vec2(0.0, 24.0)),
+                );
+                if let Some(c) = c {
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(
+                            r.rect.left_top() + vec2(0.0, 0.0),
+                            vec2(r.rect.width(), 2.0),
+                        ),
+                        0,
+                        c,
+                    );
+                }
+                if r.clicked() {
+                    *self.net_view = i;
+                }
+            };
+            tab(ui, 0, "Overview", None);
+            for (i, n) in NETS.iter().enumerate() {
+                tab(ui, i + 1, n.name, Some(net_color(&p, n.name)));
+            }
+        });
+    }
+
+    fn net_detail(&mut self, ui: &mut egui::Ui, avail: Vec2, idx: usize) {
+        let p = self.p;
+        let net = &NETS[idx];
+        let col = net_color(&p, net.name);
+        let (rect, resp) = ui.allocate_exact_size(avail, Sense::click());
+        let painter = ui.painter_at(rect);
+        gradient(&painter, rect, p.g1, p.g2);
+        let s = (rect.width() / 900.0)
+            .min(rect.height() / 420.0)
+            .clamp(0.8, 1.4);
+        let o = rect.min + vec2(10.0, 10.0);
+        let at = |x: f32, y: f32| o + vec2(x, y) * s;
+        let font = |px: f32| FontId::proportional(px * s.max(0.85));
+
+        let mut blocks: Vec<(Block, &str)> = net.nodes.iter().map(|n| (Block::Ecu, *n)).collect();
+        blocks.extend(net.gens.iter().map(|n| (Block::Gen, *n)));
+        blocks.extend(net.replays.iter().map(|n| (Block::Replay, *n)));
+
+        let eth = net.proto == Proto::Eth;
+        let bus_y = 205.0;
+        let nb = Rect::from_min_size(at(680.0, 150.0), vec2(190.0, 110.0) * s);
+        let pos = |i: usize| {
+            let row = i / 3;
+            let x = 30.0 + (i % 3) as f32 * 205.0;
+            let y = if row == 0 { 20.0 } else { 290.0 };
+            Rect::from_min_size(at(x, y), vec2(175.0, 100.0) * s)
+        };
+
+        // Wiring
+        let w = Stroke::new(2.0 * s.max(0.8), col);
+        if eth {
+            for i in 0..blocks.len() {
+                let b = pos(i);
+                let (sx, sy) = if i / 3 == 0 {
+                    (b.center().x, b.bottom())
+                } else {
+                    (b.center().x, b.top())
+                };
+                let ly = at(0.0, bus_y - 30.0 + i as f32 * 12.0).y;
+                let ty = nb.top() + (12.0 + i as f32 * 14.0) * s;
+                let pts = vec![
+                    pos2(sx, sy),
+                    pos2(sx, ly),
+                    pos2(nb.left() - (20.0 + i as f32 * 6.0) * s, ly),
+                    pos2(nb.left() - (20.0 + i as f32 * 6.0) * s, ty),
+                    pos2(nb.left(), ty),
+                ];
+                painter.add(Shape::line(pts, w));
+                painter.text(
+                    pos2(nb.left() - 4.0, ty - 7.0),
+                    Align2::RIGHT_CENTER,
+                    format!("P{}", i + 1),
+                    FontId::monospace(9.5),
+                    p.muted,
+                );
+            }
+        } else {
+            let y = at(0.0, bus_y).y;
+            for dy in [-2.5, 2.5] {
+                painter.hline(at(20.0, 0.0).x..=nb.left(), y + dy, w);
+            }
+            for i in 0..blocks.len() {
+                let b = pos(i);
+                let from = if i / 3 == 0 { b.bottom() } else { b.top() };
+                painter.vline(b.center().x, from.min(y)..=from.max(y), w);
+            }
+            if self.running {
+                let t = (self.t as f32 / 2.0).fract();
+                let x = at(20.0, 0.0).x + (nb.left() - at(20.0, 0.0).x) * t;
+                painter.circle_filled(pos2(x, y), 4.0, p.green);
+                ui.ctx().request_repaint();
+            }
+        }
+
+        // Blocks
+        let click = resp
+            .clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten();
+        for (i, (kind, name)) in blocks.iter().enumerate() {
+            let b = pos(i);
+            if click.is_some_and(|c| b.contains(c)) && *kind == Block::Ecu {
+                *self.selected = name;
+            }
+            let label = match kind {
+                Block::Ecu if name.contains("GW") => "Gateway",
+                Block::Ecu => "ECU",
+                Block::Gen => "Interactive generator",
+                Block::Replay => "Replay",
+            };
+            let sub = match kind {
+                Block::Ecu if *name == "SeatCtrl" && net.proto == Proto::Lin => {
+                    "LIN master".to_string()
+                }
+                Block::Ecu if net.proto == Proto::Lin => "LIN slave".to_string(),
+                Block::Ecu => format!("{}.rhai", name.to_lowercase().replace(' ', "_")),
+                Block::Gen => "3 messages".to_string(),
+                Block::Replay => "loop · 1.0x".to_string(),
+            };
+            painter.add(
+                egui::Shadow {
+                    offset: [0, 3],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(22),
+                }
+                .as_shape(b, 10),
+            );
+            painter.rect(
+                b,
+                10,
+                p.panel,
+                Stroke::new(1.0_f32, p.line),
+                StrokeKind::Inside,
+            );
+            let foot = Rect::from_min_max(pos2(b.left(), b.bottom() - 28.0 * s), b.max);
+            painter.rect_filled(
+                foot,
+                CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 10,
+                    se: 10,
+                },
+                p.soft,
+            );
+            painter.text(
+                b.center_top() + vec2(0.0, 14.0 * s),
+                Align2::CENTER_CENTER,
+                label,
+                font(10.5),
+                p.muted,
+            );
+            painter.text(
+                b.center_top() + vec2(0.0, 32.0 * s),
+                Align2::CENTER_CENTER,
+                *name,
+                font(13.5),
+                p.fg,
+            );
+            painter.text(
+                b.center_top() + vec2(0.0, 50.0 * s),
+                Align2::CENTER_CENTER,
+                sub,
+                FontId::monospace(10.0 * s.max(0.85)),
+                p.muted,
+            );
+            if *self.selected == *name {
+                painter.rect_stroke(
+                    b.expand(3.0),
+                    12,
+                    Stroke::new(2.0_f32, p.green),
+                    StrokeKind::Outside,
+                );
+            }
+            let icons: Vec<(ImageSource<'static>, &str)> = match kind {
+                Block::Ecu => vec![
+                    (icon::script(), "Edit script"),
+                    (icon::ecu(), "Node settings"),
+                    (icon::bus(), "Online / offline"),
+                ],
+                Block::Gen => vec![(icon::send(), "Open generator")],
+                Block::Replay => vec![
+                    (icon::play(), "Play"),
+                    (icon::pause(), "Pause"),
+                    (icon::stop(), "Stop"),
+                ],
+            };
+            for (k, (src, tip)) in icons.into_iter().enumerate() {
+                let r = Rect::from_min_size(
+                    foot.left_top() + vec2(10.0 + k as f32 * 24.0, 6.0) * s,
+                    Vec2::splat(16.0 * s.max(0.85)),
+                );
+                let hov = ui.rect_contains_pointer(r);
+                if rect.contains_rect(r) {
+                    img(src, if hov { p.green } else { p.muted }, 16.0).paint_at(ui, r);
+                }
+                ui.interact(r, Id::new(("blk", idx, i, k)), Sense::hover())
+                    .on_hover_text(tip);
+            }
+        }
+
+        // Network block
+        painter.add(
+            egui::Shadow {
+                offset: [0, 3],
+                blur: 12,
+                spread: 0,
+                color: Color32::from_black_alpha(22),
+            }
+            .as_shape(nb, 10),
+        );
+        painter.rect(
+            nb,
+            10,
+            p.panel,
+            Stroke::new(1.0_f32, p.line),
+            StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            Rect::from_min_size(nb.min, vec2(nb.width(), 4.0)),
+            CornerRadius {
+                nw: 10,
+                ne: 10,
+                sw: 0,
+                se: 0,
+            },
+            col,
+        );
+        let foot = Rect::from_min_max(pos2(nb.left(), nb.bottom() - 28.0 * s), nb.max);
+        painter.rect_filled(
+            foot,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: 10,
+                se: 10,
+            },
+            p.soft,
+        );
+        painter.text(
+            nb.center_top() + vec2(0.0, 18.0 * s),
+            Align2::CENTER_CENTER,
+            net.kind,
+            font(10.5),
+            p.muted,
+        );
+        painter.text(
+            nb.center_top() + vec2(0.0, 38.0 * s),
+            Align2::CENTER_CENTER,
+            net.name,
+            font(14.0),
+            p.fg,
+        );
+        painter.text(
+            nb.center_top() + vec2(0.0, 58.0 * s),
+            Align2::CENTER_CENTER,
+            net.channel,
+            FontId::monospace(11.0 * s.max(0.85)),
+            col,
+        );
+        let load = match net.proto {
+            Proto::Eth => "62 Mbit/s",
+            Proto::Lin => "sched 42 %",
+            Proto::CanFd => "load 3.0 %",
+            Proto::Can => "load 5.9 %",
+        };
+        painter.text(
+            foot.left_center() + vec2(10.0, 0.0),
+            Align2::LEFT_CENTER,
+            load,
+            FontId::monospace(10.5 * s.max(0.85)),
+            p.muted,
+        );
+        painter.text(
+            rect.left_top() + vec2(12.0, 12.0),
+            Align2::LEFT_TOP,
+            format!("{} · {} blocks", net.name, blocks.len()),
+            FontId::proportional(11.0),
+            p.faint,
+        );
+    }
+
+    fn measurement_setup(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        let painter = ui.painter_at(rect);
+        gradient(&painter, rect, p.g1, p.g2);
+        let s = (rect.width() / 860.0)
+            .min(rect.height() / 440.0)
+            .clamp(0.8, 1.4);
+        let o = rect.min + vec2(14.0, 14.0);
+        let at = |x: f32, y: f32| o + vec2(x, y) * s;
+        let r = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(at(x, y), vec2(w, h) * s);
+        let font = |px: f32| FontId::proportional(px * s.max(0.85));
+        let click = resp
+            .clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten();
+        let dbl = resp
+            .double_clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten();
+        let line = Stroke::new(2.0 * s.max(0.8), p.green);
+        let dim = Stroke::new(1.5_f32, p.faint);
+
+        // Sources
+        let real = r(10.0, 250.0, 70.0, 40.0);
+        let off = r(10.0, 120.0, 70.0, 40.0);
+        let online = *self.online;
+        for (b, label, on) in [(real, "Real bus", online), (off, "Offline log", !online)] {
+            painter.rect(
+                b,
+                8,
+                if on { p.soft } else { p.panel },
+                Stroke::new(1.0_f32, if on { p.green } else { p.line }),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                b.center(),
+                Align2::CENTER_CENTER,
+                label,
+                font(11.0),
+                if on { p.green } else { p.muted },
+            );
+        }
+        let sw = r(130.0, 175.0, 90.0, 80.0);
+        painter.add(Shape::line(
+            vec![
+                real.right_center(),
+                pos2(sw.center().x, real.center().y),
+                pos2(sw.center().x, sw.bottom()),
+            ],
+            if online { line } else { dim },
+        ));
+        painter.add(Shape::line(
+            vec![
+                off.right_center(),
+                pos2(sw.center().x, off.center().y),
+                pos2(sw.center().x, sw.top()),
+            ],
+            if online { dim } else { line },
+        ));
+        painter.rect(
+            sw,
+            10,
+            p.panel,
+            Stroke::new(1.0_f32, p.line),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            sw.center_top() + vec2(0.0, 12.0 * s),
+            Align2::CENTER_CENTER,
+            "Offline",
+            font(10.0),
+            if online { p.faint } else { p.green },
+        );
+        painter.text(
+            sw.center_bottom() - vec2(0.0, 12.0 * s),
+            Align2::CENTER_CENTER,
+            "Online",
+            font(10.0),
+            if online { p.green } else { p.faint },
+        );
+        let pivot = sw.center() - vec2(18.0 * s, 0.0);
+        let tip = sw.center() + vec2(18.0 * s, if online { 10.0 } else { -10.0 } * s);
+        painter.line_segment([pivot, tip], Stroke::new(3.0_f32, p.green));
+        painter.circle_filled(pivot, 3.5, p.green);
+        if click.is_some_and(|c| sw.contains(c)) {
+            *self.online = !*self.online;
+        }
+
+        // Trunk and branches
+        let trunk_x = at(300.0, 0.0).x;
+        painter.line_segment([sw.right_center(), pos2(trunk_x, sw.center().y)], line);
+        let names = [
+            ("Statistics", Tab::Statistics),
+            ("Trace", Tab::Trace),
+            ("Data", Tab::Properties),
+            ("Graphics", Tab::Graph),
+            ("Logging", Tab::Log),
+        ];
+        let ys: Vec<f32> = (0..names.len()).map(|i| 20.0 + i as f32 * 82.0).collect();
+        painter.vline(
+            trunk_x,
+            at(0.0, ys[0] + 30.0).y..=at(0.0, ys[4] + 30.0).y,
+            line,
+        );
+        for (i, (name, tab)) in names.iter().enumerate() {
+            let b = r(400.0, ys[i], 210.0, 62.0);
+            let y = b.center().y;
+            let blocked = self.ms[i];
+            let sq = Rect::from_center_size(pos2(at(350.0, 0.0).x, y), Vec2::splat(14.0 * s));
+            painter.line_segment([pos2(trunk_x, y), sq.left_center()], line);
+            painter.line_segment(
+                [sq.right_center(), b.left_center()],
+                if blocked { dim } else { line },
+            );
+            if blocked {
+                for dx in [-3.0, 3.0] {
+                    painter.vline(
+                        sq.center().x + dx,
+                        sq.y_range(),
+                        Stroke::new(3.0_f32, p.amber),
+                    );
+                }
+            } else {
+                painter.rect_filled(sq, 3, p.green);
+            }
+            if click.is_some_and(|c| sq.expand(4.0).contains(c)) {
+                self.ms[i] = !blocked;
+            }
+            let fill = if blocked { p.page } else { p.panel };
+            painter.add(
+                egui::Shadow {
+                    offset: [0, 2],
+                    blur: 10,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if blocked { 0 } else { 20 }),
+                }
+                .as_shape(b, 10),
+            );
+            painter.rect(
+                b,
+                10,
+                fill,
+                Stroke::new(1.0_f32, p.line),
+                StrokeKind::Inside,
+            );
+            let foot = Rect::from_min_max(pos2(b.left(), b.bottom() - 24.0 * s), b.max);
+            painter.rect_filled(
+                foot,
+                CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 10,
+                    se: 10,
+                },
+                if blocked { p.line } else { p.soft },
+            );
+            painter.text(
+                b.left_top() + vec2(12.0, 16.0) * s,
+                Align2::LEFT_CENTER,
+                *name,
+                font(13.0),
+                if blocked { p.faint } else { p.fg },
+            );
+            let state = if blocked { "paused" } else { "active" };
+            painter.text(
+                b.right_top() + vec2(-12.0, 16.0) * s,
+                Align2::RIGHT_CENTER,
+                state,
+                font(10.0),
+                if blocked { p.amber } else { p.green },
+            );
+            if rect.contains_rect(Rect::from_min_size(foot.left_top(), Vec2::splat(20.0))) {
+                img(tab.icon(), if blocked { p.faint } else { p.muted }, 14.0).paint_at(
+                    ui,
+                    Rect::from_min_size(
+                        foot.left_top() + vec2(10.0, 5.0) * s,
+                        Vec2::splat(14.0 * s.max(0.85)),
+                    ),
+                );
+            }
+            painter.text(
+                foot.left_center() + vec2(32.0 * s, 0.0),
+                Align2::LEFT_CENTER,
+                "double-click to open",
+                font(9.5),
+                p.faint,
+            );
+            if dbl.is_some_and(|c| b.contains(c)) {
+                self.req = Some(Req::Open(*tab));
+            }
+            if *name == "Logging" {
+                let f = r(660.0, ys[i] + 12.0, 150.0, 38.0);
+                painter.arrow(
+                    b.right_center(),
+                    vec2(f.left() - b.right() - 6.0, 0.0),
+                    if blocked { dim } else { line },
+                );
+                painter.rect(
+                    f,
+                    6,
+                    p.panel,
+                    Stroke::new(1.0_f32, p.line),
+                    StrokeKind::Inside,
+                );
+                painter.text(
+                    f.center(),
+                    Align2::CENTER_CENTER,
+                    "run_0007.blf",
+                    FontId::monospace(11.0 * s.max(0.85)),
+                    if blocked { p.faint } else { p.fg },
+                );
+            }
+        }
+        painter.text(rect.left_bottom() + vec2(12.0, -10.0), Align2::LEFT_BOTTOM, "Click the switch to change source · click a square to pause a branch · double-click a block to open it", FontId::proportional(11.0), p.faint);
+    }
+
+    fn offline_mode(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        self.toolbar(ui, |ui| {
+            ui.add(egui::Button::image_and_text(
+                img(icon::open(), p.muted, 14.0),
+                "Add log file...",
+            ));
+            ui.add(egui::Button::image_and_text(
+                img(icon::clear(), p.muted, 14.0),
+                "Remove",
+            ));
+            let _ = ui.button("Move up");
+            let _ = ui.button("Move down");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (t, c) = if *self.online {
+                    ("Source: real bus (switch in Measurement Setup)", p.muted)
+                } else {
+                    ("Source: offline logs", p.green)
+                };
+                ui.label(RichText::new(t).small().color(c));
+            });
+        });
+        let files = [
+            (
+                "drive_cycle.blf",
+                "0.000",
+                "612.402",
+                "0.000014",
+                "0.000",
+                "CAN 1 > Powertrain",
+                "logs/drive_cycle.blf",
+            ),
+            (
+                "door_test.asc",
+                "0.000",
+                "45.880",
+                "0.120000",
+                "+2.000",
+                "CAN 2 > Body",
+                "logs/door_test.asc",
+            ),
+            (
+                "eth_capture.pcapng",
+                "0.000",
+                "30.002",
+                "0.000310",
+                "0.000",
+                "Eth 1 > Backbone",
+                "logs/eth_capture.pcapng",
+            ),
+        ];
         use egui_extras::{Column, TableBuilder};
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(86.0))
-            .column(Column::exact(104.0))
-            .column(Column::exact(100.0))
-            .column(Column::exact(58.0))
-            .column(Column::exact(104.0))
-            .column(Column::exact(38.0))
-            .column(Column::initial(220.0).clip(true))
+            .column(Column::exact(52.0))
+            .columns(Column::auto().at_least(70.0), 6)
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                for (c, f) in [
-                    ("Time (s)", false),
-                    ("Chn", true),
-                    ("ID / Addr", true),
-                    ("Proto", false),
-                    ("Name", false),
-                    ("Dir", false),
-                    ("Details", false),
-                    ("Data", false),
+                for c in [
+                    "Active",
+                    "Offline source",
+                    "Start",
+                    "End",
+                    "First event",
+                    "Offset",
+                    "Channel mapping",
+                    "Path",
                 ] {
                     h.col(|ui| {
-                        ui.label(RichText::new(c).strong().small().color(if f {
-                            p.green
-                        } else {
-                            p.muted
-                        }));
-                        if f {
-                            ui.add(img(icon::filter(), p.green, 11.0));
-                        }
+                        ui.label(RichText::new(c).strong().small().color(p.muted));
                     });
                 }
             })
             .body(|body| {
-                body.rows(22.0, rows.len(), |mut row| {
-                    let r = rows[row.index()];
+                body.rows(24.0, files.len(), |mut row| {
+                    let i = row.index();
+                    let f = files[i];
                     row.col(|ui| {
-                        let (a, z) = r.t.split_at(r.t.trim_end_matches('0').len());
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.label(RichText::new(a).monospace());
-                        ui.label(RichText::new(z).monospace().color(p.faint));
+                        ui.checkbox(&mut self.offline[i], "");
                     });
                     row.col(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                        ui.painter().rect_filled(rect, 2, net_color(&p, r.net));
-                        ui.label(RichText::new(r.net).monospace());
+                        ui.label(RichText::new(f.0).strong());
+                    });
+                    for v in [f.1, f.2, f.3, f.4] {
+                        row.col(|ui| {
+                            ui.label(RichText::new(v).monospace());
+                        });
+                    }
+                    row.col(|ui| {
+                        ui.label(RichText::new(f.5).color(p.green));
                     });
                     row.col(|ui| {
-                        ui.label(RichText::new(r.id).monospace());
-                    });
-                    row.col(|ui| {
-                        let (t, c) = proto_style(&p, r.proto);
-                        tag(ui, t, c);
-                    });
-                    row.col(|ui| {
-                        ui.label(r.name);
-                    });
-                    row.col(|ui| {
-                        let (t, c) = if r.tx {
-                            ("TX", p.green)
-                        } else {
-                            ("RX", p.can_a)
-                        };
-                        ui.label(RichText::new(t).small().strong().color(c));
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(r.details).color(p.muted));
-                    });
-                    row.col(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        for (i, b) in r.data.split(' ').enumerate() {
-                            let t = RichText::new(b).monospace();
-                            if r.changed.contains(&i) {
-                                ui.label(t.background_color(p.green.gamma_multiply(0.25)).strong());
-                            } else {
-                                ui.label(t);
-                            }
-                        }
+                        ui.label(RichText::new(f.6).monospace().color(p.muted));
                     });
                 });
             });
     }
 
-    fn toolbar_trace(&self, ui: &mut egui::Ui, filter: &mut Option<Proto>) {
+    fn trace(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        let mut st = std::mem::take(self.trace);
+        let headers = st.view.headers();
+        let mut rows = trace_rows(st.view);
+        let all_rows = trace_rows(st.view);
+        let q = st.search.to_lowercase();
+        rows.retain(|r| {
+            st.filters.iter().all(|(c, f)| f.matches(&r.cells[*c]))
+                && (q.is_empty() || r.cells.iter().any(|c| c.to_lowercase().contains(&q)))
+        });
+        if let Some((c, asc)) = st.sort {
+            rows.sort_by(|a, b| a.cells[c].cmp(&b.cells[c]));
+            if !asc {
+                rows.reverse();
+            }
+        }
+        self.toolbar_trace(ui, &mut st, rows.len());
+
+        use egui_extras::{Column, TableBuilder};
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            let mut tb = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for h in headers {
+                tb = tb.column(match *h {
+                    "Data" => Column::initial(190.0).at_least(120.0),
+                    "Details" | "Interpretation" => Column::initial(200.0).clip(true),
+                    "Time (s)" => Column::initial(84.0),
+                    "Source IP" | "Destination IP" => Column::initial(108.0),
+                    _ => Column::auto().at_least(40.0),
+                });
+            }
+            tb.header(26.0, |mut hr| {
+                for (ci, h) in headers.iter().enumerate() {
+                    hr.col(|ui| {
+                        let filtered = st.filters.iter().any(|(c, _)| *c == ci);
+                        let arrow = match st.sort {
+                            Some((c, true)) if c == ci => " ^",
+                            Some((c, false)) if c == ci => " v",
+                            _ => "",
+                        };
+                        let color = if filtered || !arrow.is_empty() {
+                            p.green
+                        } else {
+                            p.muted
+                        };
+                        let r = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{h}{arrow}"))
+                                    .strong()
+                                    .small()
+                                    .color(color),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if r.clicked() {
+                            st.sort = match st.sort {
+                                Some((c, true)) if c == ci => Some((ci, false)),
+                                Some((c, false)) if c == ci => None,
+                                _ => Some((ci, true)),
+                            };
+                        }
+                        r.on_hover_text("Click to sort, right-click for column options")
+                            .context_menu(|ui| {
+                                if ui.button("Sort ascending").clicked() {
+                                    st.sort = Some((ci, true));
+                                }
+                                if ui.button("Sort descending").clicked() {
+                                    st.sort = Some((ci, false));
+                                }
+                                if ui
+                                    .add_enabled(st.sort.is_some(), egui::Button::new("Reset sort"))
+                                    .clicked()
+                                {
+                                    st.sort = None;
+                                }
+                                ui.separator();
+                                let _ = ui.button("Adapt column widths");
+                                if ui
+                                    .add_enabled(
+                                        !st.filters.is_empty(),
+                                        egui::Button::new("Reset all column filters"),
+                                    )
+                                    .clicked()
+                                {
+                                    st.filters.clear();
+                                }
+                                ui.separator();
+                                let _ = ui.button("Field chooser...");
+                                let _ = ui.button("Column configuration...");
+                            });
+                        // Per-column value filter
+                        let tint = if filtered { p.green } else { p.faint };
+                        ui.menu_image_button(img(icon::filter(), tint, 11.0), |ui| {
+                            ui.set_min_width(180.0);
+                            if ui.button("(Reset filter)").clicked() {
+                                st.filters.retain(|(c, _)| *c != ci);
+                                ui.close();
+                            }
+                            if ui.button("(Custom...)").clicked() {
+                                let conds = match st.filters.iter().find(|(c, _)| *c == ci) {
+                                    Some((_, Filt::Custom { conds, .. })) => conds.clone(),
+                                    Some((_, Filt::Eq(v))) => vec![Cond {
+                                        on: true,
+                                        rel: Rel::Equals,
+                                        value: v.clone(),
+                                    }],
+                                    None => vec![Cond {
+                                        on: true,
+                                        rel: Rel::Equals,
+                                        value: String::new(),
+                                    }],
+                                };
+                                let and = matches!(
+                                    st.filters.iter().find(|(c, _)| *c == ci),
+                                    Some((_, Filt::Custom { and: true, .. }))
+                                );
+                                st.custom = Some(CustomEdit {
+                                    col: ci,
+                                    and,
+                                    conds,
+                                });
+                                ui.close();
+                            }
+                            ui.separator();
+                            let mut vals: Vec<&String> = all_rows
+                                .iter()
+                                .map(|r| &r.cells[ci])
+                                .filter(|v| !v.is_empty())
+                                .collect();
+                            vals.sort();
+                            vals.dedup();
+                            if vals.is_empty() {
+                                ui.label(
+                                    RichText::new("No further items available.").color(p.muted),
+                                );
+                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for v in vals {
+                                        let on = st.filters.iter().any(|(c, f)| {
+                                            *c == ci && matches!(f, Filt::Eq(x) if x == v)
+                                        });
+                                        if ui.selectable_label(on, v.as_str()).clicked() {
+                                            st.filters.retain(|(c, _)| *c != ci);
+                                            if !on {
+                                                st.filters.push((ci, Filt::Eq(v.clone())));
+                                            }
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(22.0, rows.len(), |mut row| {
+                    let r = &rows[row.index()];
+                    for (ci, h) in headers.iter().enumerate() {
+                        let v = r.cells[ci].as_str();
+                        row.col(|ui| match *h {
+                            "Time (s)" => {
+                                let (a, z) = v.split_at(v.trim_end_matches('0').len());
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.label(RichText::new(a).monospace());
+                                ui.label(RichText::new(z).monospace().color(p.faint));
+                            }
+                            "Chn" => {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                ui.painter().rect_filled(rect, 2, net_color(&p, v));
+                                ui.label(RichText::new(v).monospace());
+                            }
+                            "Proto" => {
+                                let (t, c) = proto_style(&p, r.proto);
+                                tag(ui, t, c);
+                            }
+                            "Protocol" => tag(ui, v, p.eth),
+                            "Dir" => {
+                                let c = if v == "TX" { p.green } else { p.can_a };
+                                ui.label(RichText::new(v).small().strong().color(c));
+                            }
+                            "Data" => {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                let v = fmt_num(v, self.hex, true);
+                                for (i, b) in v.split(' ').enumerate() {
+                                    let t = RichText::new(b).monospace();
+                                    if r.changed.contains(&i) {
+                                        ui.label(
+                                            t.background_color(p.green.gamma_multiply(0.25))
+                                                .strong(),
+                                        );
+                                    } else {
+                                        ui.label(t);
+                                    }
+                                }
+                            }
+                            "Details" | "Interpretation" | "Event type" | "Schedule"
+                            | "Checksum" => {
+                                ui.label(RichText::new(v).color(p.muted));
+                            }
+                            "Name" => {
+                                ui.label(v);
+                            }
+                            "ID" | "ID / Addr" | "PID" => {
+                                ui.label(RichText::new(fmt_num(v, self.hex, false)).monospace());
+                            }
+                            _ => {
+                                ui.label(RichText::new(v).monospace());
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        self.custom_filter_dialog(ui.ctx(), &mut st, headers, &all_rows);
+        *self.trace = st;
+    }
+
+    fn custom_filter_dialog(
+        &self,
+        ctx: &egui::Context,
+        st: &mut TraceState,
+        headers: &[&str],
+        all_rows: &[TRow],
+    ) {
+        let p = self.p;
+        let Some(ed) = st.custom.as_mut() else { return };
+        let mut done: Option<bool> = None;
+        let mut open = true;
+        egui::Window::new("Custom column filter")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("Column: {}", headers[ed.col]))
+                        .strong()
+                        .size(14.0),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Match").color(p.muted));
+                    ui.selectable_value(&mut ed.and, false, "any condition (OR)");
+                    ui.selectable_value(&mut ed.and, true, "all conditions (AND)");
+                });
+                ui.add_space(6.0);
+                let mut vals: Vec<&String> = all_rows
+                    .iter()
+                    .map(|r| &r.cells[ed.col])
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                vals.sort();
+                vals.dedup();
+                let mut remove = None;
+                egui::Frame::new()
+                    .stroke(Stroke::new(1.0_f32, p.line))
+                    .corner_radius(6)
+                    .inner_margin(8)
+                    .show(ui, |ui| {
+                        egui::Grid::new("conds")
+                            .num_columns(4)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                for h in ["Use", "Relation", "Value", ""] {
+                                    ui.label(RichText::new(h).small().strong().color(p.muted));
+                                }
+                                ui.end_row();
+                                for (i, c) in ed.conds.iter_mut().enumerate() {
+                                    ui.checkbox(&mut c.on, "");
+                                    egui::ComboBox::from_id_salt(("rel", i))
+                                        .selected_text(c.rel.label())
+                                        .width(110.0)
+                                        .show_ui(ui, |ui| {
+                                            for r in Rel::ALL {
+                                                ui.selectable_value(&mut c.rel, r, r.label());
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut c.value)
+                                                .hint_text("value")
+                                                .desired_width(170.0),
+                                        );
+                                        egui::ComboBox::from_id_salt(("val", i))
+                                            .selected_text("")
+                                            .width(24.0)
+                                            .show_ui(ui, |ui| {
+                                                for v in &vals {
+                                                    if ui
+                                                        .selectable_label(
+                                                            c.value == **v,
+                                                            v.as_str(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        c.value = (*v).clone();
+                                                    }
+                                                }
+                                            });
+                                    });
+                                    if ui
+                                        .add(egui::Button::image(img(icon::clear(), p.muted, 12.0)))
+                                        .on_hover_text("Remove condition")
+                                        .clicked()
+                                    {
+                                        remove = Some(i);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        if ui.button("+ Add condition").clicked() {
+                            ed.conds.push(Cond {
+                                on: true,
+                                rel: Rel::Equals,
+                                value: String::new(),
+                            });
+                        }
+                    });
+                if let Some(i) = remove {
+                    ed.conds.remove(i);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Numbers accept hex (0x1F) or decimal.")
+                            .small()
+                            .color(p.muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("Cancel").min_size(vec2(72.0, 28.0)))
+                            .clicked()
+                        {
+                            done = Some(false);
+                        }
+                        if primary(ui, &p, None, "   OK   ").clicked() {
+                            done = Some(true);
+                        }
+                    });
+                });
+            });
+        if !open {
+            done = Some(false);
+        }
+        if let Some(ok) = done {
+            let ed = st.custom.take().unwrap();
+            if ok {
+                st.filters.retain(|(c, _)| *c != ed.col);
+                st.filters.push((
+                    ed.col,
+                    Filt::Custom {
+                        and: ed.and,
+                        conds: ed.conds,
+                    },
+                ));
+            }
+        }
+    }
+
+    fn toolbar_trace(&self, ui: &mut egui::Ui, st: &mut TraceState, shown: usize) {
         let p = self.p;
         self.toolbar(ui, |ui| {
             ui.add(egui::Button::image(img(icon::pause(), p.muted, 14.0)))
@@ -1143,29 +2916,48 @@ impl Viewer<'_> {
             ui.add(egui::Button::image(img(icon::clear(), p.muted, 14.0)))
                 .on_hover_text("Clear view");
             ui.separator();
-            for (l, v) in [
-                ("All", None),
-                ("CAN", Some(Proto::Can)),
-                ("LIN", Some(Proto::Lin)),
-                ("ETH", Some(Proto::Eth)),
-            ] {
-                if ui.selectable_label(*filter == v, l).clicked() {
-                    *filter = v;
-                }
+            ui.label(RichText::new("Columns for").color(p.muted));
+            let before = st.view;
+            egui::ComboBox::from_id_salt("trace_view")
+                .selected_text(st.view.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for v in TraceView::ALL {
+                        ui.selectable_value(&mut st.view, v, v.label());
+                    }
+                });
+            if st.view != before {
+                st.sort = None;
+                st.filters.clear();
             }
-            ui.separator();
             ui.add(
-                egui::Button::image_and_text(
-                    img(icon::filter(), p.green, 14.0),
-                    RichText::new("2 filters").color(p.green),
-                )
-                .stroke(Stroke::new(1.0_f32, p.green)),
+                egui::TextEdit::singleline(&mut st.search)
+                    .hint_text("Search")
+                    .desired_width(140.0),
             );
-            let _ = ui.button("Columns");
+            ui.separator();
+            let n = st.filters.len();
+            let label = if n == 0 {
+                "No filters".to_string()
+            } else {
+                format!("{n} filter{} - clear", if n == 1 { "" } else { "s" })
+            };
+            let b = egui::Button::image_and_text(
+                img(icon::filter(), if n > 0 { p.green } else { p.muted }, 14.0),
+                RichText::new(label).color(if n > 0 { p.green } else { p.muted }),
+            );
+            let b = if n > 0 {
+                b.stroke(Stroke::new(1.0_f32, p.green))
+            } else {
+                b
+            };
+            if ui.add(b).clicked() {
+                st.filters.clear();
+            }
             let _ = ui.button("Export CSV");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new("278 rows · 412 msg/s")
+                    RichText::new(format!("{shown} rows · 412 msg/s"))
                         .monospace()
                         .color(p.muted),
                 );
@@ -1410,13 +3202,19 @@ impl eframe::App for Draft {
         let p = self.pal();
         ctx.set_visuals(visuals(&p, self.dark));
 
-        // Command bar
+        // Title row with ribbon tabs
+        let mut open: Option<Tab> = None;
         egui::TopBottomPanel::top("cmd")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 6,
+                bottom: 0,
+            }))
             .show(ctx, |ui| {
                 gradient(
                     ui.painter(),
-                    ui.max_rect().expand2(vec2(12.0, 8.0)),
+                    ui.max_rect().expand2(vec2(12.0, 6.0)),
                     p.g1,
                     p.g2,
                 );
@@ -1432,84 +3230,37 @@ impl eframe::App for Draft {
                     );
                     ui.label(RichText::new("Operow").strong().size(15.0));
                     ui.label(RichText::new("· body_gateway.operow").color(p.muted));
-                    ui.add_space(8.0);
-                    for m in ["File", "Edit", "View", "Simulation", "Tools", "Help"] {
-                        ui.menu_button(m, |ui| {
-                            ui.add(egui::Button::image_and_text(
-                                img(icon::open(), p.muted, 14.0),
-                                "Open project…",
-                            ));
-                            ui.add(egui::Button::image_and_text(
-                                img(icon::save(), p.muted, 14.0),
-                                "Save",
-                            ));
-                        });
+                    ui.add_space(14.0);
+                    for (i, t) in RIBBON_TABS.iter().enumerate() {
+                        let on = self.ribbon == i && !self.ribbon_min;
+                        let b = if i == 0 {
+                            egui::Button::new(RichText::new(*t).color(p.on_green).strong())
+                                .fill(p.green)
+                        } else {
+                            egui::Button::new(RichText::new(*t).color(if on {
+                                p.green
+                            } else {
+                                p.fg
+                            }))
+                            .frame(false)
+                        };
+                        let r = ui.add(b.min_size(vec2(0.0, 30.0)));
+                        if on && i != 0 {
+                            ui.painter().hline(
+                                r.rect.x_range(),
+                                r.rect.bottom() + 1.0,
+                                Stroke::new(2.0_f32, p.green),
+                            );
+                        }
+                        if r.clicked() {
+                            if self.ribbon == i {
+                                self.ribbon_min = !self.ribbon_min;
+                            } else {
+                                self.ribbon = i;
+                                self.ribbon_min = false;
+                            }
+                        }
                     }
-                    ui.add_space(ui.available_width() / 2.0 - 330.0);
-                    egui::Frame::new()
-                        .fill(p.panel)
-                        .stroke(Stroke::new(1.0_f32, p.line))
-                        .corner_radius(9)
-                        .inner_margin(4)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if self.running {
-                                    let _ = ui.add_enabled(
-                                        false,
-                                        egui::Button::image_and_text(
-                                            img(icon::play(), p.faint, 14.0),
-                                            "Start",
-                                        )
-                                        .min_size(vec2(0.0, 28.0)),
-                                    );
-                                } else if primary(ui, &p, Some(icon::play()), "Start").clicked() {
-                                    self.running = true;
-                                }
-                                let _ = ui
-                                    .add(
-                                        egui::Button::image(img(icon::pause(), p.muted, 14.0))
-                                            .min_size(vec2(28.0, 28.0)),
-                                    )
-                                    .on_hover_text("Pause");
-                                if ui
-                                    .add(
-                                        egui::Button::image(img(icon::stop(), p.muted, 14.0))
-                                            .min_size(vec2(28.0, 28.0)),
-                                    )
-                                    .on_hover_text("Stop")
-                                    .clicked()
-                                {
-                                    self.running = false;
-                                }
-                                let t = if self.running {
-                                    ctx.input(|i| i.time) % 1000.0
-                                } else {
-                                    0.0
-                                };
-                                ui.label(
-                                    RichText::new(format!(" t = {t:.3} s "))
-                                        .monospace()
-                                        .size(17.0),
-                                );
-                                let (txt, c) = if self.running {
-                                    ("RUNNING", p.green)
-                                } else {
-                                    ("STOPPED", p.muted)
-                                };
-                                egui::Frame::new()
-                                    .fill(if self.running { p.soft } else { p.page })
-                                    .corner_radius(99)
-                                    .inner_margin(egui::Margin::symmetric(9, 3))
-                                    .show(ui, |ui| {
-                                        ui.label(RichText::new(txt).small().strong().color(c));
-                                    });
-                                let _ = ui.button("Real-time x1");
-                                let _ = ui.add(
-                                    egui::Button::new(RichText::new("Record").color(p.red))
-                                        .stroke(Stroke::new(1.0_f32, p.red.gamma_multiply(0.5))),
-                                );
-                            });
-                        });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .button(if self.dark {
@@ -1521,9 +3272,54 @@ impl eframe::App for Draft {
                         {
                             self.dark = !self.dark;
                         }
+                        let t = if self.running {
+                            ctx.input(|i| i.time) % 1000.0
+                        } else {
+                            0.0
+                        };
+                        let (txt, c) = if self.running {
+                            ("RUNNING", p.green)
+                        } else {
+                            ("STOPPED", p.muted)
+                        };
+                        egui::Frame::new()
+                            .fill(if self.running { p.soft } else { p.page })
+                            .corner_radius(99)
+                            .inner_margin(egui::Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(txt).small().strong().color(c));
+                            });
+                        ui.label(
+                            RichText::new(format!("t = {t:.3} s"))
+                                .monospace()
+                                .size(16.0),
+                        );
+                        let mode = if self.online {
+                            "Online · real bus"
+                        } else {
+                            "Offline · 2 logs"
+                        };
+                        ui.label(RichText::new(mode).small().color(p.muted));
                     });
                 });
             });
+
+        // Ribbon body
+        if !self.ribbon_min {
+            egui::TopBottomPanel::top("ribbon")
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .stroke(Stroke::new(1.0_f32, p.line)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_height(78.0);
+                        self.ribbon_body(ui, &p, &mut open);
+                    });
+                });
+        }
 
         // Workspace bar
         egui::TopBottomPanel::top("ws")
@@ -1635,7 +3431,6 @@ impl eframe::App for Draft {
             });
 
         // Activity rail
-        let mut open = None;
         egui::SidePanel::left("rail")
             .exact_width(48.0)
             .resizable(false)
@@ -1703,14 +3498,23 @@ impl eframe::App for Draft {
 
         // Dock area
         let mut selected = self.selected;
-        let mut filter = self.trace_filter;
+        let mut trace = std::mem::take(&mut self.trace);
+        let mut net_view = self.net_view;
+        let mut online = self.online;
+        let mut ms = self.ms;
+        let mut offline = self.offline;
         let mut name = std::mem::take(&mut self.name);
         let mut viewer = Viewer {
             p,
             t: ctx.input(|i| i.time),
             running: self.running,
             selected: &mut selected,
-            trace_filter: &mut filter,
+            trace: &mut trace,
+            net_view: &mut net_view,
+            hex: self.hex,
+            online: &mut online,
+            ms: &mut ms,
+            offline: &mut offline,
             name: &mut name,
             req: None,
         };
@@ -1740,9 +3544,14 @@ impl eframe::App for Draft {
             });
         let req = viewer.req.take();
         self.selected = selected;
-        self.trace_filter = filter;
+        self.trace = trace;
+        self.net_view = net_view;
+        self.online = online;
+        self.ms = ms;
+        self.offline = offline;
         self.name = name;
         match req {
+            Some(Req::Open(tab)) => self.open(tab),
             Some(Req::Maximise(tab)) => {
                 if let Some(s) = self.saved.take() {
                     *self.dock() = s;
@@ -1774,82 +3583,137 @@ impl eframe::App for Draft {
 
 impl Draft {
     fn tree(&mut self, ui: &mut egui::Ui, p: &Pal) {
-        let header = |ui: &mut egui::Ui, txt: &str, n: usize| {
+        let row = |ui: &mut egui::Ui,
+                   src: ImageSource<'static>,
+                   tint: Color32,
+                   txt: &str,
+                   color: Color32| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(txt).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(n.to_string()).small().color(p.muted));
-                });
+                ui.add(img(src, tint, 14.0));
+                ui.label(RichText::new(txt).color(color));
             });
         };
-        header(ui, "Networks", 4);
-        for (n, proto, rate) in [
-            ("Powertrain", Proto::CanFd, "500k"),
-            ("Body", Proto::Can, "250k"),
-            ("SeatLIN", Proto::Lin, "19.2k"),
-            ("Backbone", Proto::Eth, "1G"),
-        ] {
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                ui.painter().rect_filled(rect, 2, net_color(p, n));
-                ui.label(n);
-                let (t, c) = proto_style(p, proto);
-                tag(ui, t, c);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(rate).small().color(p.muted));
-                });
-            });
-        }
-        ui.add_space(6.0);
-        header(ui, "Domains", 3);
-        for (d, nodes) in [
-            ("Powertrain", &["Engine"][..]),
-            (
-                "Body & comfort",
-                &["BodyCtrl", "DoorLeft", "SeatCtrl", "SeatMotor"],
-            ),
-            (
-                "Ethernet backbone",
-                &["ETH Switch", "ADAS", "Infotainment", "Telematics"],
-            ),
-        ] {
-            egui::CollapsingHeader::new(d)
-                .default_open(true)
-                .show(ui, |ui| {
-                    for n in nodes {
-                        let on = self.selected == *n;
-                        ui.horizontal(|ui| {
-                            ui.add(img(icon::ecu(), if on { p.green } else { p.muted }, 14.0));
-                            if ui
-                                .selectable_label(
-                                    on,
-                                    RichText::new(*n).color(if on { p.green } else { p.fg }),
-                                )
-                                .clicked()
+        egui::CollapsingHeader::new(RichText::new("Networks").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                for (group, protos) in [
+                    ("CAN networks", &[Proto::CanFd, Proto::Can][..]),
+                    ("LIN networks", &[Proto::Lin]),
+                    ("Ethernet networks", &[Proto::Eth]),
+                ] {
+                    egui::CollapsingHeader::new(RichText::new(group).strong())
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for (ni, net) in NETS
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| protos.contains(&n.proto))
                             {
-                                self.selected = n;
+                                let c = net_color(p, net.name);
+                                let on = self.net_view == ni + 1;
+                                let hdr = egui::CollapsingHeader::new(
+                                    RichText::new(net.name).strong().color(if on {
+                                        p.green
+                                    } else {
+                                        p.fg
+                                    }),
+                                )
+                                .id_salt(("net", ni))
+                                .default_open(ni == 0 || ni == 3)
+                                .show(ui, |ui| {
+                                    egui::CollapsingHeader::new("Nodes")
+                                        .id_salt(("nodes", ni))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            for n in net.nodes {
+                                                let sel = self.selected == *n;
+                                                ui.horizontal(|ui| {
+                                                    let src = if n.contains("GW") {
+                                                        icon::gateway()
+                                                    } else {
+                                                        icon::ecu()
+                                                    };
+                                                    ui.add(img(
+                                                        src,
+                                                        if sel { p.green } else { c },
+                                                        14.0,
+                                                    ));
+                                                    if ui.selectable_label(sel, *n).clicked() {
+                                                        self.selected = n;
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    egui::CollapsingHeader::new("Interactive generators")
+                                        .id_salt(("gen", ni))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            for g in net.gens {
+                                                row(ui, icon::send(), c, g, p.fg);
+                                            }
+                                        });
+                                    egui::CollapsingHeader::new("Replay blocks")
+                                        .id_salt(("rep", ni))
+                                        .show(ui, |ui| {
+                                            if net.replays.is_empty() {
+                                                ui.label(
+                                                    RichText::new("none").small().color(p.faint),
+                                                );
+                                            }
+                                            for r in net.replays {
+                                                row(ui, icon::replay(), c, r, p.fg);
+                                            }
+                                        });
+                                    egui::CollapsingHeader::new("Databases")
+                                        .id_salt(("db", ni))
+                                        .show(ui, |ui| {
+                                            for d in net.dbs {
+                                                row(ui, icon::open(), c, d, p.muted);
+                                            }
+                                        });
+                                    egui::CollapsingHeader::new("Channels")
+                                        .id_salt(("ch", ni))
+                                        .show(ui, |ui| {
+                                            row(ui, icon::bus(), c, net.channel, p.muted);
+                                        });
+                                });
+                                // Colour tag and type next to the network name; click opens its view.
+                                let r = hdr.header_response;
+                                let (t, tc) = proto_style(p, net.proto);
+                                let g = ui.painter().layout_no_wrap(
+                                    t.into(),
+                                    FontId::proportional(9.0),
+                                    Color32::WHITE,
+                                );
+                                let tr = Rect::from_min_size(
+                                    pos2(r.rect.right() + 6.0, r.rect.center().y - 7.0),
+                                    g.size() + vec2(8.0, 4.0),
+                                );
+                                ui.painter().rect_filled(tr, 3, tc);
+                                ui.painter()
+                                    .galley(tr.min + vec2(4.0, 2.0), g, Color32::WHITE);
+                                if r.double_clicked() || r.secondary_clicked() {
+                                    self.net_view = ni + 1;
+                                    self.open(Tab::Network);
+                                }
+                                r.on_hover_text("Double-click to open this network's view");
                             }
                         });
-                    }
-                });
-        }
-        ui.horizontal(|ui| {
-            ui.add(img(icon::gateway(), p.gw, 14.0));
-            ui.label("Central Gateway");
-        });
-        ui.add_space(6.0);
-        header(ui, "Databases", 3);
-        for d in ["powertrain.dbc", "seat.ldf", "backbone.arxml"] {
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                ui.label(RichText::new(d).color(p.muted));
+                }
             });
-        }
         ui.add_space(6.0);
-        header(ui, "Tests", 2);
-        let _ =
-            ui.add(egui::Button::new(RichText::new("+ New network…").color(p.faint)).frame(false));
+        egui::CollapsingHeader::new(RichText::new("Domains").strong()).show(ui, |ui| {
+            for d in ["Powertrain", "Body & comfort", "Ethernet backbone"] {
+                ui.label(d);
+            }
+        });
+        egui::CollapsingHeader::new(RichText::new("Tests").strong()).show(ui, |ui| {
+            for t in ["gateway_tests", "fault_tests"] {
+                row(ui, icon::script(), p.muted, t, p.fg);
+            }
+        });
+        let _ = ui
+            .add(egui::Button::new(RichText::new("+ New network...").color(p.faint)).frame(false));
     }
 }
 
