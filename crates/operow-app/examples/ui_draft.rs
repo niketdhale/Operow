@@ -981,367 +981,6 @@ fn fmt_num(v: &str, hex: bool, data: bool) -> String {
         .join(" ")
 }
 
-const RIBBON_TABS: [&str; 8] = [
-    "File",
-    "Home",
-    "Analysis",
-    "Simulation",
-    "Test",
-    "Diagnostics",
-    "Hardware",
-    "Tools",
-];
-
-/// Large ribbon button: icon over label.
-fn big(
-    ui: &mut egui::Ui,
-    p: &Pal,
-    src: ImageSource<'static>,
-    label: &str,
-    on: bool,
-    enabled: bool,
-    primary: bool,
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(
-        vec2(66.0, 62.0),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let hov = enabled && resp.hovered();
-    let (fill, fg) = if primary && enabled {
-        (
-            if hov {
-                p.green.gamma_multiply(0.9)
-            } else {
-                p.green
-            },
-            p.on_green,
-        )
-    } else if on {
-        (p.soft, p.green)
-    } else if hov {
-        (p.soft, p.fg)
-    } else {
-        (Color32::TRANSPARENT, if enabled { p.fg } else { p.faint })
-    };
-    ui.painter().rect_filled(rect, 8, fill);
-    if on && !primary {
-        ui.painter()
-            .rect_stroke(rect, 8, Stroke::new(1.0_f32, p.green), StrokeKind::Inside);
-    }
-    let ir = Rect::from_center_size(rect.center_top() + vec2(0.0, 20.0), Vec2::splat(22.0));
-    img(
-        src,
-        if primary && enabled {
-            p.on_green
-        } else if enabled {
-            if on { p.green } else { p.muted }
-        } else {
-            p.faint
-        },
-        22.0,
-    )
-    .paint_at(ui, ir);
-    ui.painter().text(
-        rect.center_bottom() - vec2(0.0, 12.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(11.5),
-        fg,
-    );
-    resp
-}
-
-/// Small stacked ribbon button.
-fn small(
-    ui: &mut egui::Ui,
-    p: &Pal,
-    src: ImageSource<'static>,
-    label: &str,
-    on: bool,
-    enabled: bool,
-) -> egui::Response {
-    let tint = if !enabled {
-        p.faint
-    } else if on {
-        p.green
-    } else {
-        p.muted
-    };
-    let txt = RichText::new(label).color(if !enabled {
-        p.faint
-    } else if on {
-        p.green
-    } else {
-        p.fg
-    });
-    let b = egui::Button::image_and_text(img(src, tint, 14.0), txt)
-        .frame(on)
-        .fill(p.soft)
-        .min_size(vec2(120.0, 22.0));
-    ui.add_enabled(enabled, b)
-}
-
-/// Titled ribbon group followed by a divider.
-fn group(ui: &mut egui::Ui, p: &Pal, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.set_min_height(64.0);
-            add(ui)
-        });
-        ui.label(RichText::new(title).small().color(p.muted));
-    });
-    ui.add(egui::Separator::default().vertical().spacing(14.0));
-}
-
-impl Draft {
-    fn ribbon_body(&mut self, ui: &mut egui::Ui, p: &Pal, open: &mut Option<Tab>) {
-        let is_open = |s: &Self, t: Tab| s.docks[s.ws as usize].find_tab(&t).is_some();
-        match self.ribbon {
-            0 => {
-                group(ui, p, "Project", |ui| {
-                    big(ui, p, icon::open(), "Open", false, true, false);
-                    big(ui, p, icon::save(), "Save", false, true, false);
-                    big(ui, p, icon::save(), "Save as", false, true, false);
-                });
-                group(ui, p, "Recent", |ui| {
-                    ui.vertical(|ui| {
-                        for f in [
-                            "body_gateway.operow",
-                            "powertrain_hil.operow",
-                            "eth_backbone.operow",
-                        ] {
-                            let _ = ui
-                                .add(egui::Button::new(RichText::new(f).color(p.fg)).frame(false));
-                        }
-                    });
-                });
-            }
-            1 => {
-                group(ui, p, "Measurement", |ui| {
-                    if big(ui, p, icon::play(), "Start", false, !self.running, true).clicked() {
-                        self.running = true;
-                    }
-                    if big(ui, p, icon::stop(), "Stop", false, self.running, false).clicked() {
-                        self.running = false;
-                    }
-                    ui.vertical(|ui| {
-                        small(ui, p, icon::play(), "Step", false, !self.running);
-                        small(ui, p, icon::pause(), "Break", false, self.running);
-                        if small(ui, p, icon::replay(), "Animate", self.animate, true).clicked() {
-                            self.animate = !self.animate;
-                        }
-                    });
-                });
-                group(ui, p, "Mode", |ui| {
-                    ui.vertical(|ui| {
-                        let txt = if self.online {
-                            "Online mode"
-                        } else {
-                            "Offline mode"
-                        };
-                        if small(ui, p, icon::bus(), txt, true, !self.running)
-                            .on_hover_text("Real bus or offline log replay")
-                            .clicked()
-                        {
-                            self.online = !self.online;
-                        }
-                        let txt = if self.real_bus {
-                            "Real bus"
-                        } else {
-                            "Simulated bus"
-                        };
-                        if small(ui, p, icon::ecu(), txt, self.real_bus, !self.running).clicked() {
-                            self.real_bus = !self.real_bus;
-                        }
-                        small(ui, p, icon::gateway(), "Hardware: Virtual", false, true);
-                    });
-                });
-                group(ui, p, "Appearance", |ui| {
-                    egui::Grid::new("fmt").spacing([4.0, 4.0]).show(ui, |ui| {
-                        ui.selectable_value(&mut self.hex, false, "dec");
-                        ui.selectable_value(&mut self.hex, true, "hex");
-                        ui.end_row();
-                        ui.selectable_value(&mut self.sym, true, "sym");
-                        ui.selectable_value(&mut self.sym, false, "num");
-                        ui.end_row();
-                    });
-                });
-                group(ui, p, "Windows", |ui| {
-                    big(ui, p, icon::replay(), "Sync", false, true, false)
-                        .on_hover_text("Synchronise the time cursor across windows");
-                    if big(
-                        ui,
-                        p,
-                        icon::trace(),
-                        "Trace",
-                        is_open(self, Tab::Trace),
-                        true,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        *open = Some(Tab::Trace);
-                    }
-                });
-            }
-            2 => {
-                group(ui, p, "Configuration", |ui| {
-                    if big(
-                        ui,
-                        p,
-                        icon::filter(),
-                        "Measure",
-                        is_open(self, Tab::MeasurementSetup),
-                        true,
-                        false,
-                    )
-                    .on_hover_text("Measurement setup")
-                    .clicked()
-                    {
-                        *open = Some(Tab::MeasurementSetup);
-                    }
-                    if big(
-                        ui,
-                        p,
-                        icon::open(),
-                        "Offline",
-                        is_open(self, Tab::OfflineMode),
-                        true,
-                        false,
-                    )
-                    .on_hover_text("Offline mode sources")
-                    .clicked()
-                    {
-                        *open = Some(Tab::OfflineMode);
-                    }
-                    big(ui, p, icon::filter(), "Filter", false, false, false);
-                    if big(
-                        ui,
-                        p,
-                        icon::save(),
-                        "Logging",
-                        is_open(self, Tab::Log),
-                        true,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        *open = Some(Tab::Log);
-                    }
-                });
-                group(ui, p, "Bus analysis", |ui| {
-                    for (t, l) in [
-                        (Tab::Trace, "Trace"),
-                        (Tab::Graph, "Graphics"),
-                        (Tab::Properties, "Data"),
-                        (Tab::Statistics, "Statistics"),
-                    ] {
-                        if big(ui, p, t.icon(), l, is_open(self, t), true, false).clicked() {
-                            *open = Some(t);
-                        }
-                    }
-                });
-            }
-            3 => {
-                group(ui, p, "Setup", |ui| {
-                    if big(
-                        ui,
-                        p,
-                        icon::bus(),
-                        "Networks",
-                        is_open(self, Tab::Network),
-                        true,
-                        false,
-                    )
-                    .on_hover_text("Simulation setup")
-                    .clicked()
-                    {
-                        *open = Some(Tab::Network);
-                    }
-                    big(ui, p, icon::ecu(), "Add ECU", false, !self.running, false);
-                    big(
-                        ui,
-                        p,
-                        icon::gateway(),
-                        "Gateway",
-                        false,
-                        !self.running,
-                        false,
-                    );
-                });
-                group(ui, p, "Stimulus", |ui| {
-                    big(ui, p, icon::send(), "Generator", false, true, false);
-                    big(ui, p, icon::replay(), "Replay", false, true, false);
-                    big(ui, p, icon::clear(), "Faults", false, true, false);
-                });
-            }
-            4 => {
-                group(ui, p, "Tests", |ui| {
-                    if big(ui, p, icon::play(), "Run all", false, true, true).clicked() {
-                        *open = Some(Tab::Tests);
-                    }
-                    if big(
-                        ui,
-                        p,
-                        icon::script(),
-                        "Modules",
-                        is_open(self, Tab::Tests),
-                        true,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        *open = Some(Tab::Tests);
-                    }
-                    big(ui, p, icon::save(), "Report", false, true, false);
-                });
-            }
-            5 => {
-                group(ui, p, "Diagnostics", |ui| {
-                    if big(
-                        ui,
-                        p,
-                        icon::send(),
-                        "Console",
-                        is_open(self, Tab::Diagnostics),
-                        true,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        *open = Some(Tab::Diagnostics);
-                    }
-                    big(ui, p, icon::filter(), "DTCs", false, true, false);
-                    big(ui, p, icon::ecu(), "Security", false, true, false);
-                });
-            }
-            6 => {
-                group(ui, p, "Driver", |ui| {
-                    for d in ["Virtual", "PCAN", "Vector XL", "SocketCAN", "UDP"] {
-                        big(ui, p, icon::gateway(), d, d == "Virtual", true, false);
-                    }
-                });
-                group(ui, p, "Channels", |ui| {
-                    big(ui, p, icon::bus(), "Mapping", false, true, false);
-                });
-            }
-            _ => {
-                group(ui, p, "Logs", |ui| {
-                    big(ui, p, icon::replay(), "Convert", false, true, false)
-                        .on_hover_text("ASC <> BLF");
-                });
-                group(ui, p, "App", |ui| {
-                    big(ui, p, icon::script(), "Settings", false, true, false);
-                });
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------- app
 
 struct Draft {
@@ -1357,13 +996,8 @@ struct Draft {
     trace: TraceState,
     name: String,
     net_view: usize,
-    ribbon: usize,
-    ribbon_min: bool,
     hex: bool,
-    sym: bool,
     online: bool,
-    real_bus: bool,
-    animate: bool,
     ms: [bool; 5],
     offline: [bool; 3],
 }
@@ -1382,13 +1016,8 @@ impl Draft {
             trace: TraceState::default(),
             name: "Engine".into(),
             net_view: 0,
-            ribbon: 1,
-            ribbon_min: false,
             hex: true,
-            sym: true,
             online: true,
-            real_bus: false,
-            animate: true,
             ms: [false, false, false, false, true],
             offline: [true, true, false],
         }
@@ -1507,6 +1136,7 @@ impl Viewer<'_> {
 
     fn network(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
+        let mut nv = *self.net_view;
         self.toolbar(ui, |ui| {
             ui.add(egui::Button::image_and_text(
                 img(icon::ecu(), p.muted, 14.0),
@@ -1521,8 +1151,17 @@ impl Viewer<'_> {
                 "Network",
             ));
             ui.separator();
-            for (i, l) in ["All", "CAN", "LIN", "ETH"].iter().enumerate() {
-                let _ = ui.selectable_label(i == 0, *l);
+            ui.label(RichText::new("View").color(p.muted));
+            if ui.selectable_label(nv == 0, "Overview").clicked() {
+                nv = 0;
+            }
+            for (i, n) in NETS.iter().enumerate() {
+                let (sq, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                ui.painter().rect_filled(sq, 2, net_color(&p, n.name));
+                let r = ui.selectable_label(nv == i + 1, n.name);
+                if r.clicked() {
+                    nv = i + 1;
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.running {
@@ -1535,13 +1174,13 @@ impl Viewer<'_> {
             });
         });
 
-        let avail = ui.available_size() - vec2(0.0, 32.0);
+        *self.net_view = nv;
+        let avail = ui.available_size();
         if *self.net_view > 0 {
             self.net_detail(ui, avail, *self.net_view - 1);
         } else {
             self.overview(ui, avail);
         }
-        self.net_tabs(ui);
     }
 
     fn overview(&mut self, ui: &mut egui::Ui, avail: Vec2) {
@@ -1918,48 +1557,6 @@ impl Viewer<'_> {
             mono(11.0),
             p.muted,
         );
-    }
-
-    /// Sheet-style tabs under the canvas: the overview plus one view per network.
-    fn net_tabs(&mut self, ui: &mut egui::Ui) {
-        let p = self.p;
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            let mut tab = |ui: &mut egui::Ui, i: usize, label: &str, c: Option<Color32>| {
-                let on = *self.net_view == i;
-                let r = ui.add(
-                    egui::Button::new(
-                        RichText::new(label)
-                            .color(if on { p.green } else { p.muted })
-                            .strong(),
-                    )
-                    .fill(if on { p.panel } else { Color32::TRANSPARENT })
-                    .stroke(if on {
-                        Stroke::new(1.0_f32, p.line)
-                    } else {
-                        Stroke::NONE
-                    })
-                    .min_size(vec2(0.0, 24.0)),
-                );
-                if let Some(c) = c {
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(
-                            r.rect.left_top() + vec2(0.0, 0.0),
-                            vec2(r.rect.width(), 2.0),
-                        ),
-                        0,
-                        c,
-                    );
-                }
-                if r.clicked() {
-                    *self.net_view = i;
-                }
-            };
-            tab(ui, 0, "Overview", None);
-            for (i, n) in NETS.iter().enumerate() {
-                tab(ui, i + 1, n.name, Some(net_color(&p, n.name)));
-            }
-        });
     }
 
     fn net_detail(&mut self, ui: &mut egui::Ui, avail: Vec2, idx: usize) {
@@ -3202,19 +2799,14 @@ impl eframe::App for Draft {
         let p = self.pal();
         ctx.set_visuals(visuals(&p, self.dark));
 
-        // Title row with ribbon tabs
+        // Command bar
         let mut open: Option<Tab> = None;
         egui::TopBottomPanel::top("cmd")
-            .frame(egui::Frame::new().inner_margin(egui::Margin {
-                left: 12,
-                right: 12,
-                top: 6,
-                bottom: 0,
-            }))
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ctx, |ui| {
                 gradient(
                     ui.painter(),
-                    ui.max_rect().expand2(vec2(12.0, 6.0)),
+                    ui.max_rect().expand2(vec2(12.0, 8.0)),
                     p.g1,
                     p.g2,
                 );
@@ -3230,37 +2822,134 @@ impl eframe::App for Draft {
                     );
                     ui.label(RichText::new("Operow").strong().size(15.0));
                     ui.label(RichText::new("· body_gateway.operow").color(p.muted));
-                    ui.add_space(14.0);
-                    for (i, t) in RIBBON_TABS.iter().enumerate() {
-                        let on = self.ribbon == i && !self.ribbon_min;
-                        let b = if i == 0 {
-                            egui::Button::new(RichText::new(*t).color(p.on_green).strong())
-                                .fill(p.green)
-                        } else {
-                            egui::Button::new(RichText::new(*t).color(if on {
-                                p.green
-                            } else {
-                                p.fg
-                            }))
-                            .frame(false)
-                        };
-                        let r = ui.add(b.min_size(vec2(0.0, 30.0)));
-                        if on && i != 0 {
-                            ui.painter().hline(
-                                r.rect.x_range(),
-                                r.rect.bottom() + 1.0,
-                                Stroke::new(2.0_f32, p.green),
-                            );
-                        }
-                        if r.clicked() {
-                            if self.ribbon == i {
-                                self.ribbon_min = !self.ribbon_min;
-                            } else {
-                                self.ribbon = i;
-                                self.ribbon_min = false;
+                    ui.add_space(8.0);
+                    ui.menu_button("File", |ui| {
+                        ui.add(egui::Button::image_and_text(
+                            img(icon::open(), p.muted, 14.0),
+                            "Open project...",
+                        ));
+                        ui.add(egui::Button::image_and_text(
+                            img(icon::save(), p.muted, 14.0),
+                            "Save",
+                        ));
+                    });
+                    ui.menu_button("Edit", |ui| {
+                        let _ = ui.button("Undo");
+                        let _ = ui.button("Redo");
+                    });
+                    ui.menu_button("View", |ui| {
+                        for t in [
+                            Tab::Network,
+                            Tab::Trace,
+                            Tab::Graph,
+                            Tab::Statistics,
+                            Tab::Log,
+                            Tab::MeasurementSetup,
+                            Tab::OfflineMode,
+                            Tab::Diagnostics,
+                            Tab::Tests,
+                            Tab::Properties,
+                        ] {
+                            if ui
+                                .add(egui::Button::image_and_text(
+                                    img(t.icon(), p.muted, 14.0),
+                                    t.title(),
+                                ))
+                                .clicked()
+                            {
+                                open = Some(t);
+                                ui.close();
                             }
                         }
-                    }
+                    });
+                    ui.menu_button("Simulation", |ui| {
+                        if ui.button("Start").clicked() {
+                            self.running = true;
+                        }
+                        if ui.button("Stop").clicked() {
+                            self.running = false;
+                        }
+                    });
+                    ui.menu_button("Tools", |ui| {
+                        let _ = ui.button("Convert ASC <> BLF...");
+                        let _ = ui.button("Hardware channels...");
+                    });
+                    ui.add_space((ui.available_width() / 2.0 - 420.0).max(8.0));
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .stroke(Stroke::new(1.0_f32, p.line))
+                        .corner_radius(9)
+                        .inner_margin(4)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if self.running {
+                                    let _ = ui.add_enabled(
+                                        false,
+                                        egui::Button::image_and_text(
+                                            img(icon::play(), p.faint, 14.0),
+                                            "Start",
+                                        )
+                                        .min_size(vec2(0.0, 28.0)),
+                                    );
+                                } else if primary(ui, &p, Some(icon::play()), "Start").clicked() {
+                                    self.running = true;
+                                }
+                                let _ = ui
+                                    .add(
+                                        egui::Button::image(img(icon::pause(), p.muted, 14.0))
+                                            .min_size(vec2(28.0, 28.0)),
+                                    )
+                                    .on_hover_text("Pause");
+                                if ui
+                                    .add(
+                                        egui::Button::image(img(icon::stop(), p.muted, 14.0))
+                                            .min_size(vec2(28.0, 28.0)),
+                                    )
+                                    .on_hover_text("Stop")
+                                    .clicked()
+                                {
+                                    self.running = false;
+                                }
+                                let t = if self.running {
+                                    ctx.input(|i| i.time) % 1000.0
+                                } else {
+                                    0.0
+                                };
+                                ui.label(
+                                    RichText::new(format!(" t = {t:.3} s "))
+                                        .monospace()
+                                        .size(17.0),
+                                );
+                                let (txt, c) = if self.running {
+                                    ("RUNNING", p.green)
+                                } else {
+                                    ("STOPPED", p.muted)
+                                };
+                                egui::Frame::new()
+                                    .fill(if self.running { p.soft } else { p.page })
+                                    .corner_radius(99)
+                                    .inner_margin(egui::Margin::symmetric(9, 3))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(txt).small().strong().color(c));
+                                    });
+                                let _ = ui.button("Real-time x1");
+                                let _ = ui.add(
+                                    egui::Button::new(RichText::new("Record").color(p.red))
+                                        .stroke(Stroke::new(1.0_f32, p.red.gamma_multiply(0.5))),
+                                );
+                            });
+                        });
+                    ui.add_space(10.0);
+                    // Source and number format, kept small next to the run controls.
+                    ui.add_enabled_ui(!self.running, |ui| {
+                        ui.selectable_value(&mut self.online, true, "Online")
+                            .on_hover_text("Measure the real or simulated bus");
+                        ui.selectable_value(&mut self.online, false, "Offline")
+                            .on_hover_text("Replay the logs listed in Offline Mode");
+                    });
+                    ui.separator();
+                    ui.selectable_value(&mut self.hex, true, "hex");
+                    ui.selectable_value(&mut self.hex, false, "dec");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .button(if self.dark {
@@ -3272,54 +2961,9 @@ impl eframe::App for Draft {
                         {
                             self.dark = !self.dark;
                         }
-                        let t = if self.running {
-                            ctx.input(|i| i.time) % 1000.0
-                        } else {
-                            0.0
-                        };
-                        let (txt, c) = if self.running {
-                            ("RUNNING", p.green)
-                        } else {
-                            ("STOPPED", p.muted)
-                        };
-                        egui::Frame::new()
-                            .fill(if self.running { p.soft } else { p.page })
-                            .corner_radius(99)
-                            .inner_margin(egui::Margin::symmetric(9, 3))
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(txt).small().strong().color(c));
-                            });
-                        ui.label(
-                            RichText::new(format!("t = {t:.3} s"))
-                                .monospace()
-                                .size(16.0),
-                        );
-                        let mode = if self.online {
-                            "Online · real bus"
-                        } else {
-                            "Offline · 2 logs"
-                        };
-                        ui.label(RichText::new(mode).small().color(p.muted));
                     });
                 });
             });
-
-        // Ribbon body
-        if !self.ribbon_min {
-            egui::TopBottomPanel::top("ribbon")
-                .frame(
-                    egui::Frame::new()
-                        .fill(p.panel)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .stroke(Stroke::new(1.0_f32, p.line)),
-                )
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_height(78.0);
-                        self.ribbon_body(ui, &p, &mut open);
-                    });
-                });
-        }
 
         // Workspace bar
         egui::TopBottomPanel::top("ws")
@@ -3448,6 +3092,8 @@ impl eframe::App for Draft {
                     Tab::Diagnostics,
                     Tab::Tests,
                     Tab::Statistics,
+                    Tab::MeasurementSetup,
+                    Tab::OfflineMode,
                 ] {
                     let on = self.docks[self.ws as usize].find_tab(&t).is_some();
                     if icon_btn(ui, &p, t.icon(), t.title(), on).clicked() {
@@ -3583,135 +3229,91 @@ impl eframe::App for Draft {
 
 impl Draft {
     fn tree(&mut self, ui: &mut egui::Ui, p: &Pal) {
-        let row = |ui: &mut egui::Ui,
-                   src: ImageSource<'static>,
-                   tint: Color32,
-                   txt: &str,
-                   color: Color32| {
+        let header = |ui: &mut egui::Ui, txt: &str, n: usize| {
             ui.horizontal(|ui| {
-                ui.add(img(src, tint, 14.0));
-                ui.label(RichText::new(txt).color(color));
+                ui.label(RichText::new(txt).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(n.to_string()).small().color(p.muted));
+                });
             });
         };
-        egui::CollapsingHeader::new(RichText::new("Networks").strong())
-            .default_open(true)
-            .show(ui, |ui| {
-                for (group, protos) in [
-                    ("CAN networks", &[Proto::CanFd, Proto::Can][..]),
-                    ("LIN networks", &[Proto::Lin]),
-                    ("Ethernet networks", &[Proto::Eth]),
-                ] {
-                    egui::CollapsingHeader::new(RichText::new(group).strong())
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for (ni, net) in NETS
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, n)| protos.contains(&n.proto))
-                            {
-                                let c = net_color(p, net.name);
-                                let on = self.net_view == ni + 1;
-                                let hdr = egui::CollapsingHeader::new(
-                                    RichText::new(net.name).strong().color(if on {
-                                        p.green
-                                    } else {
-                                        p.fg
-                                    }),
-                                )
-                                .id_salt(("net", ni))
-                                .default_open(ni == 0 || ni == 3)
-                                .show(ui, |ui| {
-                                    egui::CollapsingHeader::new("Nodes")
-                                        .id_salt(("nodes", ni))
-                                        .default_open(true)
-                                        .show(ui, |ui| {
-                                            for n in net.nodes {
-                                                let sel = self.selected == *n;
-                                                ui.horizontal(|ui| {
-                                                    let src = if n.contains("GW") {
-                                                        icon::gateway()
-                                                    } else {
-                                                        icon::ecu()
-                                                    };
-                                                    ui.add(img(
-                                                        src,
-                                                        if sel { p.green } else { c },
-                                                        14.0,
-                                                    ));
-                                                    if ui.selectable_label(sel, *n).clicked() {
-                                                        self.selected = n;
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    egui::CollapsingHeader::new("Interactive generators")
-                                        .id_salt(("gen", ni))
-                                        .default_open(true)
-                                        .show(ui, |ui| {
-                                            for g in net.gens {
-                                                row(ui, icon::send(), c, g, p.fg);
-                                            }
-                                        });
-                                    egui::CollapsingHeader::new("Replay blocks")
-                                        .id_salt(("rep", ni))
-                                        .show(ui, |ui| {
-                                            if net.replays.is_empty() {
-                                                ui.label(
-                                                    RichText::new("none").small().color(p.faint),
-                                                );
-                                            }
-                                            for r in net.replays {
-                                                row(ui, icon::replay(), c, r, p.fg);
-                                            }
-                                        });
-                                    egui::CollapsingHeader::new("Databases")
-                                        .id_salt(("db", ni))
-                                        .show(ui, |ui| {
-                                            for d in net.dbs {
-                                                row(ui, icon::open(), c, d, p.muted);
-                                            }
-                                        });
-                                    egui::CollapsingHeader::new("Channels")
-                                        .id_salt(("ch", ni))
-                                        .show(ui, |ui| {
-                                            row(ui, icon::bus(), c, net.channel, p.muted);
-                                        });
-                                });
-                                // Colour tag and type next to the network name; click opens its view.
-                                let r = hdr.header_response;
-                                let (t, tc) = proto_style(p, net.proto);
-                                let g = ui.painter().layout_no_wrap(
-                                    t.into(),
-                                    FontId::proportional(9.0),
-                                    Color32::WHITE,
-                                );
-                                let tr = Rect::from_min_size(
-                                    pos2(r.rect.right() + 6.0, r.rect.center().y - 7.0),
-                                    g.size() + vec2(8.0, 4.0),
-                                );
-                                ui.painter().rect_filled(tr, 3, tc);
-                                ui.painter()
-                                    .galley(tr.min + vec2(4.0, 2.0), g, Color32::WHITE);
-                                if r.double_clicked() || r.secondary_clicked() {
-                                    self.net_view = ni + 1;
-                                    self.open(Tab::Network);
-                                }
-                                r.on_hover_text("Double-click to open this network's view");
+        header(ui, "Networks", NETS.len());
+        for (ni, net) in NETS.iter().enumerate() {
+            let c = net_color(p, net.name);
+            let rate = match net.proto {
+                Proto::CanFd => "500k/2M",
+                Proto::Can => "250k",
+                Proto::Lin => "19.2k",
+                Proto::Eth => "1G",
+            };
+            let id = ui.make_persistent_id(("net", ni));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 2, c);
+                    let on = self.net_view == ni + 1;
+                    if ui
+                        .selectable_label(
+                            on,
+                            RichText::new(net.name).color(if on { p.green } else { p.fg }),
+                        )
+                        .on_hover_text("Show this network on the canvas")
+                        .clicked()
+                    {
+                        self.net_view = ni + 1;
+                        self.open(Tab::Network);
+                    }
+                    let (t, tc) = proto_style(p, net.proto);
+                    tag(ui, t, tc);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(rate).small().color(p.muted));
+                    });
+                })
+                .body(|ui| {
+                    for n in net.nodes {
+                        let sel = self.selected == *n;
+                        ui.horizontal(|ui| {
+                            let src = if n.contains("GW") {
+                                icon::gateway()
+                            } else {
+                                icon::ecu()
+                            };
+                            ui.add(img(src, if sel { p.green } else { p.muted }, 14.0));
+                            if ui.selectable_label(sel, *n).clicked() {
+                                self.selected = n;
                             }
                         });
-                }
-            });
+                    }
+                    let line = |ui: &mut egui::Ui, src: ImageSource<'static>, items: &[&str]| {
+                        for it in items {
+                            ui.horizontal(|ui| {
+                                ui.add(img(src.clone(), p.muted, 14.0));
+                                ui.label(RichText::new(*it).color(p.muted));
+                            });
+                        }
+                    };
+                    line(ui, icon::send(), net.gens);
+                    line(ui, icon::replay(), net.replays);
+                    line(ui, icon::open(), net.dbs);
+                });
+        }
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(RichText::new("Domains").strong()).show(ui, |ui| {
-            for d in ["Powertrain", "Body & comfort", "Ethernet backbone"] {
-                ui.label(d);
-            }
-        });
-        egui::CollapsingHeader::new(RichText::new("Tests").strong()).show(ui, |ui| {
-            for t in ["gateway_tests", "fault_tests"] {
-                row(ui, icon::script(), p.muted, t, p.fg);
-            }
-        });
+        header(ui, "Domains", 3);
+        for d in ["Powertrain", "Body & comfort", "Ethernet backbone"] {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new(d).color(p.muted));
+            });
+        }
+        ui.add_space(6.0);
+        header(ui, "Tests", 2);
+        for t in ["gateway_tests", "fault_tests"] {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.add(img(icon::script(), p.muted, 14.0));
+                ui.label(t);
+            });
+        }
         let _ = ui
             .add(egui::Button::new(RichText::new("+ New network...").color(p.faint)).frame(false));
     }
